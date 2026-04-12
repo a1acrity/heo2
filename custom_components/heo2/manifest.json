@@ -1,0 +1,11 @@
+{
+    "domain": "heo2",
+    "name": "HEO II — Energy Optimiser",
+    "codeowners": ["@a1acrity"],
+    "config_flow": true,
+    "dependencies": ["mqtt"],
+    "documentation": "https://github.com/a1acrity/heo2",
+    "iot_class": "local_push",
+    "requirements": ["httpx>=0.27"],
+    "version": "0.1.0"
+}
