@@ -1,0 +1,79 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "MQTT Configuration",
+                "description": "Configure the MQTT connection to Solar Assistant.",
+                "data": {
+                    "mqtt_host": "MQTT broker host",
+                    "mqtt_port": "MQTT broker port",
+                    "mqtt_username": "MQTT username",
+                    "mqtt_password": "MQTT password",
+                    "mqtt_base_topic": "MQTT base topic"
+                }
+            },
+            "battery": {
+                "title": "Battery Configuration",
+                "description": "Configure your battery system parameters.",
+                "data": {
+                    "battery_capacity_kwh": "Battery capacity (kWh)",
+                    "min_soc": "Minimum SOC (%)",
+                    "max_soc": "Maximum SOC (%)",
+                    "max_charge_kw": "Max charge rate (kW)",
+                    "max_discharge_kw": "Max discharge rate (kW)",
+                    "charge_efficiency": "Charge efficiency (0-1)",
+                    "discharge_efficiency": "Discharge efficiency (0-1)"
+                }
+            },
+            "tariff": {
+                "title": "Tariff Configuration",
+                "description": "Configure your IGO tariff rates.",
+                "data": {
+                    "igo_day_rate": "Day rate (p/kWh)",
+                    "igo_night_rate": "Night rate (p/kWh)",
+                    "igo_night_start": "Night rate start (HH:MM)",
+                    "igo_night_end": "Night rate end (HH:MM)"
+                }
+            },
+            "entities": {
+                "title": "Home Assistant Entities",
+                "description": "Select the HA entities that provide real-time data.",
+                "data": {
+                    "soc_entity": "Battery SOC sensor",
+                    "load_power_entity": "Load power sensor",
+                    "pv_power_entity": "PV power sensor",
+                    "ev_status_entity": "EV charger status",
+                    "igo_dispatch_entity": "IGO dispatch entity",
+                    "saving_session_entity": "Saving session sensor",
+                    "tapo_wash_entity": "Washing machine Tapo plug",
+                    "tapo_dryer_entity": "Tumble dryer Tapo plug",
+                    "tapo_dishwasher_entity": "Dishwasher Tapo plug"
+                }
+            },
+            "rules": {
+                "title": "Rule Configuration",
+                "description": "Enable or disable programme rules.",
+                "data": {
+                    "rule_cheap_rate_charge": "Cheap rate charge",
+                    "rule_solar_surplus": "Solar surplus",
+                    "rule_export_window": "Export window",
+                    "rule_evening_protect": "Evening protect",
+                    "rule_igo_dispatch": "IGO dispatch",
+                    "rule_ev_charging": "EV charging",
+                    "max_target_soc": "Maximum overnight charge target (%)"
+                }
+            },
+            "services": {
+                "title": "Optional Services",
+                "description": "Configure external data sources.",
+                "data": {
+                    "solcast_api_key": "Solcast API key",
+                    "solcast_resource_id": "Solcast resource ID",
+                    "agilepredict_url": "AgilePredict URL",
+                    "load_baseline_w": "Fallback load baseline (W)",
+                    "dry_run": "Dry run (log only, no MQTT writes)"
+                }
+            }
+        }
+    }
+}
