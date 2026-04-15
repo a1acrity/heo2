@@ -46,3 +46,12 @@ DEFAULT_APPLIANCES = {
     "dishwasher": {"draw_kw": 1.8, "duration_hours": 1.5},
     "ev": {"draw_kw": 7.0, "duration_hours": 2.5},
 }
+
+# Payback defaults
+DEFAULT_SYSTEM_COST = 16800.0
+DEFAULT_ADDITIONAL_COSTS = 0.0
+DEFAULT_SAVINGS_TO_DATE = 1131.47
+DEFAULT_INSTALL_DATE = "2025-02-01"
+
+# Flat tariff for savings comparison (typical UK SVT rate, p/kWh)
+DEFAULT_FLAT_RATE_PENCE = 24.5

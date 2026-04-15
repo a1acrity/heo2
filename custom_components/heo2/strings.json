@@ -73,6 +73,28 @@
                     "load_baseline_w": "Fallback load baseline (W)",
                     "dry_run": "Dry run (log only, no MQTT writes)"
                 }
+            },
+            "octopus": {
+                "title": "Octopus Energy (Optional)",
+                "description": "Connect to Octopus Energy for billing data. Leave blank to skip.",
+                "data": {
+                    "octopus_api_key": "Octopus API key",
+                    "octopus_account_number": "Account number",
+                    "octopus_mpan": "Electricity MPAN",
+                    "octopus_serial": "Meter serial number",
+                    "octopus_product_code": "Tariff product code",
+                    "octopus_tariff_code": "Tariff code"
+                }
+            },
+            "payback": {
+                "title": "Payback Tracking",
+                "description": "Seed values for ROI calculation.",
+                "data": {
+                    "system_cost": "Total system cost (£)",
+                    "additional_costs": "Additional costs (£)",
+                    "savings_to_date": "Savings already banked (£)",
+                    "install_date": "Installation date (YYYY-MM-DD)"
+                }
             }
         }
     }

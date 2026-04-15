@@ -20,6 +20,10 @@ from .const import (
     DEFAULT_IGO_NIGHT_RATE_PENCE,
     DEFAULT_IGO_DAY_RATE_PENCE,
     DEFAULT_LOAD_BASELINE_W,
+    DEFAULT_SYSTEM_COST,
+    DEFAULT_ADDITIONAL_COSTS,
+    DEFAULT_SAVINGS_TO_DATE,
+    DEFAULT_INSTALL_DATE,
     MQTT_BASE_TOPIC,
 )
 
@@ -115,10 +119,7 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_services(self, user_input=None):
         if user_input is not None:
             self._data.update(user_input)
-            return self.async_create_entry(
-                title="HEO II",
-                data=self._data,
-            )
+            return await self.async_step_octopus()
         return self.async_show_form(
             step_id="services",
             data_schema=vol.Schema({
@@ -127,5 +128,38 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional("agilepredict_url", default=""): str,
                 vol.Required("load_baseline_w", default=DEFAULT_LOAD_BASELINE_W): vol.Coerce(float),
                 vol.Required("dry_run", default=True): bool,
+            }),
+        )
+
+    async def async_step_octopus(self, user_input=None):
+        if user_input is not None:
+            self._data.update(user_input)
+            return await self.async_step_payback()
+        return self.async_show_form(
+            step_id="octopus",
+            data_schema=vol.Schema({
+                vol.Optional("octopus_api_key", default=""): str,
+                vol.Optional("octopus_account_number", default=""): str,
+                vol.Optional("octopus_mpan", default=""): str,
+                vol.Optional("octopus_serial", default=""): str,
+                vol.Optional("octopus_product_code", default=""): str,
+                vol.Optional("octopus_tariff_code", default=""): str,
+            }),
+        )
+
+    async def async_step_payback(self, user_input=None):
+        if user_input is not None:
+            self._data.update(user_input)
+            return self.async_create_entry(
+                title="HEO II",
+                data=self._data,
+            )
+        return self.async_show_form(
+            step_id="payback",
+            data_schema=vol.Schema({
+                vol.Required("system_cost", default=DEFAULT_SYSTEM_COST): vol.Coerce(float),
+                vol.Required("additional_costs", default=DEFAULT_ADDITIONAL_COSTS): vol.Coerce(float),
+                vol.Required("savings_to_date", default=DEFAULT_SAVINGS_TO_DATE): vol.Coerce(float),
+                vol.Required("install_date", default=DEFAULT_INSTALL_DATE): str,
             }),
         )
