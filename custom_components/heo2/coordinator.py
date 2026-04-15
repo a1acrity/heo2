@@ -19,6 +19,10 @@ from .solcast_client import SolcastClient
 from .agilepredict_client import AgilePredictClient
 from .appliance_timing import ApplianceTimingCalculator, ApplianceSuggestion
 from .const import DEFAULT_APPLIANCES
+from .soc_trajectory import calculate_soc_trajectory
+from .cost_tracker import CostAccumulator
+from .octopus import OctopusBillingFetcher
+from .const import DEFAULT_FLAT_RATE_PENCE
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,25 @@ class HEO2Coordinator(DataUpdateCoordinator):
         self.enabled: bool = True
         self.healthy: bool = True
 
+        # Dashboard state
+        self.soc_trajectory: list[float] = [0.0] * 24
+        self.cost_accumulator = CostAccumulator()
+        self.octopus: OctopusBillingFetcher | None = None
+
+        # ROI state (seeded from config)
+        self._savings_to_date = self._config.get("savings_to_date", 0.0)
+        self._total_accumulated_savings = 0.0
+
+        # Octopus billing (optional)
+        if self._config.get("octopus_api_key"):
+            self.octopus = OctopusBillingFetcher(
+                api_key=self._config["octopus_api_key"],
+                mpan=self._config.get("octopus_mpan", ""),
+                serial=self._config.get("octopus_serial", ""),
+                product_code=self._config.get("octopus_product_code", ""),
+                tariff_code=self._config.get("octopus_tariff_code", ""),
+            )
+
     async def _async_update_data(self) -> ProgrammeState:
         """Gather inputs, run rules, return new programme."""
         inputs = await self._gather_inputs()
@@ -73,6 +96,27 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 duration_hours=int(spec["duration_hours"]),
                 appliance_name=name,
             )
+
+        # Calculate SOC trajectory for dashboard
+        from datetime import datetime, timezone
+        current_hour = datetime.now(timezone.utc).hour
+        self.soc_trajectory = calculate_soc_trajectory(
+            current_soc=inputs.current_soc,
+            solar_forecast_kwh=inputs.solar_forecast_kwh,
+            load_forecast_kwh=inputs.load_forecast_kwh,
+            programme_slots=programme.slots,
+            battery_capacity_kwh=self._config.get("battery_capacity_kwh", 20.0),
+            max_charge_kw=self._config.get("max_charge_kw", 5.0),
+            charge_efficiency=self._config.get("charge_efficiency", 0.95),
+            discharge_efficiency=self._config.get("discharge_efficiency", 0.95),
+            min_soc=self._config.get("min_soc", 20.0),
+            max_soc=self._config.get("max_soc", 100.0),
+            current_hour=current_hour,
+        )
+
+        # Update savings vs flat rate
+        flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
+        self.cost_accumulator.calculate_savings_vs_flat(flat_rate)
 
         return programme
 
@@ -165,3 +209,55 @@ class HEO2Coordinator(DataUpdateCoordinator):
             ),
         ]
         return rates
+
+    @property
+    def total_savings(self) -> float:
+        """Cumulative savings: seed value + accumulated from cost tracker."""
+        return self._savings_to_date + self._total_accumulated_savings
+
+    @property
+    def system_cost(self) -> float:
+        return self._config.get("system_cost", 16800.0)
+
+    @property
+    def additional_costs(self) -> float:
+        return self._config.get("additional_costs", 0.0)
+
+    @property
+    def payback_progress(self) -> float:
+        """Percentage progress towards payback (0-100)."""
+        total_cost = self.system_cost + self.additional_costs
+        if total_cost <= 0:
+            return 100.0
+        return min(100.0, (self.total_savings / total_cost) * 100.0)
+
+    @property
+    def estimated_payback_date(self) -> str | None:
+        """Project payback date based on current savings rate."""
+        from datetime import datetime, timezone, timedelta
+        install_date_str = self._config.get("install_date", "2025-02-01")
+        try:
+            install_date = datetime.strptime(install_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+        now = datetime.now(timezone.utc)
+        days_elapsed = max(1, (now - install_date).days)
+        daily_savings = self.total_savings / days_elapsed
+
+        if daily_savings <= 0:
+            return None
+
+        total_cost = self.system_cost + self.additional_costs
+        remaining = total_cost - self.total_savings
+        if remaining <= 0:
+            return "Paid back"
+
+        days_remaining = remaining / daily_savings
+        payback_date = now + timedelta(days=days_remaining)
+        return payback_date.strftime("%Y-%m-%d")
+
+    @property
+    def active_rule_names(self) -> list[str]:
+        """List of currently active rule names."""
+        return [r.name for r in self._engine._rules if r.enabled]
