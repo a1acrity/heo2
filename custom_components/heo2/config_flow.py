@@ -38,7 +38,7 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=vol.Schema({
                 vol.Required("mqtt_host", default="localhost"): str,
-                vol.Required("mqtt_port", default=1883): int,
+                vol.Required("mqtt_port", default=1883): vol.Coerce(int),
                 vol.Optional("mqtt_username", default=""): str,
                 vol.Optional("mqtt_password", default=""): str,
                 vol.Required("mqtt_base_topic", default=MQTT_BASE_TOPIC): str,
@@ -52,13 +52,13 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="battery",
             data_schema=vol.Schema({
-                vol.Required("battery_capacity_kwh", default=DEFAULT_BATTERY_CAPACITY_KWH): float,
-                vol.Required("min_soc", default=DEFAULT_MIN_SOC): int,
-                vol.Required("max_soc", default=DEFAULT_MAX_SOC): int,
-                vol.Required("max_charge_kw", default=DEFAULT_MAX_CHARGE_KW): float,
-                vol.Required("max_discharge_kw", default=DEFAULT_MAX_DISCHARGE_KW): float,
-                vol.Required("charge_efficiency", default=DEFAULT_CHARGE_EFFICIENCY): float,
-                vol.Required("discharge_efficiency", default=DEFAULT_DISCHARGE_EFFICIENCY): float,
+                vol.Required("battery_capacity_kwh", default=DEFAULT_BATTERY_CAPACITY_KWH): vol.Coerce(float),
+                vol.Required("min_soc", default=DEFAULT_MIN_SOC): vol.Coerce(int),
+                vol.Required("max_soc", default=DEFAULT_MAX_SOC): vol.Coerce(int),
+                vol.Required("max_charge_kw", default=DEFAULT_MAX_CHARGE_KW): vol.Coerce(float),
+                vol.Required("max_discharge_kw", default=DEFAULT_MAX_DISCHARGE_KW): vol.Coerce(float),
+                vol.Required("charge_efficiency", default=DEFAULT_CHARGE_EFFICIENCY): vol.Coerce(float),
+                vol.Required("discharge_efficiency", default=DEFAULT_DISCHARGE_EFFICIENCY): vol.Coerce(float),
             }),
         )
 
@@ -69,8 +69,8 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="tariff",
             data_schema=vol.Schema({
-                vol.Required("igo_day_rate", default=DEFAULT_IGO_DAY_RATE_PENCE): float,
-                vol.Required("igo_night_rate", default=DEFAULT_IGO_NIGHT_RATE_PENCE): float,
+                vol.Required("igo_day_rate", default=DEFAULT_IGO_DAY_RATE_PENCE): vol.Coerce(float),
+                vol.Required("igo_night_rate", default=DEFAULT_IGO_NIGHT_RATE_PENCE): vol.Coerce(float),
                 vol.Required("igo_night_start", default="23:30"): str,
                 vol.Required("igo_night_end", default="05:30"): str,
             }),
@@ -108,7 +108,7 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("rule_evening_protect", default=True): bool,
                 vol.Required("rule_igo_dispatch", default=True): bool,
                 vol.Required("rule_ev_charging", default=True): bool,
-                vol.Required("max_target_soc", default=100): int,
+                vol.Required("max_target_soc", default=100): vol.Coerce(int),
             }),
         )
 
@@ -125,7 +125,7 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional("solcast_api_key", default=""): str,
                 vol.Optional("solcast_resource_id", default=""): str,
                 vol.Optional("agilepredict_url", default=""): str,
-                vol.Required("load_baseline_w", default=DEFAULT_LOAD_BASELINE_W): float,
+                vol.Required("load_baseline_w", default=DEFAULT_LOAD_BASELINE_W): vol.Coerce(float),
                 vol.Required("dry_run", default=True): bool,
             }),
         )
