@@ -1,0 +1,102 @@
+# HEO II — View 1: Forecast & Plan
+# Requires: apexcharts-card, mushroom, flex-table-card
+
+title: Forecast & Plan
+path: forecast-plan
+cards:
+  # 24-hour energy chart
+  - type: custom:apexcharts-card
+    header:
+      title: 24-Hour Energy Forecast
+      show: true
+    graph_span: 24h
+    span:
+      start: day
+    series:
+      - entity: sensor.heo2_solar_forecast_hourly
+        data_generator: |
+          const forecast = entity.attributes.forecast || [];
+          return forecast.map((val, i) => {
+            const d = new Date();
+            d.setHours(i, 0, 0, 0);
+            return [d.getTime(), val];
+          });
+        name: Solar (kWh)
+        type: area
+        color: "#f59e0b"
+        opacity: 0.3
+      - entity: sensor.heo2_load_forecast_hourly
+        data_generator: |
+          const forecast = entity.attributes.forecast || [];
+          return forecast.map((val, i) => {
+            const d = new Date();
+            d.setHours(i, 0, 0, 0);
+            return [d.getTime(), val];
+          });
+        name: Load (W)
+        type: line
+        color: "#ef4444"
+        stroke_width: 2
+        stroke_dash: 4
+
+  # SOC trajectory chart
+  - type: custom:apexcharts-card
+    header:
+      title: Battery SOC Trajectory
+      show: true
+    graph_span: 24h
+    span:
+      start: day
+    yaxis:
+      - min: 0
+        max: 100
+    series:
+      - entity: sensor.heo2_soc_trajectory
+        data_generator: |
+          const trajectory = entity.attributes.trajectory || [];
+          return trajectory.map((val, i) => {
+            const d = new Date();
+            d.setHours(i, 0, 0, 0);
+            return [d.getTime(), val];
+          });
+        name: SOC (%)
+        type: line
+        color: "#14b8a6"
+        stroke_width: 3
+
+  # Programme slots table
+  - type: custom:flex-table-card
+    title: Programme Slots
+    entities:
+      include: sensor.heo2_programme_slots
+    columns:
+      - name: "#"
+        data: slots
+        modify: x.index + 1
+      - name: Start
+        data: slots
+        modify: x.start
+      - name: End
+        data: slots
+        modify: x.end
+      - name: SOC Target
+        data: slots
+        modify: x.soc + '%'
+      - name: Grid Charge
+        data: slots
+        modify: "x.grid_charge ? '✅' : '❌'"
+
+  # Info chips
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-chips-card
+        chips:
+          - type: entity
+            entity: sensor.heo2_active_rules
+            icon: mdi:format-list-checks
+          - type: entity
+            entity: sensor.heo2_next_action
+            icon: mdi:battery-charging
+          - type: entity
+            entity: sensor.heo2_programme_reason
+            icon: mdi:information-outline

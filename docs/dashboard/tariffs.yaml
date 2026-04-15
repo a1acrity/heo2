@@ -1,0 +1,53 @@
+# HEO II — View 2: Tariffs
+# Requires: apexcharts-card, mushroom
+
+title: Tariffs
+path: tariffs
+cards:
+  # Current rate cards
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_current_import_rate
+        name: Import Rate
+        icon: mdi:transmission-tower-import
+        primary_info: state
+        secondary_info: name
+        layout: vertical
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_current_export_rate
+        name: Export Rate
+        icon: mdi:transmission-tower-export
+        primary_info: state
+        secondary_info: name
+        layout: vertical
+
+  # Import rates chart
+  - type: custom:apexcharts-card
+    header:
+      title: Import Rates (48h)
+      show: true
+    series:
+      - entity: sensor.heo2_import_rates
+        data_generator: |
+          const rates = entity.attributes.rates || [];
+          return rates.map(r => [new Date(r.start).getTime(), r.rate]);
+        name: Import (p/kWh)
+        type: line
+        color: "#3b82f6"
+        curve: stepline
+
+  # Export rates chart
+  - type: custom:apexcharts-card
+    header:
+      title: Export Rates (48h)
+      show: true
+    series:
+      - entity: sensor.heo2_export_rates
+        data_generator: |
+          const rates = entity.attributes.rates || [];
+          return rates.map(r => [new Date(r.start).getTime(), r.rate]);
+        name: Export (p/kWh)
+        type: line
+        color: "#22c55e"
+        curve: stepline

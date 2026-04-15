@@ -1,0 +1,78 @@
+# HEO II — View 3: ROI Tracking
+# Requires: mushroom
+
+title: ROI Tracking
+path: roi-tracking
+cards:
+  # Daily costs
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_daily_import_cost
+        name: Import Cost
+        icon: mdi:cash-minus
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_daily_export_revenue
+        name: Export Revenue
+        icon: mdi:cash-plus
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_daily_solar_value
+        name: Solar Value
+        icon: mdi:white-balance-sunny
+
+  # Weekly costs
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_weekly_net_cost
+        name: Weekly Net Cost
+        icon: mdi:calendar-week
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_weekly_savings_vs_flat
+        name: Weekly Savings vs Flat
+        icon: mdi:piggy-bank
+
+  # Octopus monthly bills (conditional)
+  - type: conditional
+    conditions:
+      - entity: sensor.heo2_octopus_monthly_bill
+        state_not: unavailable
+    card:
+      type: horizontal-stack
+      cards:
+        - type: custom:mushroom-entity-card
+          entity: sensor.heo2_octopus_monthly_bill
+          name: This Month (Octopus)
+          icon: mdi:receipt-text
+        - type: custom:mushroom-entity-card
+          entity: sensor.heo2_octopus_last_month_bill
+          name: Last Month (Octopus)
+          icon: mdi:receipt-text-check
+
+  # Payback progress
+  - type: vertical-stack
+    cards:
+      - type: gauge
+        entity: sensor.heo2_payback_progress
+        name: Payback Progress
+        min: 0
+        max: 100
+        severity:
+          green: 75
+          yellow: 25
+          red: 0
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_estimated_payback_date
+        name: Estimated Payback Date
+        icon: mdi:calendar-check
+      - type: custom:mushroom-entity-card
+        entity: sensor.heo2_total_savings
+        name: Total Savings
+        icon: mdi:cash-multiple
+
+  # Adjustable inputs
+  - type: entities
+    title: System Costs
+    entities:
+      - entity: number.heo2_system_cost
+      - entity: number.heo2_additional_costs
