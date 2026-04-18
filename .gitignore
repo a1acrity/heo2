@@ -5,3 +5,11 @@ __pycache__/
 dist/
 build/
 .worktrees/
+# Adding dev artefacts that shouldn't be tracked
+.coverage
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+docs/bugs.md.bak
