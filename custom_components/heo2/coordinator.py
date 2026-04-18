@@ -191,24 +191,33 @@ class HEO2Coordinator(DataUpdateCoordinator):
         return state.state.lower() in ("on", "true", "1")
 
     def _build_import_rates(self, now) -> list:
-        from datetime import timezone
-        from .models import RateSlot
+        """Build IGO import rate slots relative to `now`.
+
+        Delegates to `heo2.igo_rates.build_igo_import_rates` so the boundary
+        maths is unit-tested in isolation. Local timezone comes from HA config
+        to keep the night-rate window aligned with real clock time under DST.
+        See docs/bugs.md HEO-1 for history.
+        """
+        from zoneinfo import ZoneInfo
+        from .igo_rates import build_igo_import_rates
         from .const import DEFAULT_IGO_NIGHT_RATE_PENCE, DEFAULT_IGO_DAY_RATE_PENCE
 
-        night_rate = self._config.get("igo_night_rate", DEFAULT_IGO_NIGHT_RATE_PENCE)
-        day_rate = self._config.get("igo_day_rate", DEFAULT_IGO_DAY_RATE_PENCE)
-
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        rates = [
-            RateSlot(today, today.replace(hour=5, minute=30), night_rate),
-            RateSlot(today.replace(hour=5, minute=30), today.replace(hour=23, minute=30), day_rate),
-            RateSlot(
-                today.replace(hour=23, minute=30),
-                (today + timedelta(days=1)).replace(hour=5, minute=30),
-                night_rate,
+        tz_name = (self.hass.config.time_zone
+                   if self.hass and self.hass.config.time_zone
+                   else "UTC")
+        tz = ZoneInfo(tz_name)
+        return build_igo_import_rates(
+            now=now,
+            tz=tz,
+            night_start=self._config.get("igo_night_start", "23:30"),
+            night_end=self._config.get("igo_night_end", "05:30"),
+            night_rate_pence=self._config.get(
+                "igo_night_rate", DEFAULT_IGO_NIGHT_RATE_PENCE
             ),
-        ]
-        return rates
+            day_rate_pence=self._config.get(
+                "igo_day_rate", DEFAULT_IGO_DAY_RATE_PENCE
+            ),
+        )
 
     @property
     def total_savings(self) -> float:
