@@ -15,7 +15,7 @@ from .models import ProgrammeInputs, ProgrammeState
 from .rule_engine import RuleEngine
 from .rules import default_rules
 from .load_profile import LoadProfileBuilder
-from .solcast_client import SolcastClient
+from .solar_forecast import solar_forecast_from_hacs
 from .agilepredict_client import AgilePredictClient
 from .appliance_timing import ApplianceTimingCalculator, ApplianceSuggestion
 from .const import DEFAULT_APPLIANCES
@@ -45,10 +45,12 @@ class HEO2Coordinator(DataUpdateCoordinator):
         self._load_builder = LoadProfileBuilder(
             baseline_w=self._config.get("load_baseline_w", 1900.0)
         )
-        self._solcast = SolcastClient(
-            api_key=self._config.get("solcast_api_key", ""),
-            resource_id=self._config.get("solcast_resource_id", ""),
-        ) if self._config.get("solcast_api_key") else None
+        # Solar forecast is read from HACS solcast_solar entity attributes
+        # rather than via HTTP. See HEO-4 for rationale.
+        self._solar_entity = self._config.get(
+            "solcast_entity",
+            "sensor.solcast_pv_forecast_forecast_today",
+        )
         self._agilepredict = AgilePredictClient(
             base_url=self._config.get("agilepredict_url", "https://agilepredict.com"),
         ) if self._config.get("agilepredict_url") else None
@@ -139,9 +141,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             self._config.get("ev_status_entity", ""), default=False
         )
 
-        solar = [0.0] * 24
-        if self._solcast:
-            solar = await self._solcast.fetch_forecast()
+        solar = self._read_solar_forecast(now)
 
         export_rates = []
         if self._agilepredict:
@@ -189,6 +189,39 @@ class HEO2Coordinator(DataUpdateCoordinator):
         if state is None or state.state in ("unknown", "unavailable"):
             return default
         return state.state.lower() in ("on", "true", "1")
+
+    def _read_solar_forecast(self, now) -> list[float]:
+        """Read solar forecast from HACS solcast_solar sensor attributes.
+
+        Returns 24 hourly kWh values, index 0 = 00:00 local time for today.
+        Returns zeros if the sensor is missing or has no detailedHourly
+        attribute. See HEO-4 for the history: HEO II previously made its
+        own Solcast HTTP calls and mis-aggregated the result.
+        """
+        from zoneinfo import ZoneInfo
+        tz_name = (self.hass.config.time_zone
+                   if self.hass and self.hass.config.time_zone
+                   else "UTC")
+        tz = ZoneInfo(tz_name)
+        target_date = now.astimezone(tz).date()
+
+        state = self.hass.states.get(self._solar_entity) if self.hass else None
+        if state is None or state.state in ("unknown", "unavailable"):
+            logger.warning(
+                "Solar forecast entity %s not available, using zero forecast",
+                self._solar_entity,
+            )
+            return [0.0] * 24
+
+        detailed = state.attributes.get("detailedHourly") or []
+        if not detailed:
+            logger.warning(
+                "Solar forecast entity %s has no detailedHourly attribute",
+                self._solar_entity,
+            )
+            return [0.0] * 24
+
+        return solar_forecast_from_hacs(detailed, target_date=target_date)
 
     def _build_import_rates(self, now) -> list:
         """Build IGO import rate slots relative to `now`.

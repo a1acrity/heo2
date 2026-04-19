@@ -13,3 +13,7 @@ __pycache__/
 .venv/
 *.egg-info/
 docs/bugs.md.bak
+
+# Local dev scripts and PR bodies (not tracked)
+.create-issues.ps1
+.pr-*.md
