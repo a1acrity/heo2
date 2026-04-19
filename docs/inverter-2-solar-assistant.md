@@ -1,77 +1,90 @@
 # Connecting Inverter 2 to Solar Assistant
 
-Current state: only inverter 1 is cabled to the Solar Assistant USB hub. Inverter 2 metrics in HA are reflections of whatever Solar Assistant infers from inverter 1's response over the master/slave RS485 link (note `sensor.sa_inverter_2_serial_number` currently shows 2401264337, the same as inverter 1).
+Current state: Only inverter 1 has a direct cable to the Solar Assistant USB hub. Inverter 2 data in HA (`sensor.sa_inverter_2_*`) is reflected via the master/slave RS485 link between the two inverters, not read directly. Diagnostic: `sensor.sa_inverter_2_serial_number` shows 2401264337, the same as inverter 1, confirming the data is inferred rather than directly measured.
 
-To get real per-inverter telemetry and writable control of inverter 2, connect a second USB RS485 cable from the Solar Assistant box into inverter 2's RS485 monitoring port. Both inverters will then report individually.
+Important constraint: **The RS485 port on inverter 2 is occupied by the master/slave parallel-operation cable to inverter 1**. That cable must stay in place — it is what makes the parallel operation work at all. So the option used for inverter 1 (RS485 internal port) is not available for inverter 2.
 
-Source: Solar Assistant documentation for SunSynk SG01LP1 (the 5kW hybrid family your inverters are part of). See https://solar-assistant.io/help/inverters/sunsynk/SG01LP1/rs485 and the family-wide https://solar-assistant.io/help/deye/configuration.
+## Do you actually need direct Solar Assistant telemetry for inverter 2?
 
-## What you need
+Before doing anything, ask this question honestly. The answer depends on two things:
 
-- **1 × USB RS485 cable, Sunsynk/Deye specialised pinout** — you said you already have a spare one of the same type used for inverter 1. Verify this: generic USB RS485 cables from Amazon or eBay will not work. The pinout below is non-standard. If the cable is identical to the one on inverter 1, you're good.
-- **Access inside inverter 2** (power down inverter 2, open case, locate the RS485 port).
+1. **Are you happy with inferred inverter-2 metrics?** The data via the master/slave link is accurate for monitoring purposes (total system view, aggregate power flows). You lose per-inverter breakdown but HEO II's rules operate on aggregate SOC/load/export anyway.
 
-## Cable pinout (for reference)
+2. **Does Solar Assistant relay HEO II's MQTT writes to inverter 2 via the parallel link?** This is the real question. HEO II currently writes `solar_assistant/inverter_1/set_time_point_X/set`. The equivalent `solar_assistant/inverter_2/...` topics exist in the MQTT tree even without a direct SA connection (because SA knows about both inverters from inverter 1's parallel-mode reports). The question is whether **writes** on `inverter_2/*` get acted on through the master/slave RS485 link between the two inverters.
 
-| RJ45 pin | Signal  |
-|----------|---------|
-| 1        | RS485B  |
-| 2        | RS485A  |
-| 3        | GND     |
-| 4–8      | unused  |
+If writes relay via the parallel link, you don't need a second Solar Assistant connection at all — HEO-13 just needs to duplicate the writes to both topic trees.
 
-## Steps
+If writes do NOT relay, you'll need a second direct connection. Then see Options A or B below.
 
-### 1. Power down inverter 2
+## Testing the relay first (recommended)
 
-Follow your normal Sunsynk power-down procedure. Switch off AC, DC, and battery breakers before opening the case.
+This test tells us whether we need the hardware at all.
 
-### 2. Locate the RS485 monitoring port on inverter 2
+1. Note inverter 2's current setting for one timer slot, e.g. via `sensor.sa_inverter_2_capacity_point_2` (currently 10)
+2. Publish a change via MQTT on the inverter_2 topic, using `mosquitto_pub` or the HA UI's MQTT dev tool:
+   ```
+   topic: solar_assistant/inverter_2/capacity_point_2/set
+   payload: 95
+   ```
+3. Wait 30 seconds. Check whether `sensor.sa_inverter_2_capacity_point_2` now reads 95, AND whether the physical inverter 2 accepted the change (look at the panel if accessible, or the Sunsynk Connect app).
 
-The RS485 port is **inside** the inverter (not on the outer case). For the 5kW SG01LP1 models, it's on the communications board near the CAN/BMS ports. The labelling is not always intuitive. Solar Assistant's docs show a diagram — the image at https://solar-assistant.io/help-images/docs/inverters/deye/5k-rs485-port.png is what you want.
+If the readback shows 95 and the physical inverter followed → **relay works**, no second SA connection needed.
 
-Note: this is the port used for RS485 monitoring, NOT the CAN/BMS port used for the battery link, and NOT the WiFi RS232 port on the underside (though the RS232 port can also be used as an alternative — Solar Assistant supports either). You already used RS485 for inverter 1, so stay consistent and use RS485 on inverter 2.
+If the readback doesn't change OR the physical inverter ignored it → **relay doesn't work**, pick Option A or B.
 
-**"2-in-1 BMS port" caveat**: On the latest 5kW firmware the BMS port is used for BOTH SolarAssistant monitoring AND battery CAN at the same time. If your inverter 1 is already connected that way, inverter 2 should be done the same way. See https://solar-assistant.io/help/inverters/sunsynk/SG01LP1/2-in-1-bms-port.
+Undo the test change afterwards by setting the point back to its original value.
 
-### 3. Plug in the cable
+## Option A: RS232 USB serial cable (if relay fails)
 
-RJ45 end → RS485 port on inverter 2. USB end → a spare USB port on the Solar Assistant Pi.
+Sunsynk inverters have a second comms port — the **RS232 WiFi/dongle port on the bottom of the inverter**. This is completely separate from the internal RS485 port. It's where the stock Sunsynk WiFi dongle plugs in — if you don't use the Sunsynk cloud, this port is free.
 
-### 4. Reassemble and power inverter 2 back up
+**What you need**: a USB-to-RS232 DB9 serial cable with Prolific PL2303 or FTDI chipset. Generic and available on Amazon for about £10-15. Unlike the RS485 cable, this one has no proprietary pinout — any standard USB serial cable works. Solar Assistant's docs confirm: "a normal USB serial cable available from most electronic stores" (https://solar-assistant.io/help/inverters/sunsynk/SG01LP1/rs232).
 
-Close the case and restore power.
+Your existing spare USB RS485 cable **will not work** for this port — wrong protocol, wrong connector.
 
-### 5. Configure Solar Assistant
+**Caveat**: "When using this option, you will not be able to use the standard Deye/SunSynk dongle as the dongle can only be connected to this port." Not an issue if you're not using the Sunsynk cloud app.
 
-Open the Solar Assistant web UI (http://192.168.4.84 if the hostname hasn't changed).
+**Steps** (only if you buy the cable):
+1. Locate the RS232 port on the *underside* of inverter 2 (where a WiFi dongle would go if installed)
+2. Plug the DB9 end of the USB serial cable in
+3. Plug the USB end into the Solar Assistant Pi
+4. In the Solar Assistant web UI → Configuration, multi-select both USB ports (the existing RS485 for inverter 1 plus the new RS232 for inverter 2)
+5. Click Connect
+6. Verify: `sensor.sa_inverter_2_serial_number` should change from 2401264337 to inverter 2's real serial
 
-Navigate to Configuration. You should see:
+## Option B: Solarman WiFi dongle (if you have one spare)
 
-- **Inverter model**: "Deye, SunSynk, Sol-Ark" (already selected for inverter 1)
-- **USB port**: currently only one USB port is selected. You now need to **multi-select** both USB ports (the existing one for inverter 1 plus the new one for inverter 2).
+If inverter 2 came with a Sunsynk/Deye WiFi dongle in the box, Solar Assistant can read from the Solarman cloud via your credentials. No cable.
 
-Click Connect.
+**Disadvantages:**
+- Cloud-dependent — Solarman outage or internet problem = no data
+- Higher latency — data lags ~5 minutes versus real-time over cable
+- Control latency — HEO II writes may take 5+ minutes to propagate
 
-### 6. Verify in Home Assistant
+Not recommended for HEO II's use case. Listed here only because Solar Assistant supports it and some people prefer it.
 
-After a couple of minutes the MQTT topics `solar_assistant/inverter_2/*` will carry real inverter-2 data rather than repeats of inverter 1's. Easy smoke test: `sensor.sa_inverter_2_serial_number` should change from 2401264337 (currently a duplicate of inverter 1) to inverter 2's actual serial.
+## Option C: Leave it as-is (recommended for now)
 
-Also check:
-- `sensor.sa_inverter_2_load_power` now tracks inverter 2 specifically
-- `sensor.sa_inverter_2_pv_power_1` / `_2` appear
-- `sensor.sa_inverter_2_capacity_point_1` through `_6` and the grid_charge switches reflect the REAL programme on inverter 2
+Given where we are (dry_run still true, commissioning phase, HEO II not yet writing anything):
+- Inferred inverter-2 data is sufficient
+- HEO-13 (duplicate writes to both inverters) is the real blocker for using the second inverter properly, and may not need additional hardware — run the relay test above first
+- Even when HEO II goes live, if the relay test passes, a second Solar Assistant cable may never be needed
 
-Right now inverter 2 reports a different set of capacity points than inverter 1 (we saw 100/10/100/15/15/15 vs inverter 1's 20/100/100/100/20/20) — once properly linked you can decide whether to harmonise those or keep them intentionally different. HEO II currently only writes to inverter 1 (see HEO-13), so this is cosmetic until we wire up the slave.
+**Recommendation: don't buy hardware until we've proven the MQTT relay test fails.**
 
-## Risks and gotchas
+## Cable reference (for when/if you do Option A)
 
-- **Power down before opening** — the inverter has live AC, DC and battery DC inside. Use proper isolation.
-- **If the cable doesn't work**: check it's the genuine Sunsynk pinout cable (pin 1 = RS485B, pin 2 = RS485A, pin 3 = GND). If you bought it from Solar Assistant's shop alongside the first one, it's fine.
-- **If Solar Assistant shows the USB port but no data** appears after a few minutes: swap the two USB cables between ports (sometimes one port is flaky), or power-cycle the Solar Assistant device.
-- **Serial numbers** are the quickest way to confirm each cable talks to the correct inverter.
+RS232 to DB9 serial cable. Common chipsets:
+- **Prolific PL2303** — widely compatible, cheapest. Some Windows driver issues but fine on Linux (Solar Assistant is Linux).
+- **FTDI FT232** — slightly more expensive, generally more reliable.
 
-## After the physical connection works
+Solar Assistant's shop sells one: https://solar-assistant.io/shop/products/sunsynk_rs232
 
-- HEO II currently hardcodes MQTT writes to `inverter_1` only (tracked as issue #13). Once both inverters are visible in Solar Assistant, we'll need to extend the MqttWriter to publish to both so the slave inverter actually follows the HEO II programme. This is a separate piece of work, not part of the cabling.
-- You'll also want to double-check that the master/slave RS485 link between the two inverters stays in place — don't unplug that thinking it's now redundant. The inverters use it for parallel-inverter coordination, which is separate from Solar Assistant monitoring.
+Generic example referenced in their docs: https://www.amazon.com/Adapter-Chipset%EF%BC%8CDB9-Serial-Converter-Windows/dp/B0759HSLP1/
+
+## Sources
+
+- Solar Assistant connection options: https://solar-assistant.io/help/inverters/sunsynk/SG01LP1
+- RS485 connection (used for inverter 1): https://solar-assistant.io/help/inverters/sunsynk/SG01LP1/rs485
+- RS232 connection (needed for inverter 2 if relay fails): https://solar-assistant.io/help/inverters/sunsynk/SG01LP1/rs232
+- Deye/SunSynk family configuration: https://solar-assistant.io/help/deye/configuration
