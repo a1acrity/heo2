@@ -1,0 +1,3 @@
+# Keep shell scripts LF-only so busybox on HA doesn't choke on CR.
+# Everything else uses the git default.
+*.sh text eol=lf
