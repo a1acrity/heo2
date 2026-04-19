@@ -308,21 +308,42 @@ class HEO2Coordinator(DataUpdateCoordinator):
         tz = ZoneInfo(tz_name)
 
         # Detect whether this entity reports instantaneous power (W) or
-        # a cumulative energy counter (kWh). Units drive the aggregator
-        # choice. Default is power_watts for backward compatibility with
-        # the original HEO-5 design.
-        entity_state = self.hass.states.get(entity_id)
-        unit = (
-            entity_state.attributes.get("unit_of_measurement", "")
-            if entity_state else ""
-        ).lower()
-        if unit in ("kwh", "mwh"):
-            source_type = "cumulative_kwh"
+        # a cumulative energy counter (kWh). Order of precedence:
+        #   1. Explicit config override (load_source_type)
+        #   2. state_class attribute (total_increasing -> cumulative)
+        #   3. device_class attribute (energy -> cumulative, power -> watts)
+        #   4. unit_of_measurement (kwh -> cumulative, w -> watts)
+        # state_class and device_class are more reliable than unit because
+        # MQTT-discovered sensors can publish the value before the unit
+        # attribute is set, and checking only unit leads to a race at
+        # startup (observed in production 2026-04-19).
+        configured_type = self._config.get("load_source_type", "").lower()
+        if configured_type in ("cumulative_kwh", "power_watts"):
+            source_type = configured_type
+            detect_reason = "config override"
         else:
-            source_type = "power_watts"
+            entity_state = self.hass.states.get(entity_id)
+            attrs = entity_state.attributes if entity_state else {}
+            state_class = str(attrs.get("state_class", "")).lower()
+            device_class = str(attrs.get("device_class", "")).lower()
+            unit = str(attrs.get("unit_of_measurement", "")).lower()
+
+            if state_class in ("total_increasing", "total") or device_class == "energy":
+                source_type = "cumulative_kwh"
+                detect_reason = f"state_class={state_class!r} device_class={device_class!r}"
+            elif unit in ("kwh", "mwh"):
+                source_type = "cumulative_kwh"
+                detect_reason = f"unit={unit!r}"
+            elif device_class == "power" or unit in ("w", "kw"):
+                source_type = "power_watts"
+                detect_reason = f"device_class={device_class!r} unit={unit!r}"
+            else:
+                source_type = "power_watts"
+                detect_reason = "default (ambiguous)"
+
         logger.warning(
-            "HEO-5: learning from entity=%s unit=%s source_type=%s",
-            entity_id, unit, source_type,
+            "HEO-5: learning from entity=%s source_type=%s (%s)",
+            entity_id, source_type, detect_reason,
         )
 
         days = learn_days_from_samples(samples, tz, source_type=source_type)
