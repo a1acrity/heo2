@@ -28,6 +28,14 @@ async def async_setup_entry(hass, entry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
+    # Seed the load profile from recorder history (HEO-5). Fire-and-forget
+    # so we do not block startup on a DB query. The first coordinator tick
+    # will use the flat baseline; the second and later ticks use the
+    # learned profile once this task completes.
+    hass.async_create_task(
+        coordinator.async_refresh_load_profile_from_recorder()
+    )
+
     # Wire up CostTracker state-change listeners
     unsub_callbacks = []
     config = dict(entry.data)
