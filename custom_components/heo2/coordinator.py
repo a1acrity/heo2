@@ -307,7 +307,25 @@ class HEO2Coordinator(DataUpdateCoordinator):
                    else "UTC")
         tz = ZoneInfo(tz_name)
 
-        days = learn_days_from_samples(samples, tz)
+        # Detect whether this entity reports instantaneous power (W) or
+        # a cumulative energy counter (kWh). Units drive the aggregator
+        # choice. Default is power_watts for backward compatibility with
+        # the original HEO-5 design.
+        entity_state = self.hass.states.get(entity_id)
+        unit = (
+            entity_state.attributes.get("unit_of_measurement", "")
+            if entity_state else ""
+        ).lower()
+        if unit in ("kwh", "mwh"):
+            source_type = "cumulative_kwh"
+        else:
+            source_type = "power_watts"
+        logger.warning(
+            "HEO-5: learning from entity=%s unit=%s source_type=%s",
+            entity_id, unit, source_type,
+        )
+
+        days = learn_days_from_samples(samples, tz, source_type=source_type)
         for d, hourly_kwh in days.items():
             # Convert date to datetime at midnight for the builder's
             # existing weekday-or-weekend branching logic.
