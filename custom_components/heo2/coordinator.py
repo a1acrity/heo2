@@ -53,6 +53,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
         )
         self._agilepredict = AgilePredictClient(
             base_url=self._config.get("agilepredict_url", "https://agilepredict.com"),
+            region=self._config.get("agilepredict_region", "M"),
         ) if self._config.get("agilepredict_url") else None
         self._appliance_calc = ApplianceTimingCalculator()
 
