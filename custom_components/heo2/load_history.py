@@ -174,3 +174,35 @@ def learn_days_from_samples(
     for d in dates:
         result[d] = aggregate_samples_to_hourly_kwh(ordered, d, tz)
     return result
+
+
+def states_to_power_samples(states) -> list[tuple]:
+    """Convert HA recorder State-like objects into (datetime, watts) tuples.
+
+    Defensive against ``unknown`` / ``unavailable`` / ``None`` states and
+    malformed numeric values. Non-numeric states, states missing
+    attributes, and states with a None timestamp are all silently
+    skipped so one bad record cannot break the whole history fetch.
+
+    Returns the list ordered by ``last_changed`` ascending. Caller is
+    responsible for treating the returned watts as "load power" including
+    its sign (negative = export); the aggregator clamps to zero.
+    """
+    out: list[tuple] = []
+    for s in states:
+        try:
+            raw = s.state
+            ts = s.last_changed
+        except AttributeError:
+            continue
+        if raw in (None, "unknown", "unavailable"):
+            continue
+        try:
+            watts = float(raw)
+        except (ValueError, TypeError):
+            continue
+        if ts is None:
+            continue
+        out.append((ts, watts))
+    out.sort(key=lambda p: p[0])
+    return out

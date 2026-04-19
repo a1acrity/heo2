@@ -224,6 +224,102 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         return solar_forecast_from_hacs(detailed, target_date=target_date)
 
+    async def async_refresh_load_profile_from_recorder(
+        self, days_back: int = 14,
+    ) -> int:
+        """Seed LoadProfileBuilder from HA recorder history.
+
+        Queries the last ``days_back`` days of state history for the
+        configured ``load_power_entity``, aggregates by hour into kWh,
+        and calls ``LoadProfileBuilder.add_day()`` for each covered date.
+
+        Intended to be called once on startup as a fire-and-forget task
+        so the integration does not block on a recorder query. Safe to
+        call again later; add_day() appends samples rather than replacing,
+        so repeated calls grow the median window rather than overwrite.
+
+        Returns the number of days successfully added. Zero on any
+        failure (recorder unavailable, no entity, no history).
+
+        See HEO-5 for history. Scheduled daily refresh and Store-backed
+        persistence are tracked as follow-up enhancements.
+        """
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta, timezone as _tz
+
+        entity_id = self._config.get("load_power_entity", "")
+        if not entity_id:
+            logger.debug("No load_power_entity configured; skipping history learn")
+            return 0
+
+        try:
+            from homeassistant.components.recorder import (
+                get_instance,
+                history,
+            )
+        except ImportError:
+            logger.warning(
+                "HA recorder component not available; load profile cannot learn"
+            )
+            return 0
+
+        now_utc = datetime.now(_tz.utc)
+        start_utc = now_utc - timedelta(days=days_back)
+
+        try:
+            recorder_instance = get_instance(self.hass)
+            raw = await recorder_instance.async_add_executor_job(
+                history.get_significant_states,
+                self.hass,
+                start_utc,
+                now_utc,
+                [entity_id],
+            )
+        except Exception as exc:  # broad: recorder errors vary
+            logger.warning(
+                "Recorder history fetch failed for %s: %s", entity_id, exc
+            )
+            return 0
+
+        states = raw.get(entity_id) if isinstance(raw, dict) else None
+        if not states:
+            logger.info(
+                "No recorder history for %s in last %d days; "
+                "load profile stays at baseline",
+                entity_id, days_back,
+            )
+            return 0
+
+        from .load_history import (
+            learn_days_from_samples,
+            states_to_power_samples,
+        )
+
+        samples = states_to_power_samples(states)
+        if not samples:
+            logger.info(
+                "No parseable power samples for %s; load profile stays at baseline",
+                entity_id,
+            )
+            return 0
+        tz_name = (self.hass.config.time_zone
+                   if self.hass and self.hass.config.time_zone
+                   else "UTC")
+        tz = ZoneInfo(tz_name)
+
+        days = learn_days_from_samples(samples, tz)
+        for d, hourly_kwh in days.items():
+            # Convert date to datetime at midnight for the builder's
+            # existing weekday-or-weekend branching logic.
+            date_midnight = datetime(d.year, d.month, d.day, tzinfo=tz)
+            self._load_builder.add_day(date_midnight, hourly_kwh)
+
+        logger.info(
+            "Load profile learned from %d samples across %d days for %s",
+            len(samples), len(days), entity_id,
+        )
+        return len(days)
+
     def _build_import_rates(self, now) -> list:
         """Build IGO import rate slots relative to `now`.
 
