@@ -138,3 +138,42 @@ class TestSolarForecastFromHacs:
         # The synthetic 4x bug would have produced ~200+ kWh. The correct
         # one-day total is around 50 kWh. Set a generous ceiling at 2x.
         assert total < 100, f"Suspiciously high forecast {total} kWh, possible regression of HEO-4"
+
+    def test_period_start_as_datetime_object(self):
+        """HACS solcast delivers period_start as datetime.datetime, not a string.
+
+        When HEO II reads state.attributes.get('detailedHourly') from HA, the
+        HACS solcast integration publishes the datetime already parsed. If
+        the pure function only accepts strings, every entry is silently
+        skipped and the sum collapses to zero. This is the HEO-4 production
+        regression — tests passed because fixtures used strings, but the
+        live code path receives datetimes.
+
+        See https://github.com/a1acrity/heo2/issues/... for the investigation.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        london = ZoneInfo("Europe/London")
+        entries = [
+            {"period_start": datetime(2026, 4, 18, 11, 0, tzinfo=london),
+             "pv_estimate": 7.4367, "pv_estimate10": 3.0, "pv_estimate90": 10.0},
+            {"period_start": datetime(2026, 4, 18, 12, 0, tzinfo=london),
+             "pv_estimate": 7.2188, "pv_estimate10": 2.9, "pv_estimate90": 9.5},
+        ]
+        out = solar_forecast_from_hacs(entries, TARGET)
+        assert out[11] == pytest.approx(7.4367)
+        assert out[12] == pytest.approx(7.2188)
+        assert sum(out) == pytest.approx(7.4367 + 7.2188)
+
+    def test_period_start_as_datetime_naive_is_handled(self):
+        """Defensive: if a naive datetime somehow appears, don't crash."""
+        from datetime import datetime
+        entries = [
+            {"period_start": datetime(2026, 4, 18, 12, 0),
+             "pv_estimate": 5.0},
+        ]
+        # Should not raise - either gets accepted (interpreted as target_date
+        # local) or skipped cleanly. Specific behaviour can be decided, but
+        # "raises TypeError" is not acceptable.
+        out = solar_forecast_from_hacs(entries, TARGET)
+        assert len(out) == 24
