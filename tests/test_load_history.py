@@ -265,3 +265,72 @@ class TestLearnDaysFromSamples:
         # This spans local dates 2026-04-18 and 2026-04-19
         assert date(2026, 4, 18) in result
         assert date(2026, 4, 19) in result
+
+class TestAggregateCumulativeKwhToHourly:
+    def test_empty_samples_returns_zeros(self):
+        from heo2.load_history import aggregate_cumulative_kwh_to_hourly
+        out = aggregate_cumulative_kwh_to_hourly([], date(2026, 4, 18), UTC)
+        assert out == [0.0] * 24
+
+    def test_single_sample_returns_zeros(self):
+        """One reading gives no interval to compute a delta."""
+        from heo2.load_history import aggregate_cumulative_kwh_to_hourly
+        samples = [(datetime(2026, 4, 18, 12, 0, tzinfo=UTC), 100.0)]
+        out = aggregate_cumulative_kwh_to_hourly(samples, date(2026, 4, 18), UTC)
+        assert out == [0.0] * 24
+
+    def test_one_kwh_in_one_hour(self):
+        """Meter went from 100.0 to 101.0 kWh in the hour: 1 kWh in hour 12."""
+        from heo2.load_history import aggregate_cumulative_kwh_to_hourly
+        samples = [
+            (datetime(2026, 4, 18, 12, 0, tzinfo=UTC), 100.0),
+            (datetime(2026, 4, 18, 13, 0, tzinfo=UTC), 101.0),
+        ]
+        out = aggregate_cumulative_kwh_to_hourly(samples, date(2026, 4, 18), UTC)
+        assert out[12] == pytest.approx(1.0)
+        assert sum(out) == pytest.approx(1.0)
+
+    def test_increase_spanning_hour_boundary_is_prorated(self):
+        """Meter gained 1 kWh between 12:30 and 13:30: 0.5 kWh in each hour."""
+        from heo2.load_history import aggregate_cumulative_kwh_to_hourly
+        samples = [
+            (datetime(2026, 4, 18, 12, 30, tzinfo=UTC), 100.0),
+            (datetime(2026, 4, 18, 13, 30, tzinfo=UTC), 101.0),
+        ]
+        out = aggregate_cumulative_kwh_to_hourly(samples, date(2026, 4, 18), UTC)
+        assert out[12] == pytest.approx(0.5)
+        assert out[13] == pytest.approx(0.5)
+        assert sum(out) == pytest.approx(1.0)
+
+    def test_meter_reset_is_ignored(self):
+        """If the meter counter decreases (restart, rollover), ignore that interval."""
+        from heo2.load_history import aggregate_cumulative_kwh_to_hourly
+        samples = [
+            (datetime(2026, 4, 18, 10, 0, tzinfo=UTC), 100.0),
+            (datetime(2026, 4, 18, 11, 0, tzinfo=UTC), 101.0),
+            # Counter resets to 0 (inverter restart)
+            (datetime(2026, 4, 18, 12, 0, tzinfo=UTC), 0.0),
+            (datetime(2026, 4, 18, 13, 0, tzinfo=UTC), 1.5),
+        ]
+        out = aggregate_cumulative_kwh_to_hourly(samples, date(2026, 4, 18), UTC)
+        # Hour 10 is fine (100 -> 101 = +1)
+        assert out[10] == pytest.approx(1.0)
+        # Hour 11 sees the drop 101 -> 0, ignored
+        assert out[11] == 0.0
+        # Hour 12 is fine (0 -> 1.5 = +1.5)
+        assert out[12] == pytest.approx(1.5)
+
+    def test_stale_gap_is_dropped(self):
+        """Gap > max_interval means meter was offline, don't spread delta across."""
+        from heo2.load_history import aggregate_cumulative_kwh_to_hourly
+        samples = [
+            (datetime(2026, 4, 18, 10, 0, tzinfo=UTC), 100.0),
+            # 6-hour gap
+            (datetime(2026, 4, 18, 16, 0, tzinfo=UTC), 110.0),
+        ]
+        out = aggregate_cumulative_kwh_to_hourly(
+            samples, date(2026, 4, 18), UTC,
+            max_interval_seconds=2 * 3600,
+        )
+        # Gap too long, interval dropped
+        assert sum(out) == 0.0
