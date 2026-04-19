@@ -37,10 +37,12 @@ async def async_setup_entry(hass, entry) -> bool:
     # wrapper, hass.async_create_task will swallow uncaught exceptions
     # silently and the caller has no way to see why the task did nothing.
     async def _seed_load_profile() -> None:
-        logger.info("HEO-5 startup refresh: scheduling load-profile learn")
+        # NOTE: using warning level temporarily so messages surface at HA's
+        # default log level. Drop back to info once HEO-5 is proven working.
+        logger.warning("HEO-5 startup refresh: scheduling load-profile learn")
         try:
             n_days = await coordinator.async_refresh_load_profile_from_recorder()
-            logger.info("HEO-5 startup refresh: complete, %d days learned", n_days)
+            logger.warning("HEO-5 startup refresh: complete, %d days learned", n_days)
         except Exception:
             logger.exception("HEO-5 startup refresh: raised")
 
