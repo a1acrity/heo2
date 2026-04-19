@@ -45,11 +45,18 @@ def solar_forecast_from_hacs(
 
     for entry in detailed_hourly:
         ts = entry.get("period_start", "")
-        try:
-            period_start = datetime.fromisoformat(ts)
-        except (ValueError, TypeError):
-            # Malformed timestamp: skip, don't fail the whole forecast.
-            continue
+        # HACS solcast_solar publishes period_start as a datetime.datetime
+        # object when read via state.attributes (it's stored as such in HA's
+        # attribute registry). When we query the sensor over REST API HA
+        # serialises it to ISO string. Accept both.
+        if isinstance(ts, datetime):
+            period_start = ts
+        else:
+            try:
+                period_start = datetime.fromisoformat(str(ts))
+            except (ValueError, TypeError):
+                # Malformed timestamp: skip, don't fail the whole forecast.
+                continue
 
         if period_start.date() != target_date:
             continue
