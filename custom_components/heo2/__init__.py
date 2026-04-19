@@ -30,11 +30,21 @@ async def async_setup_entry(hass, entry) -> bool:
 
     # Seed the load profile from recorder history (HEO-5). Fire-and-forget
     # so we do not block startup on a DB query. The first coordinator tick
-    # will use the flat baseline; the second and later ticks use the
-    # learned profile once this task completes.
-    hass.async_create_task(
-        coordinator.async_refresh_load_profile_from_recorder()
-    )
+    # uses the flat baseline; subsequent ticks use the learned profile
+    # once this task completes.
+    #
+    # Wrap the coroutine so exceptions surface in the log. Without the
+    # wrapper, hass.async_create_task will swallow uncaught exceptions
+    # silently and the caller has no way to see why the task did nothing.
+    async def _seed_load_profile() -> None:
+        logger.info("HEO-5 startup refresh: scheduling load-profile learn")
+        try:
+            n_days = await coordinator.async_refresh_load_profile_from_recorder()
+            logger.info("HEO-5 startup refresh: complete, %d days learned", n_days)
+        except Exception:
+            logger.exception("HEO-5 startup refresh: raised")
+
+    hass.async_create_task(_seed_load_profile())
 
     # Wire up CostTracker state-change listeners
     unsub_callbacks = []
