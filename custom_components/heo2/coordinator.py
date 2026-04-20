@@ -23,6 +23,9 @@ from .soc_trajectory import calculate_soc_trajectory
 from .cost_tracker import CostAccumulator
 from .octopus import OctopusBillingFetcher
 from .const import DEFAULT_FLAT_RATE_PENCE
+from .mqtt_writer import MqttWriter, apply_programme_diff
+from .ha_mqtt_transport import HAMqttTransport
+from .inverter_state_reader import read_from_hass as read_inverter_state
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,17 @@ class HEO2Coordinator(DataUpdateCoordinator):
             region=self._config.get("agilepredict_region", "M"),
         ) if self._config.get("agilepredict_url") else None
         self._appliance_calc = ApplianceTimingCalculator()
+
+        # MQTT writer for applying programme changes to the inverter.
+        # dry_run defaults to True so nothing is written until explicitly
+        # enabled via config. See HEO-27.
+        self._inverter_name = self._config.get("inverter_name", "inverter_1")
+        self._writer_dry_run: bool = bool(self._config.get("dry_run", True))
+        self._mqtt_writer: MqttWriter | None = None  # lazy-constructed on first tick
+        # Source of truth for "what's currently on the inverter". Seeded
+        # on first tick from SA-published entities and updated on every
+        # successful write.
+        self._last_known_programme: ProgrammeState | None = None
 
         # State
         self.current_programme: ProgrammeState | None = None
@@ -121,7 +135,87 @@ class HEO2Coordinator(DataUpdateCoordinator):
         flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
         self.cost_accumulator.calculate_savings_vs_flat(flat_rate)
 
+        # Apply programme to inverter via MQTT if enabled.
+        # Any failure is logged but does NOT abort the tick - the coordinator
+        # still returns a valid programme and the next tick will retry
+        # the diff against the un-updated _last_known_programme.
+        try:
+            await self._apply_programme_to_inverter(programme)
+        except Exception:
+            logger.exception("HEO-27: apply_programme failed")
+
         return programme
+
+    async def _apply_programme_to_inverter(
+        self, new_programme: ProgrammeState,
+    ) -> None:
+        """Diff new_programme vs last-known inverter state and write changes.
+
+        Lazy-seeds the writer and last-known state on the first call after
+        HA startup, when SA's MQTT discovery has populated the entities.
+        """
+        # Lazy construct writer on first use. HA startup sequence can race
+        # with mqtt component availability, hence deferring past __init__.
+        if self._mqtt_writer is None:
+            transport = HAMqttTransport(self.hass)
+            self._mqtt_writer = MqttWriter(
+                transport=transport,
+                inverter_name=self._inverter_name,
+                dry_run=self._writer_dry_run,
+            )
+            logger.info(
+                "HEO-27: MqttWriter constructed (inverter=%s dry_run=%s)",
+                self._inverter_name, self._writer_dry_run,
+            )
+
+        # Lazy seed last-known state on first tick.
+        if self._last_known_programme is None:
+            self._last_known_programme = read_inverter_state(
+                self.hass, inverter_name=self._inverter_name,
+            )
+            logger.info(
+                "HEO-27: seeded last-known programme from HA entities "
+                "(slot1 cap=%d gc=%s, slot3 cap=%d)",
+                self._last_known_programme.slots[0].capacity_soc,
+                self._last_known_programme.slots[0].grid_charge,
+                self._last_known_programme.slots[2].capacity_soc,
+            )
+
+        writes = self._mqtt_writer.diff(
+            self._last_known_programme, new_programme,
+        )
+        if not writes:
+            logger.debug("HEO-27: no diffs, nothing to write")
+            return
+
+        logger.info(
+            "HEO-27: %d slot write(s) needed (dry_run=%s)",
+            len(writes), self._writer_dry_run,
+        )
+
+        result, self._last_known_programme = await apply_programme_diff(
+            self._mqtt_writer,
+            self._last_known_programme,
+            new_programme,
+        )
+
+        if result.dry_run_log:
+            for line in result.dry_run_log:
+                logger.info("HEO-27: %s", line)
+
+        if result.success:
+            logger.info(
+                "HEO-27: %d/%d writes confirmed",
+                result.writes_confirmed, result.writes_attempted,
+            )
+        else:
+            logger.warning(
+                "HEO-27: write failed at slot %s param %s: %s "
+                "(%d/%d confirmed before failure); will retry next tick",
+                result.failed_slot, result.failed_param,
+                result.failed_reason,
+                result.writes_confirmed, result.writes_attempted,
+            )
 
     async def _gather_inputs(self) -> ProgrammeInputs:
         """Build ProgrammeInputs from HA entities and external APIs."""

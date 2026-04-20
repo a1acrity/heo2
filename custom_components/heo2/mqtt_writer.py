@@ -321,3 +321,36 @@ class MqttWriter:
                 self._response_futures.pop(setting_display, None)
 
         return False, last_reason
+
+
+async def apply_programme_diff(
+    writer: "MqttWriter",
+    last_known: "ProgrammeState",
+    new_programme: "ProgrammeState",
+) -> tuple["MqttWriteResult", "ProgrammeState"]:
+    """Diff new_programme against last_known and apply via writer.
+
+    Returns (result, effective_last_known) where effective_last_known is:
+      - new_programme if the write succeeded (or was dry-run)
+      - last_known unchanged if the write failed (caller should retry
+        on next tick; partial successes are NOT committed)
+
+    Behaviour on dry_run: writer reports success with writes_confirmed == N
+    and dry_run_log populated. We still advance last_known because in
+    dry_run mode we're simulating a world where the writes happened, so
+    the next tick should see no diff. This prevents re-logging the same
+    "Would publish" lines every 15 minutes.
+
+    Pure async, no HA imports. Callable from the coordinator with real
+    HAMqttTransport-backed writer, or from tests with FakeTransport.
+    """
+    writes = writer.diff(last_known, new_programme)
+    if not writes:
+        # Fabricate a success result for the "no work" case
+        result = MqttWriteResult(success=True, writes_attempted=0, writes_confirmed=0)
+        return result, last_known
+
+    result = await writer.write_registers(writes)
+    if result.success:
+        return result, new_programme
+    return result, last_known
