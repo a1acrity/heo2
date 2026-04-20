@@ -410,3 +410,131 @@ class TestWriteRegisters:
         result = await writer.write_registers([])
         assert result.success is True
         assert result.writes_attempted == 0
+
+
+# -----------------------------------------------------------------------
+# apply_programme_diff - the pure helper used by the coordinator
+# -----------------------------------------------------------------------
+
+from heo2.mqtt_writer import apply_programme_diff
+
+
+class TestApplyProgrammeDiff:
+    @pytest.mark.asyncio
+    async def test_no_diff_returns_last_known_unchanged(self):
+        """When new matches last_known, no writes are attempted and
+        last_known is returned as-is (not replaced with a new object)."""
+        transport = FakeTransport()
+        writer = MqttWriter(transport=transport)
+        programme = _baseline_programme()
+
+        result, returned_last_known = await apply_programme_diff(
+            writer, programme, programme,
+        )
+
+        assert result.success is True
+        assert result.writes_attempted == 0
+        assert result.writes_confirmed == 0
+        assert len(transport.published) == 0
+        assert returned_last_known is programme
+
+    @pytest.mark.asyncio
+    async def test_success_advances_last_known_to_new(self):
+        """After a successful write, last_known should reflect the new
+        programme so the next tick sees no diff."""
+        transport = FakeTransport()
+        transport.script_responses([
+            "Set 'Capacity point 1' to '80': Saved.",
+        ])
+        writer = MqttWriter(transport=transport)
+
+        current = _baseline_programme()
+        new = _baseline_programme()
+        new.slots[0] = SlotConfig(time(0, 0), time(5, 30), 80, True)
+
+        result, returned_last_known = await apply_programme_diff(
+            writer, current, new,
+        )
+
+        assert result.success is True
+        assert returned_last_known is new
+        assert returned_last_known.slots[0].capacity_soc == 80
+
+
+    @pytest.mark.asyncio
+    async def test_failure_keeps_last_known_unchanged(self):
+        """If SA rejects the write, last_known must NOT advance.
+        Next tick should then retry the same diff."""
+        transport = FakeTransport()
+        transport.script_responses([
+            "Set 'Capacity point 1' to '80': Error: Inverter unreachable.",
+        ])
+        writer = MqttWriter(transport=transport)
+
+        current = _baseline_programme()
+        new = _baseline_programme()
+        new.slots[0] = SlotConfig(time(0, 0), time(5, 30), 80, True)
+
+        result, returned_last_known = await apply_programme_diff(
+            writer, current, new,
+        )
+
+        assert result.success is False
+        assert returned_last_known is current
+        # Caller still has the OLD programme; next tick will re-diff.
+        assert returned_last_known.slots[0].capacity_soc == 100
+
+    @pytest.mark.asyncio
+    async def test_dry_run_advances_last_known(self):
+        """In dry_run mode, advance last_known anyway so we don't spam
+        the log with 'Would publish' lines every tick. The coordinator
+        is simulating the world where the writes happened."""
+        transport = FakeTransport()
+        writer = MqttWriter(transport=transport, dry_run=True)
+
+        current = _baseline_programme()
+        new = _baseline_programme()
+        new.slots[0] = SlotConfig(time(0, 0), time(5, 30), 80, True)
+
+        result, returned_last_known = await apply_programme_diff(
+            writer, current, new,
+        )
+
+        assert result.success is True
+        assert len(result.dry_run_log) >= 1
+        assert len(transport.published) == 0
+        # dry_run advances last_known to simulate the writes
+        assert returned_last_known is new
+
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_does_not_partially_commit(self):
+        """If write 2 of 3 fails, last_known stays at the pre-write state.
+        This is conservative but correct: there's no safe way to represent
+        'slot 1 updated, slot 2 failed, slot 3 never tried' as a single
+        ProgrammeState. Next tick re-diffs from the original state and
+        retries everything."""
+        transport = FakeTransport()
+        transport.script_responses([
+            "Set 'Capacity point 1' to '80': Saved.",  # 1 ok
+            "Set 'Capacity point 2' to '60': Error: No response.",  # 2 fails
+            # slot 3 never attempted
+        ])
+        writer = MqttWriter(transport=transport)
+
+        current = _baseline_programme()
+        new = _baseline_programme()
+        new.slots[0] = SlotConfig(time(0, 0), time(5, 30), 80, True)
+        new.slots[1] = SlotConfig(time(5, 30), time(18, 30), 60, False)
+        new.slots[2] = SlotConfig(time(18, 30), time(23, 30), 40, False)
+
+        result, returned_last_known = await apply_programme_diff(
+            writer, current, new,
+        )
+
+        assert result.success is False
+        assert result.failed_slot == 2
+        assert result.writes_confirmed == 1
+        # last_known still reflects the PRE-write world
+        assert returned_last_known is current
+        assert returned_last_known.slots[0].capacity_soc == 100  # unchanged
