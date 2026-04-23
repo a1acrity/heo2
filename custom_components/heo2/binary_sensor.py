@@ -22,7 +22,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: HEO2Coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([HealthySensor(coordinator, entry)])
+    async_add_entities([
+        HealthySensor(coordinator, entry),
+        WritesBlockedSensor(coordinator, entry),
+    ])
 
 
 class HealthySensor(CoordinatorEntity, BinarySensorEntity):
@@ -36,3 +39,29 @@ class HealthySensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         return self.coordinator.healthy
+
+
+class WritesBlockedSensor(CoordinatorEntity, BinarySensorEntity):
+    """Dashboard alert indicator: ON when HEO II cannot write the
+    programme to the inverter right now.
+
+    Uses device_class=problem so the HA UI colours it red when on,
+    and green when off. Extra state attribute 'reason' explains why
+    when blocked. Useful as a conditional card trigger on dashboards.
+    """
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coordinator: HEO2Coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_writes_blocked"
+        self._attr_name = "HEO II Writes Blocked"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.writes_blocked
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "reason": self.coordinator.writes_blocked_reason or "writes enabled",
+        }

@@ -27,6 +27,7 @@ from .const import DEFAULT_FLAT_RATE_PENCE
 from .mqtt_writer import MqttWriter, apply_programme_diff
 from .direct_mqtt_transport import DirectMqttTransport
 from .inverter_state_reader import read_from_hass as read_inverter_state
+from .writes_status import _compute_writes_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -566,3 +567,42 @@ class HEO2Coordinator(DataUpdateCoordinator):
     def active_rule_names(self) -> list[str]:
         """List of currently active rule names."""
         return [r.name for r in self._engine._rules if r.enabled]
+
+    @property
+    def writes_blocked(self) -> bool:
+        """True when HEO II cannot currently send programme changes to
+        the inverter. Drives binary_sensor.heo_ii_writes_blocked so the
+        dashboard can show an alert.
+
+        Blocked conditions:
+          - dry_run is True (writes suppressed by config)
+          - MqttWriter hasn't been constructed yet (early startup)
+          - DirectMqttTransport exists but is not connected
+        """
+        blocked, _ = _compute_writes_blocked(
+            dry_run=self._writer_dry_run,
+            writer_constructed=self._mqtt_writer is not None,
+            transport_exists=self._mqtt_transport is not None,
+            transport_connected=(
+                self._mqtt_transport.is_connected
+                if self._mqtt_transport is not None else False
+            ),
+            host=self._sa_mqtt_host,
+        )
+        return blocked
+
+    @property
+    def writes_blocked_reason(self) -> str:
+        """Short human-readable reason matching writes_blocked, for the
+        binary sensor's state attributes. Returns '' when not blocked."""
+        _, reason = _compute_writes_blocked(
+            dry_run=self._writer_dry_run,
+            writer_constructed=self._mqtt_writer is not None,
+            transport_exists=self._mqtt_transport is not None,
+            transport_connected=(
+                self._mqtt_transport.is_connected
+                if self._mqtt_transport is not None else False
+            ),
+            host=self._sa_mqtt_host,
+        )
+        return reason
