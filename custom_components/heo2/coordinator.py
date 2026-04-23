@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -24,8 +25,9 @@ from .cost_tracker import CostAccumulator
 from .octopus import OctopusBillingFetcher
 from .const import DEFAULT_FLAT_RATE_PENCE
 from .mqtt_writer import MqttWriter, apply_programme_diff
-from .ha_mqtt_transport import HAMqttTransport
+from .direct_mqtt_transport import DirectMqttTransport
 from .inverter_state_reader import read_from_hass as read_inverter_state
+from .writes_status import _compute_writes_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +67,15 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # enabled via config. See HEO-27.
         self._inverter_name = self._config.get("inverter_name", "inverter_1")
         self._writer_dry_run: bool = bool(self._config.get("dry_run", True))
+        # SA broker connection details. Defaults point at Paddy's install;
+        # override via config entry for other deployments. No auth required
+        # for SA's default broker configuration.
+        self._sa_mqtt_host: str = self._config.get("sa_mqtt_host", "192.168.4.7")
+        self._sa_mqtt_port: int = int(self._config.get("sa_mqtt_port", 1883))
+        self._sa_mqtt_username: str | None = self._config.get("sa_mqtt_username") or None
+        self._sa_mqtt_password: str | None = self._config.get("sa_mqtt_password") or None
         self._mqtt_writer: MqttWriter | None = None  # lazy-constructed on first tick
+        self._mqtt_transport: DirectMqttTransport | None = None  # owned by this coordinator
         # Source of truth for "what's currently on the inverter". Seeded
         # on first tick from SA-published entities and updated on every
         # successful write.
@@ -156,15 +166,39 @@ class HEO2Coordinator(DataUpdateCoordinator):
         """
         # Lazy construct writer on first use. HA startup sequence can race
         # with mqtt component availability, hence deferring past __init__.
+        # The DirectMqttTransport connects directly to SA's broker rather
+        # than going through HA's local mosquitto + bridge, because adding
+        # outbound to the bridge config kills inbound telemetry in
+        # mosquitto 2.1.2. See HEO-27 discussion.
         if self._mqtt_writer is None:
-            transport = HAMqttTransport(self.hass)
+            try:
+                transport = DirectMqttTransport(
+                    loop=asyncio.get_event_loop(),
+                    host=self._sa_mqtt_host,
+                    port=self._sa_mqtt_port,
+                    username=self._sa_mqtt_username,
+                    password=self._sa_mqtt_password,
+                    client_id="heo2_writer",
+                )
+                await transport.connect()
+            except Exception:
+                logger.exception(
+                    "HEO-27: DirectMqttTransport connect to %s:%d failed; "
+                    "will retry on next tick",
+                    self._sa_mqtt_host, self._sa_mqtt_port,
+                )
+                return
+
+            self._mqtt_transport = transport
             self._mqtt_writer = MqttWriter(
                 transport=transport,
                 inverter_name=self._inverter_name,
                 dry_run=self._writer_dry_run,
             )
-            logger.info(
-                "HEO-27: MqttWriter constructed (inverter=%s dry_run=%s)",
+            logger.warning(
+                "HEO-27: MqttWriter ready via DirectMqttTransport "
+                "(broker=%s:%d, inverter=%s, dry_run=%s)",
+                self._sa_mqtt_host, self._sa_mqtt_port,
                 self._inverter_name, self._writer_dry_run,
             )
 
@@ -173,7 +207,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             self._last_known_programme = read_inverter_state(
                 self.hass, inverter_name=self._inverter_name,
             )
-            logger.info(
+            logger.warning(
                 "HEO-27: seeded last-known programme from HA entities "
                 "(slot1 cap=%d gc=%s, slot3 cap=%d)",
                 self._last_known_programme.slots[0].capacity_soc,
@@ -188,7 +222,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             logger.debug("HEO-27: no diffs, nothing to write")
             return
 
-        logger.info(
+        logger.warning(
             "HEO-27: %d slot write(s) needed (dry_run=%s)",
             len(writes), self._writer_dry_run,
         )
@@ -201,10 +235,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         if result.dry_run_log:
             for line in result.dry_run_log:
-                logger.info("HEO-27: %s", line)
+                logger.warning("HEO-27: %s", line)
 
         if result.success:
-            logger.info(
+            logger.warning(
                 "HEO-27: %d/%d writes confirmed",
                 result.writes_confirmed, result.writes_attempted,
             )
@@ -533,3 +567,42 @@ class HEO2Coordinator(DataUpdateCoordinator):
     def active_rule_names(self) -> list[str]:
         """List of currently active rule names."""
         return [r.name for r in self._engine._rules if r.enabled]
+
+    @property
+    def writes_blocked(self) -> bool:
+        """True when HEO II cannot currently send programme changes to
+        the inverter. Drives binary_sensor.heo_ii_writes_blocked so the
+        dashboard can show an alert.
+
+        Blocked conditions:
+          - dry_run is True (writes suppressed by config)
+          - MqttWriter hasn't been constructed yet (early startup)
+          - DirectMqttTransport exists but is not connected
+        """
+        blocked, _ = _compute_writes_blocked(
+            dry_run=self._writer_dry_run,
+            writer_constructed=self._mqtt_writer is not None,
+            transport_exists=self._mqtt_transport is not None,
+            transport_connected=(
+                self._mqtt_transport.is_connected
+                if self._mqtt_transport is not None else False
+            ),
+            host=self._sa_mqtt_host,
+        )
+        return blocked
+
+    @property
+    def writes_blocked_reason(self) -> str:
+        """Short human-readable reason matching writes_blocked, for the
+        binary sensor's state attributes. Returns '' when not blocked."""
+        _, reason = _compute_writes_blocked(
+            dry_run=self._writer_dry_run,
+            writer_constructed=self._mqtt_writer is not None,
+            transport_exists=self._mqtt_transport is not None,
+            transport_connected=(
+                self._mqtt_transport.is_connected
+                if self._mqtt_transport is not None else False
+            ),
+            host=self._sa_mqtt_host,
+        )
+        return reason
