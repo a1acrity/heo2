@@ -194,7 +194,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 inverter_name=self._inverter_name,
                 dry_run=self._writer_dry_run,
             )
-            logger.info(
+            logger.warning(
                 "HEO-27: MqttWriter ready via DirectMqttTransport "
                 "(broker=%s:%d, inverter=%s, dry_run=%s)",
                 self._sa_mqtt_host, self._sa_mqtt_port,
@@ -206,7 +206,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             self._last_known_programme = read_inverter_state(
                 self.hass, inverter_name=self._inverter_name,
             )
-            logger.info(
+            logger.warning(
                 "HEO-27: seeded last-known programme from HA entities "
                 "(slot1 cap=%d gc=%s, slot3 cap=%d)",
                 self._last_known_programme.slots[0].capacity_soc,
@@ -221,7 +221,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             logger.debug("HEO-27: no diffs, nothing to write")
             return
 
-        logger.info(
+        logger.warning(
             "HEO-27: %d slot write(s) needed (dry_run=%s)",
             len(writes), self._writer_dry_run,
         )
@@ -234,10 +234,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         if result.dry_run_log:
             for line in result.dry_run_log:
-                logger.info("HEO-27: %s", line)
+                logger.warning("HEO-27: %s", line)
 
         if result.success:
-            logger.info(
+            logger.warning(
                 "HEO-27: %d/%d writes confirmed",
                 result.writes_confirmed, result.writes_attempted,
             )
