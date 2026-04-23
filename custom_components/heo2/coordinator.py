@@ -203,10 +203,21 @@ class HEO2Coordinator(DataUpdateCoordinator):
             )
 
         # Lazy seed last-known state on first tick.
+        # read_inverter_state returns None if SA's MQTT-discovered
+        # entities haven't been populated yet (HA startup race). In that
+        # case we skip seeding and retry next tick. Writing against bogus
+        # seed values would produce spurious SA log entries.
         if self._last_known_programme is None:
-            self._last_known_programme = read_inverter_state(
+            seeded = read_inverter_state(
                 self.hass, inverter_name=self._inverter_name,
             )
+            if seeded is None:
+                logger.warning(
+                    "HEO-27: deferring seed - SA entities not yet populated "
+                    "in HA (discovery still in progress?); retry next tick",
+                )
+                return  # No writer activity until we have a real baseline
+            self._last_known_programme = seeded
             logger.warning(
                 "HEO-27: seeded last-known programme from HA entities "
                 "(slot1 cap=%d gc=%s, slot3 cap=%d)",
