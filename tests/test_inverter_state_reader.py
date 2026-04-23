@@ -146,3 +146,88 @@ class TestReadProgrammeState:
             self._make_lookup(values), inverter_name="inverter_2",
         )
         assert state.slots[0].capacity_soc == 42
+
+
+# -----------------------------------------------------------------------
+# read_from_hass - the HA adapter with defer-if-missing behaviour
+# -----------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from heo2.inverter_state_reader import read_from_hass
+
+
+def _fake_hass(entity_states: dict[str, str]):
+    """Build a minimal hass-like object with a states.get(eid) method.
+
+    entity_states maps entity_id -> state string. Missing entities
+    return None (as HA does for entities that don't exist)."""
+    def _get(entity_id: str):
+        state_val = entity_states.get(entity_id)
+        if state_val is None:
+            return None
+        return SimpleNamespace(state=state_val)
+
+    hass = SimpleNamespace()
+    hass.states = SimpleNamespace(get=_get)
+    return hass
+
+
+def _all_18_entities_populated() -> dict[str, str]:
+    """Build a dict of all 18 SA slot entities with plausible values.
+
+    Matches what Paddy's install had pre-HEO-27-direct-mqtt work."""
+    vals: dict[str, str] = {}
+    caps = [23, 100, 100, 100, 20, 20]
+    times = ["00:00", "05:30", "14:00", "15:00", "18:25", "23:30"]
+    for n in range(1, 7):
+        vals[f"sensor.sa_inverter_1_capacity_point_{n}"] = str(caps[n-1])
+        vals[f"sensor.sa_inverter_1_time_point_{n}"] = times[n-1]
+        vals[f"sensor.sa_inverter_1_grid_charge_point_{n}"] = "false"
+    return vals
+
+
+class TestReadFromHass:
+    def test_all_entities_present_returns_programme_state(self):
+        """Happy path: all 18 entities available, returns a real state."""
+        hass = _fake_hass(_all_18_entities_populated())
+        state = read_from_hass(hass)
+        assert state is not None
+        assert state.slots[0].capacity_soc == 23
+        assert state.slots[1].capacity_soc == 100
+        assert state.slots[4].capacity_soc == 20
+
+    def test_one_entity_missing_returns_none(self):
+        """If even one required entity is missing, defer by returning None.
+        Prevents seeding with fallback values on startup race."""
+        vals = _all_18_entities_populated()
+        del vals["sensor.sa_inverter_1_capacity_point_1"]
+        hass = _fake_hass(vals)
+        assert read_from_hass(hass) is None
+
+    def test_one_entity_unknown_returns_none(self):
+        """State value 'unknown' should be treated as missing."""
+        vals = _all_18_entities_populated()
+        vals["sensor.sa_inverter_1_time_point_3"] = "unknown"
+        hass = _fake_hass(vals)
+        assert read_from_hass(hass) is None
+
+    def test_one_entity_unavailable_returns_none(self):
+        """State 'unavailable' should be treated as missing too."""
+        vals = _all_18_entities_populated()
+        vals["sensor.sa_inverter_1_grid_charge_point_2"] = "unavailable"
+        hass = _fake_hass(vals)
+        assert read_from_hass(hass) is None
+
+    def test_empty_hass_returns_none(self):
+        """Cold-start HA with no entities yet discovered: returns None."""
+        hass = _fake_hass({})
+        assert read_from_hass(hass) is None
+
+    def test_custom_inverter_name_checked(self):
+        """When inverter_name='inverter_2', checks inverter_2 entities
+        (not inverter_1's). inverter_1 entities being present doesn't
+        help satisfy inverter_2 requirements."""
+        vals = _all_18_entities_populated()  # inverter_1 only
+        hass = _fake_hass(vals)
+        assert read_from_hass(hass, inverter_name="inverter_2") is None

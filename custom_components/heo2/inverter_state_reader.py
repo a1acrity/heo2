@@ -126,9 +126,20 @@ def read_programme_state(
 def read_from_hass(
     hass,
     inverter_name: str = "inverter_1",
-) -> ProgrammeState:
-    """HA-side adapter. Calls hass.states.get(...).state for each
-    required entity and delegates to read_programme_state.
+) -> ProgrammeState | None:
+    """HA-side adapter. Reads SA-published slot entities into a
+    ProgrammeState.
+
+    Returns None if ANY of the 18 required entities (6 slots x 3 params:
+    capacity_point, time_point, grid_charge_point) is missing or in an
+    unknown/unavailable state. This handles the HA startup race: on the
+    first coordinator tick, HA's MQTT discovery may not have populated
+    the SA entities yet, so we'd fall back to junk values (cap=50 etc.)
+    and compute a bogus diff. Returning None lets the caller defer
+    seeding to the next tick when discovery has completed.
+
+    When all entities are present, returns a valid ProgrammeState built
+    from them (delegates to read_programme_state).
     """
     def _lookup(entity_id: str) -> str | None:
         state = hass.states.get(entity_id) if hass else None
@@ -137,5 +148,29 @@ def read_from_hass(
         if state.state in ("unknown", "unavailable", "none", ""):
             return None
         return state.state
+
+    # Pre-flight: verify all 18 required entities are populated before
+    # building a ProgrammeState. Any missing means HA MQTT discovery
+    # hasn't finished or the bridge is down; either way, don't seed.
+    inv = inverter_name.replace("inverter_", "")
+    required_templates = [
+        "sensor.sa_inverter_{inv}_capacity_point_{n}",
+        "sensor.sa_inverter_{inv}_time_point_{n}",
+        "sensor.sa_inverter_{inv}_grid_charge_point_{n}",
+    ]
+    missing: list[str] = []
+    for n in range(1, 7):
+        for tmpl in required_templates:
+            entity_id = tmpl.format(inv=inv, n=n)
+            if _lookup(entity_id) is None:
+                missing.append(entity_id)
+
+    if missing:
+        logger.info(
+            "inverter_state_reader: %d/%d entities missing/unavailable "
+            "(e.g. %s); deferring seed until next tick",
+            len(missing), 18, missing[0],
+        )
+        return None
 
     return read_programme_state(_lookup, inverter_name=inverter_name)
