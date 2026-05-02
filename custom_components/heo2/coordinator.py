@@ -643,6 +643,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             live_import_rates=live_import_rates,
             live_export_rates=live_export_rates,
             solar_forecast_kwh_tomorrow=solar_tomorrow,
+            local_tz=self._local_tz(),
         )
 
     def _read_entity_float(self, entity_id: str, default: float) -> float:

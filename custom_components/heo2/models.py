@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import time, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 
 @dataclass
@@ -204,6 +205,24 @@ class ProgrammeInputs:
     # working; the rank logic treats an empty list as "no forecast"
     # which biases towards the conservative top-15% sell window.
     solar_forecast_kwh_tomorrow: list[float] = field(default_factory=list)
+    # Local timezone for projecting `now` and tz-aware rate slots onto
+    # programme-slot time-of-day. Optional for tests that share a single
+    # tz between rates and slots; coordinator passes the real local tz
+    # in production. Rules that compare `inputs.now.time()` against
+    # programme slot times MUST go through `now_local()` so a UTC `now`
+    # doesn't alias against local-time slots in DST. See HEO-31 PR2 fix.
+    local_tz: Optional[ZoneInfo] = None
+
+    def now_local(self) -> datetime:
+        """Return `now` projected into the local timezone if known.
+
+        Falls back to whatever tz `now` already carries (UTC in
+        production) so existing tests that don't set local_tz continue
+        to work.
+        """
+        if self.local_tz is not None and self.now.tzinfo is not None:
+            return self.now.astimezone(self.local_tz)
+        return self.now
 
     def rate_at(self, dt: datetime) -> float | None:
         """Find the import rate at a specific datetime. Returns None if no rate covers it."""
