@@ -127,3 +127,46 @@ class TestComputeWritesBlocked:
         )
         assert blocked is True
         assert "10.0.5.42" in reason
+
+    def test_plan_rejected_blocks_with_h5_prefix(self):
+        """SPEC §6 / H5: validator-rejected plan blocks writes."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            plan_rejected_reason="H1 violation: slot 2 grid_charge in peak",
+        )
+        assert blocked is True
+        assert "H5" in reason
+        assert "H1 violation" in reason
+
+    def test_verify_mismatch_blocks_with_h6_prefix(self):
+        """SPEC §7 / H6: post-write verify mismatch blocks subsequent writes."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            verify_mismatch_reason="slot 2 cap sent=80 got=50",
+        )
+        assert blocked is True
+        assert "H6" in reason
+
+    def test_h4_takes_precedence_over_h5(self):
+        """If we never had live rates we can't have a valid plan; the
+        H4 reason is the more useful one to report."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            live_rates_present=False,
+            plan_rejected_reason="some H5 reason",
+        )
+        assert blocked is True
+        assert "H4" in reason
+        assert "H5" not in reason

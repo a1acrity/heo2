@@ -5,14 +5,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import timedelta, time
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, UPDATE_INTERVAL_MINUTES, DEFAULT_MIN_SOC
-from .models import ProgrammeInputs, ProgrammeState
+from .const import (
+    DOMAIN,
+    UPDATE_INTERVAL_MINUTES,
+    DEFAULT_MIN_SOC,
+    DEFAULT_DAILY_PLAN_TIME,
+    DEFAULT_REPLAN_SOLAR_PCT,
+    DEFAULT_REPLAN_LOAD_PCT,
+    DEFAULT_REPLAN_SOC_PCT,
+    DEFAULT_PEAK_THRESHOLD_PENCE,
+    DEFAULT_SELL_TOP_PCT,
+    DEFAULT_CHEAP_CHARGE_BOTTOM_PCT,
+    DEFAULT_MAX_CHARGE_KW,
+    DEFAULT_MAX_DISCHARGE_KW,
+    DEFAULT_CHARGE_EFFICIENCY,
+    DEFAULT_DISCHARGE_EFFICIENCY,
+    POST_WRITE_VERIFY_DELAY_SECONDS,
+)
+from .models import ProgrammeInputs, ProgrammeState, SlotConfig
 from .rule_engine import RuleEngine
 from .rules import default_rules
 from .load_profile import LoadProfileBuilder
@@ -33,6 +49,13 @@ from .mqtt_writer import MqttWriter, apply_programme_diff
 from .direct_mqtt_transport import DirectMqttTransport
 from .inverter_state_reader import read_from_hass as read_inverter_state
 from .writes_status import _compute_writes_blocked
+from .plan_validator import ValidationResult, validate_plan
+from .projection import Projection
+from .replan_triggers import (
+    BaselineSnapshot,
+    capture_baseline,
+    should_commit_replan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +123,61 @@ class HEO2Coordinator(DataUpdateCoordinator):
         self._live_rates_present: bool = True
         self._bottlecapdave_meter_key: str | None = None
 
+        # SPEC §8 planning lifecycle. The baseline is the programme
+        # currently being driven into the inverter; the rule engine
+        # runs every tick for sensors/diagnostics but only swaps the
+        # baseline when the daily 18:00 window fires or a trigger
+        # condition deviates the world from the baseline-time snapshot.
+        self._baseline: BaselineSnapshot | None = None
+        # SPEC §6 H5 / §7 H6: pre-write validation + post-write verify
+        # state. Reasons surface via writes_blocked_reason; the
+        # projection feeds sensor.heo_ii_projection_today.
+        self._plan_rejected_reason: str | None = None
+        self._verify_mismatch_reason: str | None = None
+        self._validation_warnings: list[str] = []
+        self._last_projection: Projection | None = None
+        # The programme currently on the inverter that the next tick
+        # should verify. Set after a successful write; cleared after
+        # verify completes. Only ever holds a programme that we
+        # actively pushed (never the lazy seed).
+        self._pending_verification: ProgrammeState | None = None
+
+        # SPEC §10 tunable knobs. Defaults match the SPEC table; any
+        # of these will become HA UI number entities under HEO-11.
+        self._daily_plan_time: time = self._parse_time_config(
+            "daily_plan_time", DEFAULT_DAILY_PLAN_TIME,
+        )
+        self._replan_solar_pct: float = self._config.get(
+            "replan_solar_pct", DEFAULT_REPLAN_SOLAR_PCT,
+        )
+        self._replan_load_pct: float = self._config.get(
+            "replan_load_pct", DEFAULT_REPLAN_LOAD_PCT,
+        )
+        self._replan_soc_pct: float = self._config.get(
+            "replan_soc_pct", DEFAULT_REPLAN_SOC_PCT,
+        )
+        self._peak_threshold_p: float = self._config.get(
+            "peak_threshold_p", DEFAULT_PEAK_THRESHOLD_PENCE,
+        )
+        self._sell_top_pct_default: int = self._config.get(
+            "sell_top_pct_default", DEFAULT_SELL_TOP_PCT,
+        )
+        self._cheap_bottom_pct: int = self._config.get(
+            "cheap_charge_bottom_pct", DEFAULT_CHEAP_CHARGE_BOTTOM_PCT,
+        )
+        self._max_charge_kw: float = self._config.get(
+            "max_charge_kw", DEFAULT_MAX_CHARGE_KW,
+        )
+        self._max_discharge_kw: float = self._config.get(
+            "max_discharge_kw", DEFAULT_MAX_DISCHARGE_KW,
+        )
+        self._charge_efficiency: float = self._config.get(
+            "charge_efficiency", DEFAULT_CHARGE_EFFICIENCY,
+        )
+        self._discharge_efficiency: float = self._config.get(
+            "discharge_efficiency", DEFAULT_DISCHARGE_EFFICIENCY,
+        )
+
         # Dashboard state
         self.soc_trajectory: list[float] = [0.0] * 24
         self.cost_accumulator = CostAccumulator()
@@ -120,14 +198,102 @@ class HEO2Coordinator(DataUpdateCoordinator):
             )
 
     async def _async_update_data(self) -> ProgrammeState:
-        """Gather inputs, run rules, return new programme."""
+        """Gather inputs, run rules, decide whether to commit a fresh
+        plan or hold the baseline, validate, write, verify."""
         inputs = await self._gather_inputs()
         self.last_inputs = inputs
 
-        programme = self._engine.calculate(inputs)
-        self.current_programme = programme
+        # Verify the previously-written programme BEFORE running new
+        # rules: SA's polling will have caught up by now (15-min tick
+        # spacing) so a mismatch is real rather than a timing artefact.
+        await self._verify_pending_programme()
 
-        # Calculate appliance timing suggestions
+        # Always run the rule engine for sensors and diagnostics. The
+        # 15-min cadence updates dashboard signals every tick even
+        # when the inverter programme stays on the baseline.
+        fresh = self._engine.calculate(inputs)
+        self.current_programme = fresh
+
+        # SPEC §8: decide whether this tick commits a new baseline or
+        # holds the previous one. The trigger logic considers daily-
+        # plan-time, IGO/saving session/grid restore transitions, and
+        # quantitative deviations vs the captured baseline forecasts.
+        tz = self._local_tz()
+        decision = should_commit_replan(
+            new_programme=fresh,
+            inputs=inputs,
+            baseline=self._baseline,
+            tz=tz,
+            daily_plan_time=self._daily_plan_time,
+            replan_solar_pct=self._replan_solar_pct,
+            replan_load_pct=self._replan_load_pct,
+            replan_soc_pct=self._replan_soc_pct,
+        )
+        is_daily_plan = "daily plan" in decision.reason
+
+        if decision.commit:
+            effective = fresh
+            logger.warning("HEO-31 PR2: committing new plan: %s", decision.reason)
+        else:
+            effective = self._baseline.programme if self._baseline else fresh
+            logger.debug("HEO-31 PR2: %s", decision.reason)
+
+        # SPEC §6 H5: pre-write validate the EFFECTIVE programme (the
+        # one that will be diffed against the inverter). If it fails,
+        # the baseline stays unchanged and writes_blocked surfaces the
+        # rejection reason.
+        validation = validate_plan(
+            effective, inputs,
+            peak_threshold_p=self._peak_threshold_p,
+            cheap_bottom_pct=self._cheap_bottom_pct,
+            max_charge_kw=self._max_charge_kw,
+            max_discharge_kw=self._max_discharge_kw,
+            charge_efficiency=self._charge_efficiency,
+            discharge_efficiency=self._discharge_efficiency,
+        )
+        self._validation_warnings = validation.warnings
+        self._last_projection = validation.projection
+
+        for w in validation.warnings:
+            logger.warning("HEO-31 PR2 H5 warning: %s", w)
+
+        if not validation.passed:
+            self._plan_rejected_reason = validation.reason()[len("plan rejected: "):]
+            for e in validation.errors:
+                logger.warning("HEO-31 PR2 H5 reject: %s", e)
+            # Don't update baseline, don't write. Sensors still reflect
+            # the fresh rule output for dashboard transparency.
+            self._update_dashboard_secondary(inputs, fresh)
+            return fresh
+
+        self._plan_rejected_reason = None
+
+        # Validation passed. Promote the candidate baseline only when
+        # the trigger said "commit"; otherwise we stay on the existing
+        # baseline (which is what we just successfully validated).
+        if decision.commit:
+            self._baseline = capture_baseline(
+                fresh, inputs, tz=tz, is_daily_plan=is_daily_plan,
+            )
+
+        # Apply programme to inverter via MQTT if enabled.
+        # Any failure is logged but does NOT abort the tick - the
+        # coordinator still returns a valid programme and the next
+        # tick will retry the diff against the un-updated
+        # _last_known_programme.
+        try:
+            await self._apply_programme_to_inverter(effective)
+        except Exception:
+            logger.exception("HEO-27: apply_programme failed")
+
+        self._update_dashboard_secondary(inputs, fresh)
+        return fresh
+
+    def _update_dashboard_secondary(
+        self, inputs: ProgrammeInputs, fresh: ProgrammeState,
+    ) -> None:
+        """Calculate appliance suggestions, SOC trajectory and savings
+        from the fresh rule output regardless of write outcome."""
         for name, spec in DEFAULT_APPLIANCES.items():
             self.appliance_suggestions[name] = self._appliance_calc.best_window(
                 inputs=inputs,
@@ -136,37 +302,123 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 appliance_name=name,
             )
 
-        # Calculate SOC trajectory for dashboard
         from datetime import datetime, timezone
         current_hour = datetime.now(timezone.utc).hour
         self.soc_trajectory = calculate_soc_trajectory(
             current_soc=inputs.current_soc,
             solar_forecast_kwh=inputs.solar_forecast_kwh,
             load_forecast_kwh=inputs.load_forecast_kwh,
-            programme_slots=programme.slots,
+            programme_slots=fresh.slots,
             battery_capacity_kwh=self._config.get("battery_capacity_kwh", 20.0),
-            max_charge_kw=self._config.get("max_charge_kw", 5.0),
-            charge_efficiency=self._config.get("charge_efficiency", 0.95),
-            discharge_efficiency=self._config.get("discharge_efficiency", 0.95),
+            max_charge_kw=self._max_charge_kw,
+            charge_efficiency=self._charge_efficiency,
+            discharge_efficiency=self._discharge_efficiency,
             min_soc=self._config.get("min_soc", 20.0),
             max_soc=self._config.get("max_soc", 100.0),
             current_hour=current_hour,
         )
 
-        # Update savings vs flat rate
         flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
         self.cost_accumulator.calculate_savings_vs_flat(flat_rate)
 
-        # Apply programme to inverter via MQTT if enabled.
-        # Any failure is logged but does NOT abort the tick - the coordinator
-        # still returns a valid programme and the next tick will retry
-        # the diff against the un-updated _last_known_programme.
-        try:
-            await self._apply_programme_to_inverter(programme)
-        except Exception:
-            logger.exception("HEO-27: apply_programme failed")
+    def _local_tz(self):
+        """Resolve HA's local timezone, defaulting to UTC."""
+        from zoneinfo import ZoneInfo
+        tz_name = (
+            self.hass.config.time_zone
+            if self.hass and self.hass.config.time_zone
+            else "UTC"
+        )
+        return ZoneInfo(tz_name)
 
-        return programme
+    def _parse_time_config(self, key: str, default: str) -> time:
+        """Parse a "HH:MM" config value into a `time` object."""
+        raw = str(self._config.get(key, default))
+        try:
+            h, m = raw.split(":", 1)
+            return time(int(h), int(m))
+        except (ValueError, TypeError):
+            logger.warning(
+                "HEO-31 PR2: invalid %s=%r in config; falling back to %s",
+                key, raw, default,
+            )
+            h, m = default.split(":", 1)
+            return time(int(h), int(m))
+
+    async def _verify_pending_programme(self) -> None:
+        """SPEC §7 H6: read inverter state back and compare to the
+        programme we wrote on the previous tick.
+
+        On mismatch: log ERROR, set verify_mismatch_reason which drives
+        writes_blocked, and leave `_last_known_programme` un-advanced
+        so the next diff retries the missing fields.
+        """
+        if self._pending_verification is None:
+            return
+        observed = read_inverter_state(
+            self.hass, inverter_name=self._inverter_name,
+        )
+        if observed is None:
+            # SA entities still not populated. Defer verification one
+            # more tick rather than spuriously alerting.
+            logger.info(
+                "HEO-31 PR2 H6: SA entities unavailable; deferring verify",
+            )
+            return
+
+        mismatches = self._diff_programmes(observed, self._pending_verification)
+        if mismatches:
+            self._verify_mismatch_reason = (
+                f"slot {mismatches[0][0]} {mismatches[0][1]} "
+                f"sent={mismatches[0][2]} got={mismatches[0][3]}"
+                + (f" (+{len(mismatches) - 1} more)"
+                   if len(mismatches) > 1 else "")
+            )
+            logger.error(
+                "HEO-31 PR2 H6: post-write verify mismatch: %s",
+                self._verify_mismatch_reason,
+            )
+            # Do NOT advance _last_known_programme - the next tick's
+            # diff against `observed` will spot the missing writes
+            # and retry them.
+            self._last_known_programme = observed
+        else:
+            self._verify_mismatch_reason = None
+            logger.warning(
+                "HEO-31 PR2 H6: post-write verify OK across all 6 slots",
+            )
+
+        self._pending_verification = None
+
+    @staticmethod
+    def _diff_programmes(
+        observed: ProgrammeState, intended: ProgrammeState,
+    ) -> list[tuple[int, str, str, str]]:
+        """Return (slot_num, field, sent_value, observed_value) for
+        every slot field that differs between intended and observed.
+        Used by the post-write verify to surface concrete mismatches.
+        """
+        out: list[tuple[int, str, str, str]] = []
+        for i in range(6):
+            o = observed.slots[i]
+            n = intended.slots[i]
+            if o.start_time != n.start_time:
+                out.append((
+                    i + 1, "time_point",
+                    n.start_time.strftime("%H:%M"),
+                    o.start_time.strftime("%H:%M"),
+                ))
+            if o.capacity_soc != n.capacity_soc:
+                out.append((
+                    i + 1, "capacity",
+                    str(n.capacity_soc), str(o.capacity_soc),
+                ))
+            if o.grid_charge != n.grid_charge:
+                out.append((
+                    i + 1, "grid_charge",
+                    str(n.grid_charge), str(o.grid_charge),
+                ))
+        return out
 
     async def _apply_programme_to_inverter(
         self, new_programme: ProgrammeState,
@@ -278,6 +530,13 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 "HEO-27: %d/%d writes confirmed",
                 result.writes_confirmed, result.writes_attempted,
             )
+            # SPEC §7 H6: queue a post-write verification for the next
+            # tick. We don't sleep-and-verify inline because SA's
+            # poll-then-publish cycle can take 5-10s and we don't want
+            # to extend the coordinator tick. The 15-min spacing
+            # between ticks is more than sufficient for SA to have
+            # caught up and the entities to reflect reality.
+            self._pending_verification = new_programme
         else:
             logger.warning(
                 "HEO-27: write failed at slot %s param %s: %s "
@@ -678,6 +937,8 @@ class HEO2Coordinator(DataUpdateCoordinator):
           - MqttWriter hasn't been constructed yet (early startup)
           - DirectMqttTransport exists but is not connected
           - HEO-14: BottlecapDave returned no live rates (SPEC H4)
+          - HEO-31 PR2: pre-write validator rejected the plan (H5)
+          - HEO-31 PR2: post-write verify saw a mismatch (H6)
         """
         blocked, _ = _compute_writes_blocked(
             dry_run=self._writer_dry_run,
@@ -689,6 +950,8 @@ class HEO2Coordinator(DataUpdateCoordinator):
             ),
             host=self._sa_mqtt_host,
             live_rates_present=self._live_rates_present,
+            plan_rejected_reason=self._plan_rejected_reason,
+            verify_mismatch_reason=self._verify_mismatch_reason,
         )
         return blocked
 
@@ -706,5 +969,20 @@ class HEO2Coordinator(DataUpdateCoordinator):
             ),
             host=self._sa_mqtt_host,
             live_rates_present=self._live_rates_present,
+            plan_rejected_reason=self._plan_rejected_reason,
+            verify_mismatch_reason=self._verify_mismatch_reason,
         )
         return reason
+
+    @property
+    def projection_today(self) -> Projection | None:
+        """Latest 24h forecast of expected return given the effective
+        programme. Populated even when validation rejected the plan,
+        so the dashboard always shows the projected outcome of what
+        the rules just produced.
+        """
+        return self._last_projection
+
+    @property
+    def validation_warnings(self) -> list[str]:
+        return list(self._validation_warnings)

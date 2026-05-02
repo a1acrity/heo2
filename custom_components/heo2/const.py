@@ -55,6 +55,20 @@ SLOT_COUNT = 6
 UPDATE_INTERVAL_MINUTES = 15
 SOC_DEVIATION_THRESHOLD_PCT = 10.0
 
+# SPEC §8 planning cadence: full re-plan once per day at this local time.
+# Tomorrow's Octopus rates are published after 16:00; 18:00 gives a
+# two-hour safety margin.
+DEFAULT_DAILY_PLAN_TIME = "18:00"
+DEFAULT_REPLAN_SOLAR_PCT = 25
+DEFAULT_REPLAN_LOAD_PCT = 25
+DEFAULT_REPLAN_SOC_PCT = 10
+
+# SPEC §7 post-write verify: how long to wait for SA's polling cadence
+# to reflect a successful publish in the discovered HA entities. SA
+# polls the inverter every ~5s; 10s is conservative without bloating
+# the tick.
+POST_WRITE_VERIFY_DELAY_SECONDS = 10
+
 # Appliance defaults (draw_kw, duration_hours)
 DEFAULT_APPLIANCES = {
     "wash": {"draw_kw": 2.0, "duration_hours": 1.0},
