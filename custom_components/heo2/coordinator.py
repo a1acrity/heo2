@@ -18,6 +18,11 @@ from .rules import default_rules
 from .load_profile import LoadProfileBuilder
 from .solar_forecast import solar_forecast_from_hacs
 from .agilepredict_client import AgilePredictClient
+from .bottlecapdave_client import (
+    BottlecapDaveRates,
+    merge_rate_sources,
+    read_bottlecapdave_rates,
+)
 from .appliance_timing import ApplianceTimingCalculator, ApplianceSuggestion
 from .const import DEFAULT_APPLIANCES
 from .soc_trajectory import calculate_soc_trajectory
@@ -87,6 +92,13 @@ class HEO2Coordinator(DataUpdateCoordinator):
         self.appliance_suggestions: dict[str, ApplianceSuggestion] = {}
         self.enabled: bool = True
         self.healthy: bool = True
+        # H4 (live-prices-only writes): cleared when BottlecapDave returns
+        # no live rate data for the current tick. Used by writes_blocked
+        # property and as a guard before MQTT writes go out. Defaults True
+        # so the first tick (before _gather_inputs) doesn't spuriously
+        # block; the subsequent tick with real data sets the actual value.
+        self._live_rates_present: bool = True
+        self._bottlecapdave_meter_key: str | None = None
 
         # Dashboard state
         self.soc_trajectory: list[float] = [0.0] * 24
@@ -164,6 +176,19 @@ class HEO2Coordinator(DataUpdateCoordinator):
         Lazy-seeds the writer and last-known state on the first call after
         HA startup, when SA's MQTT discovery has populated the entities.
         """
+        # SPEC H4 (Live-prices-only writes): if BottlecapDave returned no
+        # live rates this tick the programme may have been driven by
+        # AgilePredict (forecast) or IGO fixed-rate slots, not by prices
+        # Octopus has actually published. Skip the write entirely - the
+        # next tick will retry once BD is back. The writes_blocked sensor
+        # already reflects this state for the dashboard.
+        if not self._live_rates_present:
+            logger.warning(
+                "HEO-14: skipping inverter write - no live BottlecapDave "
+                "rates (SPEC H4); will retry next tick",
+            )
+            return
+
         # Lazy construct writer on first use. HA startup sequence can race
         # with mqtt component availability, hence deferring past __init__.
         # The DirectMqttTransport connects directly to SA's broker rather
@@ -283,14 +308,51 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         solar = self._read_solar_forecast(now)
 
-        export_rates = []
+        # HEO-14: BottlecapDave is the PRIMARY rate source per SPEC H4.
+        # AgilePredict (export) and IGO fixed-rate generator (import) are
+        # fallback only - to extend coverage past BD's horizon, or as a
+        # backstop when BD's entities aren't yet populated. Writes are
+        # blocked when BD returns nothing (see _live_rates_present).
+        bd_rates = read_bottlecapdave_rates(self.hass)
+        live_import_rates = list(bd_rates.import_today) + list(bd_rates.import_tomorrow)
+        live_export_rates = list(bd_rates.export_today) + list(bd_rates.export_tomorrow)
+
+        forecast_export_rates: list = []
         if self._agilepredict:
-            export_rates = await self._agilepredict.fetch_export_rates()
+            forecast_export_rates = await self._agilepredict.fetch_export_rates()
+
+        igo_import_rates = self._build_import_rates(now)
+
+        # Merged "best available" set: BD wins for any window it covers,
+        # forecast/IGO-fixed fills the tail. Rules and dashboard sensors
+        # consume these; the live_* subsets are reserved for H4 enforcement.
+        import_rates = merge_rate_sources(live_import_rates, igo_import_rates)
+        export_rates = merge_rate_sources(live_export_rates, forecast_export_rates)
+
+        # H4 gate. Conservative AND: writes need both directions live.
+        # Either being empty means a rule could be acting on forecast
+        # data, which violates SPEC H4 once it reaches the inverter.
+        prev_present = self._live_rates_present
+        self._live_rates_present = bool(live_import_rates) and bool(live_export_rates)
+        self._bottlecapdave_meter_key = bd_rates.meter_key
+
+        if not self._live_rates_present:
+            logger.warning(
+                "HEO-14: BottlecapDave incomplete (import=%d slots, export=%d slots, "
+                "meter_key=%s); blocking writes per SPEC H4",
+                len(live_import_rates), len(live_export_rates),
+                bd_rates.meter_key,
+            )
+        elif not prev_present:
+            logger.warning(
+                "HEO-14: BottlecapDave rates restored (meter_key=%s, import=%d, "
+                "export=%d slots); writes unblocked",
+                bd_rates.meter_key,
+                len(live_import_rates), len(live_export_rates),
+            )
 
         load_profile = self._load_builder.build()
         load_forecast = load_profile.for_datetime(now)
-
-        import_rates = self._build_import_rates(now)
 
         return ProgrammeInputs(
             now=now,
@@ -309,6 +371,8 @@ class HEO2Coordinator(DataUpdateCoordinator):
             grid_connected=True,
             active_appliances=[],
             appliance_expected_kwh=0.0,
+            live_import_rates=live_import_rates,
+            live_export_rates=live_export_rates,
         )
 
     def _read_entity_float(self, entity_id: str, default: float) -> float:
@@ -589,6 +653,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
           - dry_run is True (writes suppressed by config)
           - MqttWriter hasn't been constructed yet (early startup)
           - DirectMqttTransport exists but is not connected
+          - HEO-14: BottlecapDave returned no live rates (SPEC H4)
         """
         blocked, _ = _compute_writes_blocked(
             dry_run=self._writer_dry_run,
@@ -599,6 +664,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 if self._mqtt_transport is not None else False
             ),
             host=self._sa_mqtt_host,
+            live_rates_present=self._live_rates_present,
         )
         return blocked
 
@@ -615,5 +681,6 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 if self._mqtt_transport is not None else False
             ),
             host=self._sa_mqtt_host,
+            live_rates_present=self._live_rates_present,
         )
         return reason
