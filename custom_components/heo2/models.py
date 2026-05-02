@@ -17,6 +17,22 @@ class RateSlot:
 
 
 @dataclass
+class PlannedDispatch:
+    """A planned IGO smart-charge dispatch announced by Octopus.
+
+    Used by HEO-8 to pre-position the battery (gc=True + cap=100) on
+    slots covering the dispatch window so HEO II is at full when
+    Octopus takes control of the EV. Mirrors the BottlecapDave entity's
+    `planned_dispatches` attribute shape.
+    """
+
+    start: datetime
+    end: datetime
+    charge_kwh: Optional[float] = None
+    source: Optional[str] = None
+
+
+@dataclass
 class SlotConfig:
     """One of 6 inverter timer slots."""
     start_time: time
@@ -212,6 +228,12 @@ class ProgrammeInputs:
     # programme slot times MUST go through `now_local()` so a UTC `now`
     # doesn't alias against local-time slots in DST. See HEO-31 PR2 fix.
     local_tz: Optional[ZoneInfo] = None
+    # HEO-8: planned IGO dispatches in the next 24 hours, sourced from
+    # `binary_sensor.octopus_energy_..._intelligent_dispatching.attributes.planned_dispatches`.
+    # Empty list means no upcoming dispatches; the rule treats it as
+    # such and stays a no-op. Defaults preserve backward compatibility
+    # with tests built before HEO-8.
+    planned_dispatches: list["PlannedDispatch"] = field(default_factory=list)
 
     def now_local(self) -> datetime:
         """Return `now` projected into the local timezone if known.

@@ -559,6 +559,9 @@ class HEO2Coordinator(DataUpdateCoordinator):
         igo_dispatching = self._read_entity_bool(
             self._config.get("igo_dispatch_entity", ""), default=False
         )
+        planned_dispatches = self._read_planned_dispatches(
+            self._config.get("igo_dispatch_entity", ""),
+        )
         saving_session = self._read_entity_bool(
             self._config.get("saving_session_entity", ""), default=False
         )
@@ -644,7 +647,66 @@ class HEO2Coordinator(DataUpdateCoordinator):
             live_export_rates=live_export_rates,
             solar_forecast_kwh_tomorrow=solar_tomorrow,
             local_tz=self._local_tz(),
+            planned_dispatches=planned_dispatches,
         )
+
+    def _read_planned_dispatches(self, entity_id: str) -> list:
+        """HEO-8: read `planned_dispatches` from the BottlecapDave IGO
+        intelligent_dispatching binary_sensor's attributes.
+
+        BD exposes a list-of-dicts shape:
+          [
+            {"start": "2026-05-02T16:00:00+00:00",
+             "end":   "2026-05-02T17:00:00+00:00",
+             "charge_in_kwh": -7.0,
+             "source": "smart-charge"},
+            ...
+          ]
+        Each entry becomes a `PlannedDispatch`. Missing/malformed
+        entries are skipped silently - the rule treats an empty list
+        as "no upcoming dispatches", which is also the safe fallback
+        when the attribute doesn't exist (older BD versions).
+        """
+        from .models import PlannedDispatch
+        if not entity_id:
+            return []
+        state = self.hass.states.get(entity_id) if self.hass else None
+        if state is None:
+            return []
+        raw = state.attributes.get("planned_dispatches") or []
+        out: list = []
+        for entry in raw:
+            try:
+                start = entry.get("start")
+                end = entry.get("end")
+                if not start or not end:
+                    continue
+                # BD entities return tz-aware ISO strings, but defensively
+                # coerce to datetime if a datetime object slipped through.
+                from datetime import datetime as _dt
+                start_dt = (
+                    start if isinstance(start, _dt)
+                    else _dt.fromisoformat(str(start))
+                )
+                end_dt = (
+                    end if isinstance(end, _dt)
+                    else _dt.fromisoformat(str(end))
+                )
+                charge = entry.get("charge_in_kwh")
+                source = entry.get("source")
+                out.append(PlannedDispatch(
+                    start=start_dt,
+                    end=end_dt,
+                    charge_kwh=float(charge) if charge is not None else None,
+                    source=str(source) if source is not None else None,
+                ))
+            except (ValueError, TypeError, AttributeError):
+                logger.debug(
+                    "HEO-8: skipping malformed planned_dispatches entry %r",
+                    entry,
+                )
+                continue
+        return out
 
     def _read_entity_float(self, entity_id: str, default: float) -> float:
         if not entity_id:
