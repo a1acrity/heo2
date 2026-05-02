@@ -24,6 +24,22 @@ EFFECTIVE_STORED_COST_PENCE = (
     DEFAULT_IGO_NIGHT_RATE_PENCE / ROUND_TRIP_EFFICIENCY
 ) + DEFAULT_DEGRADATION_COST_PER_KWH  # ~7.86
 
+# SPEC-aligned IGO tariff knobs (docs/SPEC.md §1, §10).
+# These are the values quoted in the spec; legacy DEFAULT_IGO_*_RATE_PENCE
+# above are kept for the synthetic fallback path in igo_rates.py and the
+# old EFFECTIVE_STORED_COST_PENCE constant (still used by SolarSurplusRule).
+DEFAULT_IGO_OFF_PEAK_PENCE = 4.9524
+DEFAULT_IGO_PEAK_PENCE = 24.8423
+DEFAULT_PEAK_THRESHOLD_PENCE = 24.0  # H1 detection - covers IGO peak with margin
+
+# SPEC §5a rank-based pricing knobs.
+DEFAULT_SELL_TOP_PCT = 30           # medium SOC, normal tomorrow forecast
+DEFAULT_SELL_TOP_PCT_LOW_SOC = 15   # low SOC OR low tomorrow forecast
+DEFAULT_SELL_TOP_PCT_HIGH_SOC = 50  # high SOC AND high tomorrow forecast
+DEFAULT_CHEAP_CHARGE_BOTTOM_PCT = 25  # bottom-N% of import rates is "cheap"
+DEFAULT_LOW_SOC_THRESHOLD = 50.0
+DEFAULT_HIGH_SOC_THRESHOLD = 80.0
+
 # Load profile
 DEFAULT_LOAD_BASELINE_W = 1900.0
 DEFAULT_LOAD_LOOKBACK_DAYS = 14

@@ -199,6 +199,11 @@ class ProgrammeInputs:
     appliance_expected_kwh: float
     live_import_rates: list[RateSlot] = field(default_factory=list)
     live_export_rates: list[RateSlot] = field(default_factory=list)
+    # 24 hourly buckets for tomorrow's solar forecast. Defaults empty
+    # so callers from before HEO-30 step 3 (rank-based pricing) keep
+    # working; the rank logic treats an empty list as "no forecast"
+    # which biases towards the conservative top-15% sell window.
+    solar_forecast_kwh_tomorrow: list[float] = field(default_factory=list)
 
     def rate_at(self, dt: datetime) -> float | None:
         """Find the import rate at a specific datetime. Returns None if no rate covers it."""
