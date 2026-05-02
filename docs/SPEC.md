@@ -4,7 +4,7 @@
 > writes. Update this document FIRST when changing intent. Code follows spec,
 > not the other way round.
 >
-> Tracking issue: #31. Last updated: 2026-04-29.
+> Tracking issue: #31. Last updated: 2026-05-02 (HEO-31 PR2: planning lifecycle + safety).
 
 ## 1. Hardware and tariff context
 
@@ -138,41 +138,65 @@ without code changes.
 
 ## 6. Pre-write validation (H5 detail)
 
-Before any write reaches the inverter, the plan must pass:
+Implemented in `custom_components/heo2/plan_validator.py`. Runs after
+the rule engine has produced a programme and BEFORE the coordinator
+hands it to the MQTT writer.
 
-### Static checks (existing in SafetyRule)
+### Static checks (re-asserted; SafetyRule fixes them in-place)
 - Exactly 6 slots
 - Slot 1 starts 00:00, slot 6 ends 00:00
 - Contiguous time boundaries
 - All SOCs in [min_soc, 100]
 
-### Sanity checks (NEW)
-- No `grid_charge=true` slot covering peak-rate window (H1)
-- No SOC < expected_load_during_slot for slots without grid_charge that occur in peak window (would force unplanned peak grid use)
-- At least one `grid_charge=true` slot covering the IGO cheap window (otherwise we miss it entirely)
+### Sanity checks (hard - reject the plan)
+- **H1**: No `grid_charge=true` slot's time window may overlap any
+  import rate slot at >= `peak_threshold_p` (24.0p default).
 
-### Projection report (NEW)
-A 1-line summary written to a sensor BEFORE write so the projection is
-visible:
+### Sanity checks (soft - log warning, allow write)
+- No `grid_charge=true` slot covers the bottom-25% cheap window
+  (the rule engine's CheapRateCharge rule is normally responsible
+  for this; missing coverage is sometimes legitimate in summer).
+- Projection forecasts > 0 kWh peak-rate import (battery hits floor
+  during peak hours). H1 says reality wins for forced peak imports;
+  the warning is informational so the user can investigate.
+
+### Projection report
+A 1-line summary written to `sensor.heo_ii_projection_today` every
+tick (whether the plan was accepted or rejected) so the projected
+outcome is always visible:
 
 > Expected return today: +£X.YZ - sells N kWh @ avg Mp, grid imports P kWh @ avg Qp, ZERO peak-rate import
 
-If projection breaches a hard rule, plan is rejected and previous plan kept.
-Logged at WARNING. Sensor `binary_sensor.heo_ii_writes_blocked` goes ON
-with reason explaining the rejection.
+When validation fails, the plan is rejected and the previous baseline
+stays on the inverter. Logged at WARNING. Sensor
+`binary_sensor.heo_ii_writes_blocked` goes ON with reason `H5: <error>`.
 
 ## 7. Post-write verification (H6 detail)
 
-After all per-slot writes complete:
+Implemented in the coordinator. The check is **deferred to the next
+tick** rather than running inline at the end of the writing tick:
 
-1. Read back full 6-slot programme from `sensor.sa_inverter_1_*` entities
-2. Compare each slot field to what was sent
-3. If any field doesn't match: log ERROR, set `binary_sensor.heo_ii_writes_blocked` ON with reason "post-write verify mismatch", DO NOT advance `_last_known_programme`
-4. Next tick will re-diff and retry
+1. After a successful per-slot write batch, the new programme is
+   stored in `_pending_verification`.
+2. The next 15-min tick begins by reading back the 6-slot programme
+   from `sensor.sa_inverter_1_*` entities and diffing each field
+   against `_pending_verification`.
+3. If any field mismatches: log ERROR, set
+   `binary_sensor.heo_ii_writes_blocked` ON with reason
+   `H6: slot N <field> sent=A got=B`, and reset
+   `_last_known_programme` to the observed state so the next diff
+   targets the correct delta.
+4. If all match: clear the pending state silently.
 
-This is on top of the per-write "Saved" readback that MqttWriter already
-does (HEO-2). Per-write confirms SA accepted the publish; post-write
-programme verify confirms the inverter's actual state matches.
+Why next-tick rather than inline? SA's MQTT polling cadence updates
+the discovered HA entities every few seconds. An inline read would
+race with that cadence; the 15-min tick spacing gives plenty of
+margin without padding the current tick with an artificial sleep.
+
+This is on top of the per-write "Saved" readback that MqttWriter
+already does (HEO-2). Per-write confirms SA accepted the publish;
+post-write programme verify confirms the inverter's actual state
+matches what we sent.
 
 ## 8. Planning cadence
 

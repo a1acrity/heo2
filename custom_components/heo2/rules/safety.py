@@ -9,6 +9,25 @@ from ..models import ProgrammeState, ProgrammeInputs, SlotConfig
 from ..rule_engine import Rule
 
 
+# Sunsynk inverter timer fields have 5-minute granularity. Sending a
+# value like 23:57 returns "Saved" from SA but the inverter floors to
+# 23:55, then SA's polling reflects 23:55 in the entity. If HEO II
+# leaves un-snapped values in the plan, the PR 2 post-write verify
+# (SPEC §7 H6) would latch a permanent mismatch reason because the
+# plan and the read-back never agree. Snap proactively in the rule
+# engine so what's written is what comes back. Verified manually on
+# 2026-05-02: 23:57/23:58/23:56/23:51 all floor to the prior :X0/:X5.
+_TIME_GRANULARITY_MINUTES = 5
+
+
+def _snap_to_granularity(t: time) -> time:
+    """Floor a `time` to the nearest 5-min boundary (Sunsynk timer
+    granularity). Same direction as the hardware itself uses.
+    """
+    snapped_minute = (t.minute // _TIME_GRANULARITY_MINUTES) * _TIME_GRANULARITY_MINUTES
+    return time(t.hour, snapped_minute)
+
+
 class SafetyRule(Rule):
     """Final validation pass over the programme.
 
@@ -18,6 +37,7 @@ class SafetyRule(Rule):
     - Exactly 6 slots
     - Full 24h coverage (00:00–00:00)
     - Contiguous time boundaries
+    - Sunsynk 5-minute time granularity (floor each boundary)
 
     Cannot be disabled.
     """
@@ -51,6 +71,23 @@ class SafetyRule(Rule):
                 fixes.append(f"Slot {i + 1}: capped SOC {slot.capacity_soc}→100%")
                 slot.capacity_soc = 100
 
+        # Snap every boundary to Sunsynk's 5-min granularity. Doing this
+        # before the contiguous fix-up below means any boundary the rule
+        # engine produced like 23:57 collapses to 23:55, both for that
+        # slot's start and the previous slot's end.
+        for i, slot in enumerate(state.slots):
+            snapped_start = _snap_to_granularity(slot.start_time)
+            if snapped_start != slot.start_time:
+                fixes.append(
+                    f"Slot {i + 1}: snapped start "
+                    f"{slot.start_time.strftime('%H:%M')}→"
+                    f"{snapped_start.strftime('%H:%M')} (5-min granularity)"
+                )
+                slot.start_time = snapped_start
+            snapped_end = _snap_to_granularity(slot.end_time)
+            if snapped_end != slot.end_time:
+                slot.end_time = snapped_end
+
         # Ensure slot 1 starts at 00:00
         if state.slots[0].start_time != time(0, 0):
             fixes.append(f"Slot 1: fixed start to 00:00")
@@ -61,7 +98,8 @@ class SafetyRule(Rule):
             fixes.append(f"Slot 6: fixed end to 00:00")
             state.slots[-1].end_time = time(0, 0)
 
-        # Ensure contiguous
+        # Ensure contiguous (after snapping, otherwise a snap on slot N's
+        # start could leave a gap between slots N-1 and N).
         for i in range(len(state.slots) - 1):
             if state.slots[i].end_time != state.slots[i + 1].start_time:
                 fixes.append(

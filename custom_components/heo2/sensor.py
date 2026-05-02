@@ -43,6 +43,7 @@ async def async_setup_entry(
     entities.append(ProgrammeSlotsSensor(coordinator, entry))
     entities.append(ProgrammeReasonSensor(coordinator, entry))
     entities.append(ActiveRulesSensor(coordinator, entry))
+    entities.append(ProjectionTodaySensor(coordinator, entry))
 
     # Dashboard sensors (Group 2: Cost Accumulator)
     entities.append(DailyImportCostSensor(coordinator, entry))
@@ -450,6 +451,44 @@ class ActiveRulesSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         return {"rules": self.coordinator.active_rule_names}
+
+
+class ProjectionTodaySensor(CoordinatorEntity, SensorEntity):
+    """SPEC §6 projection report: 1-line summary of expected daily return
+    plus structured kWh / pence breakdown for the dashboard."""
+
+    def __init__(self, coordinator: HEO2Coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_projection_today"
+        self._attr_name = "HEO II Projection Today"
+
+    @property
+    def native_value(self) -> str | None:
+        p = self.coordinator.projection_today
+        if p is None:
+            return None
+        return p.summary()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        p = self.coordinator.projection_today
+        if p is None:
+            return {"warnings": self.coordinator.validation_warnings}
+        return {
+            "expected_return_pence": round(p.expected_return_pence, 2),
+            "sells_kwh": round(p.sells_kwh, 2),
+            "sells_avg_pence": (
+                round(p.sells_avg_pence, 2)
+                if p.sells_avg_pence is not None else None
+            ),
+            "imports_kwh": round(p.imports_kwh, 2),
+            "imports_avg_pence": (
+                round(p.imports_avg_pence, 2)
+                if p.imports_avg_pence is not None else None
+            ),
+            "peak_import_kwh": round(p.peak_import_kwh, 2),
+            "warnings": self.coordinator.validation_warnings,
+        }
 
 
 # ---------------------------------------------------------------------------

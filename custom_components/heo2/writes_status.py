@@ -18,6 +18,8 @@ def _compute_writes_blocked(
     transport_connected: bool,
     host: str,
     live_rates_present: bool = True,
+    plan_rejected_reason: str | None = None,
+    verify_mismatch_reason: str | None = None,
 ) -> tuple[bool, str]:
     """Determine if writes are currently blocked and why.
 
@@ -31,10 +33,14 @@ def _compute_writes_blocked(
          misleading.
       2. Transport readiness comes next so early-startup state is
          described accurately.
-      3. SPEC H4 (live-prices-only writes) is checked last: by this
-         point the transport is up, so the only remaining reason to
-         block is missing live BottlecapDave rates. The default True
-         keeps backward compatibility for callers that pre-date HEO-14.
+      3. SPEC H4 (live-prices-only writes) is checked before plan-level
+         issues: if rates aren't live the plan content is moot.
+      4. Plan rejection from the H5 pre-write validator.
+      5. Post-write verification mismatch from H6.
+
+    Plan rejection / verify mismatch reasons are passed in by the
+    coordinator; they default to None so existing callers stay
+    backward-compatible.
     """
     if dry_run:
         return True, "dry_run enabled"
@@ -44,4 +50,8 @@ def _compute_writes_blocked(
         return True, f"MQTT transport disconnected from {host}"
     if not live_rates_present:
         return True, "HEO-14: no live BottlecapDave rates (SPEC H4)"
+    if plan_rejected_reason:
+        return True, f"H5: {plan_rejected_reason}"
+    if verify_mismatch_reason:
+        return True, f"H6: {verify_mismatch_reason}"
     return False, ""
