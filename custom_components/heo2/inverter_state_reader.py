@@ -81,11 +81,18 @@ def read_programme_state(
     write-back to the "real" value on next tick, which is fine.
 
     Note on slot start/end times:
-      SA's `time_point_N` is the END of slot N (equivalently the START
-      of slot N+1). This mirrors the Sunsynk programme semantics. The
-      returned SlotConfig has:
-        start_time = time_point_{n-1}  (time_point_6 wraps for slot 1)
-        end_time   = time_point_{n}
+      SA's `time_point_N` is the START of slot N (the Sunsynk timer
+      register convention - verified against the SA UI mapping).
+      Slot N covers [time_point_N, time_point_{N+1}), with slot 6
+      wrapping to time_point_1 for its end. So the returned SlotConfig
+      for slot N has:
+        start_time = time_point_{n}
+        end_time   = time_point_{n+1 mod 6}  (= time_point_1 for slot 6)
+
+      Pre-2026-05-02 this module had the convention reversed (treating
+      time_point_N as slot N's END). That bug shifted all SOC and
+      grid_charge writes by one slot relative to their intended time
+      windows - see commit message for HEO-31.
     """
     inv = inverter_name.replace("inverter_", "")
 
@@ -107,11 +114,10 @@ def read_programme_state(
 
         gc = parse_bool(gc_raw) if gc_raw else _FALLBACK_GRID_CHARGE
 
-        # time_point_N is slot N's end; slot N's start is time_point_{N-1},
-        # with slot 1's start being time_point_6 (wraps midnight).
-        start_idx = (n - 2) % 6  # -1 -> 5, 0 -> 0, etc
-        start_time = time_points[start_idx]
-        end_time = time_points[n - 1]
+        # time_point_N is slot N's START. Slot N runs from time_point_N
+        # to time_point_{N+1}, with slot 6 wrapping to time_point_1.
+        start_time = time_points[n - 1]
+        end_time = time_points[n % 6]  # n=6 -> index 0 (wraps midnight)
 
         slots.append(SlotConfig(
             start_time=start_time,

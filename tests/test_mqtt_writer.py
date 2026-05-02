@@ -110,13 +110,19 @@ class TestDiffProgramme:
         assert writes[0].grid_charge is None
 
     def test_time_change_detected(self):
+        """Writer maps slot[i].start_time -> time_point_{i+1} (Sunsynk
+        timer convention). Changing slot 3's start to 19:00 means
+        time_point_3 = 19:00."""
         current = _baseline_programme()
         new = _baseline_programme()
+        # Move slot 3's start earlier - this shifts the boundary
+        # between slot 2 and slot 3 from 18:30 to 19:00.
         new.slots[1] = SlotConfig(time(5, 30), time(19, 0), 100, False)
+        new.slots[2] = SlotConfig(time(19, 0), time(23, 30), 20, False)
         writer = MqttWriter(client=MagicMock())
         writes = writer.diff(current, new)
         assert len(writes) == 1
-        assert writes[0].slot_number == 2
+        assert writes[0].slot_number == 3
         assert writes[0].time_point == "19:00"
         assert writes[0].capacity_soc is None
 
@@ -130,6 +136,27 @@ class TestDiffProgramme:
         assert writes[0].slot_number == 3
         assert writes[0].grid_charge is True
         assert writes[0].capacity_soc is None
+
+    def test_time_point_is_slot_start_not_end(self):
+        """HEO-31: regression guard. The Sunsynk timer convention is
+        time_point_N = start of slot N. If a future refactor flips this
+        back to slot.end_time the bug would silently shift all SOCs and
+        grid_charge flags by one slot relative to their time windows.
+
+        Slot 1 starts at 00:00 -> time_point_1 must be "00:00", NOT
+        the end_time "05:30".
+        """
+        current = _baseline_programme()
+        # Force slot 1's start to differ from current
+        new = _baseline_programme()
+        new.slots[0] = SlotConfig(time(0, 30), time(5, 30), 100, True)
+        writer = MqttWriter(client=MagicMock())
+        writes = writer.diff(current, new)
+        # The diff must pick up the start change as time_point_1 = "00:30",
+        # not "05:30" (which is end_time and unchanged).
+        slot1_writes = [w for w in writes if w.slot_number == 1]
+        assert len(slot1_writes) == 1
+        assert slot1_writes[0].time_point == "00:30"
 
 
 # -----------------------------------------------------------------------
