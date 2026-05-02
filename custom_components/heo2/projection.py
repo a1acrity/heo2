@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
 
 from .models import ProgrammeInputs, ProgrammeState, RateSlot, SlotConfig
 
@@ -148,6 +149,7 @@ def project_day(
     export_top_pct: int = 30,
     replacement_cost_p: float = 4.95,
     horizon_hours: int = 24,
+    tz: ZoneInfo | None = None,
 ) -> Projection:
     """Forward-simulate the next `horizon_hours` and return a Projection.
 
@@ -181,19 +183,28 @@ def project_day(
         step_start = now + timedelta(minutes=_SLOT_MINUTES * step)
         step_end = step_start + timedelta(minutes=_SLOT_MINUTES)
 
-        local_clock = step_start.time()
+        # Programme slots are local time-of-day; solar/load forecasts
+        # are 24-element arrays indexed by LOCAL hour. Project the UTC
+        # step_start onto local time before looking either up.
+        if tz is not None and step_start.tzinfo is not None:
+            step_local = step_start.astimezone(tz)
+        else:
+            step_local = step_start
+        local_clock = step_local.time()
         slot = _slot_at(programme.slots, local_clock)
 
         # Import / export rates at this 30-min step. Either may be missing
         # past BD's horizon; treat None as zero contribution to revenue
-        # (we still simulate behaviour, just don't book money).
+        # (we still simulate behaviour, just don't book money). Rate
+        # lookup uses the absolute UTC datetime, since RateSlots are
+        # tz-aware.
         imp = _rate_at(inputs.import_rates, step_start)
         exp = _rate_at(inputs.export_rates, step_start)
         imp_p = imp.rate_pence if imp is not None else 0.0
         exp_p = exp.rate_pence if exp is not None else 0.0
 
         # Solar / load at this step. Forecasts are hourly; pro-rate to 30 min.
-        hour_idx = step_start.hour
+        hour_idx = step_local.hour
         solar_kwh = inputs.solar_forecast_kwh[hour_idx] * _SLOT_HOURS
         load_kwh = inputs.load_forecast_kwh[hour_idx] * _SLOT_HOURS
 

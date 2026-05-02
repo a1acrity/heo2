@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -187,3 +188,69 @@ class TestValidatePlanProjection:
         assert all("H1 violation" not in e for e in result.errors)
         # But a peak-import warning is present from the projection.
         assert any("peak-rate import" in w for w in result.warnings)
+
+
+class TestValidatePlanTimezone:
+    def test_uk_summer_peak_at_0430_utc_does_not_alias_into_overnight_slot(self):
+        """Regression: a peak rate slot at 04:30 UTC (= 05:30 BST) was
+        being aliased into the 00:00-05:30 BST overnight cheap-charge
+        slot, falsely flagging an H1 violation. The fix passes tz to
+        validate_plan and projects rate.start onto local time-of-day
+        before comparing against programme slots.
+
+        Observed in PROD on 2026-05-02: BottlecapDave returned 28.58p
+        at 04:30 UTC (peak day rate boundary), the validator flagged
+        slot 1 (00:00-05:30 BST, GC=True) as covering peak, the plan
+        was rejected on every tick.
+        """
+        london = ZoneInfo("Europe/London")
+        # A summer day in BST (DST active)
+        midnight_utc = datetime(2026, 5, 2, 23, 0, tzinfo=timezone.utc)
+        # Generate IGO-shaped UTC rates: ~5p 22:30 UTC -> 04:30 UTC,
+        # peak (28.58p) 04:30 UTC -> 22:30 UTC. (= 23:30 BST -> 05:30 BST
+        # off-peak, peak the rest of the day.)
+        rates = []
+        for i in range(48):
+            start = midnight_utc + timedelta(minutes=30 * i)
+            end = start + timedelta(minutes=30)
+            local_h = start.astimezone(london).hour
+            local_m = start.astimezone(london).minute
+            is_offpeak = (
+                local_h < 5 or (local_h == 5 and local_m < 30) or
+                local_h >= 23 and (local_h > 23 or local_m >= 30)
+            )
+            rates.append(RateSlot(start=start, end=end, rate_pence=4.95 if is_offpeak else 28.58))
+
+        # A spec-shaped plan: GC overnight only (00:00-05:30 BST).
+        prog = ProgrammeState(slots=[
+            _slot(0, 0, 5, 30, 80, True),    # BST overnight cheap-charge
+            _slot(5, 30, 16, 0, 80, False),  # BST day hold
+            _slot(16, 0, 19, 0, 10, False),  # BST evening drain
+            _slot(19, 0, 23, 30, 10, False),
+            _slot(23, 30, 23, 55, 80, True), # post-23:30 cheap window
+            _slot(23, 55, 0, 0, 80, True),
+        ])
+
+        # Build inputs with a "now" early in the day so all 48 rates fall
+        # within the validator's "today".
+        inputs = ProgrammeInputs(
+            now=datetime(2026, 5, 3, 0, 0, tzinfo=timezone.utc),
+            current_soc=50.0, battery_capacity_kwh=20.0, min_soc=10.0,
+            import_rates=rates, export_rates=[],
+            solar_forecast_kwh=[0.0] * 24, load_forecast_kwh=[0.5] * 24,
+            igo_dispatching=False, saving_session=False,
+            saving_session_start=None, saving_session_end=None,
+            ev_charging=False, grid_connected=True,
+            active_appliances=[], appliance_expected_kwh=0.0,
+        )
+
+        result = validate_plan(prog, inputs, tz=london, peak_threshold_p=24.0)
+        # No H1 violation: GC slots are 00:00-05:30 BST and 23:30+ BST,
+        # both fully inside the off-peak window.
+        h1_errors = [e for e in result.errors if "H1 violation" in e]
+        assert h1_errors == [], (
+            f"unexpected H1 violation(s): {h1_errors}; "
+            f"all errors: {result.errors}"
+        )
+        # Sanity: validator passed
+        assert result.passed
