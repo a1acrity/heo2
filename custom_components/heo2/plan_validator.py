@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import time
+from zoneinfo import ZoneInfo
 
 from .models import ProgrammeInputs, ProgrammeState, RateSlot, SlotConfig
 from .projection import Projection, project_day
@@ -55,21 +56,30 @@ class ValidationResult:
 
 
 def _slots_overlapping_rates(
-    programme: ProgrammeState, rate_slots: list[RateSlot],
+    programme: ProgrammeState,
+    rate_slots: list[RateSlot],
+    tz: ZoneInfo | None,
 ) -> list[tuple[int, RateSlot]]:
     """Return (slot_index, rate_slot) pairs where the programme slot's
     time window overlaps the rate slot's time window.
 
-    Programme slots are time-of-day; rate slots are absolute datetimes.
-    For overlap detection we project the rate slot onto its local
-    time-of-day. A rate slot crossing midnight is split into two
-    notional half-slots.
+    Programme slots are local time-of-day (Europe/London for Paddy's
+    install). Rate slots from BottlecapDave / AgilePredict are tz-aware
+    absolute UTC datetimes. To compare them we project the rate's start
+    onto local time-of-day FIRST. Without this, a rate slot at 04:30
+    UTC (= 05:30 BST in summer) would be checked as if it were 04:30
+    BST and falsely match a slot that ends at 05:30 BST.
+
+    `tz` is the local zoneinfo. None falls back to whatever timezone
+    the rate's own start carries (legacy behaviour, used by tests
+    where rates and slots share the same tz).
     """
     pairs: list[tuple[int, RateSlot]] = []
     for r in rate_slots:
-        # Rate slots from BD/IGO are 30-min wide; the start time is
-        # enough to identify which programme slot it lands in.
-        local_clock = r.start.time()
+        if tz is not None and r.start.tzinfo is not None:
+            local_clock = r.start.astimezone(tz).time()
+        else:
+            local_clock = r.start.time()
         for i, slot in enumerate(programme.slots):
             if slot.contains_time(local_clock):
                 pairs.append((i, r))
@@ -81,6 +91,7 @@ def _check_no_grid_charge_in_peak(
     programme: ProgrammeState,
     import_rates: list[RateSlot],
     peak_threshold_p: float,
+    tz: ZoneInfo | None,
 ) -> list[str]:
     """SPEC §6 sanity check: no `grid_charge=True` slot's time range may
     overlap a peak-rate import window.
@@ -93,15 +104,22 @@ def _check_no_grid_charge_in_peak(
     if not peak_rates:
         return errors
 
-    for slot_idx, rate in _slots_overlapping_rates(programme, peak_rates):
+    for slot_idx, rate in _slots_overlapping_rates(
+        programme, peak_rates, tz,
+    ):
         slot = programme.slots[slot_idx]
         if slot.grid_charge:
+            local_start = (
+                rate.start.astimezone(tz)
+                if tz is not None and rate.start.tzinfo is not None
+                else rate.start
+            )
             errors.append(
                 f"H1 violation: slot {slot_idx + 1} "
                 f"({slot.start_time.strftime('%H:%M')}-"
                 f"{slot.end_time.strftime('%H:%M')}) has grid_charge=True "
                 f"covering peak rate {rate.rate_pence:.2f}p at "
-                f"{rate.start.strftime('%H:%M')}"
+                f"{local_start.strftime('%H:%M')}"
             )
             # One error per slot is enough; further peak slots in the
             # same programme slot would just be noise.
@@ -153,6 +171,7 @@ def _check_cheap_window_covered(
     import_rates: list[RateSlot],
     inputs: ProgrammeInputs,
     bottom_n_pct_threshold: int,
+    tz: ZoneInfo | None,
 ) -> list[str]:
     """Soft SPEC §6 check: at least one `grid_charge=True` slot should
     cover the IGO cheap window.
@@ -163,18 +182,23 @@ def _check_cheap_window_covered(
     handles that decision; this guard catches accidental misconfigs
     that would silently leave the cheap window uncovered.
     """
-    today_import = filter_today(import_rates, inputs.now)
+    today_import = filter_today(import_rates, inputs.now, tz=tz)
     cheap = bottom_n_pct(today_import, bottom_n_pct_threshold)
     if not cheap:
         return []
 
-    pairs = _slots_overlapping_rates(programme, cheap)
+    pairs = _slots_overlapping_rates(programme, cheap, tz)
     covered = any(programme.slots[i].grid_charge for i, _ in pairs)
     if covered:
         return []
 
-    cheap_start = min(c.start.strftime("%H:%M") for c in cheap)
-    cheap_end = max(c.end.strftime("%H:%M") for c in cheap)
+    def _local_hhmm(d):
+        if tz is not None and d.tzinfo is not None:
+            return d.astimezone(tz).strftime("%H:%M")
+        return d.strftime("%H:%M")
+
+    cheap_start = min(_local_hhmm(c.start) for c in cheap)
+    cheap_end = max(_local_hhmm(c.end) for c in cheap)
     return [
         f"no grid_charge=True slot covers the cheap window "
         f"({cheap_start}-{cheap_end}, "
@@ -193,6 +217,7 @@ def validate_plan(
     max_discharge_kw: float = 5.0,
     charge_efficiency: float = 0.95,
     discharge_efficiency: float = 0.95,
+    tz: ZoneInfo | None = None,
 ) -> ValidationResult:
     """Run all SPEC §6 pre-write checks and a 24-hour projection.
 
@@ -200,6 +225,10 @@ def validate_plan(
     `warnings` are logged but allow the write to proceed.
     `projection` is populated regardless so the dashboard can show
     the expected return for both accepted and rejected plans.
+
+    `tz` is the local zoneinfo for projecting tz-aware rate slots
+    onto the programme's local time-of-day. Defaults to None for
+    backward compat with tests where rates and slots share a tz.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -208,11 +237,11 @@ def validate_plan(
 
     if not errors:
         errors.extend(_check_no_grid_charge_in_peak(
-            programme, inputs.import_rates, peak_threshold_p,
+            programme, inputs.import_rates, peak_threshold_p, tz,
         ))
 
     warnings.extend(_check_cheap_window_covered(
-        programme, inputs.import_rates, inputs, cheap_bottom_pct,
+        programme, inputs.import_rates, inputs, cheap_bottom_pct, tz,
     ))
 
     projection = project_day(
@@ -224,6 +253,7 @@ def validate_plan(
         charge_efficiency=charge_efficiency,
         discharge_efficiency=discharge_efficiency,
         peak_threshold_p=peak_threshold_p,
+        tz=tz,
     )
 
     if projection.peak_import_kwh > 0.001:

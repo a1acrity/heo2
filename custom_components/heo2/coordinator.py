@@ -250,6 +250,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             max_discharge_kw=self._max_discharge_kw,
             charge_efficiency=self._charge_efficiency,
             discharge_efficiency=self._discharge_efficiency,
+            tz=tz,
         )
         self._validation_warnings = validation.warnings
         self._last_projection = validation.projection
