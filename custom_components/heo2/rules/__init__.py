@@ -11,13 +11,18 @@ from .export_window import ExportWindowRule
 from .evening_protect import EveningProtectRule
 from .igo_dispatch import IGODispatchRule
 from .ev_charging import EVChargingRule
+from .saving_session import SavingSessionRule
 from .safety import SafetyRule
 
 
 def default_rules() -> list[Rule]:
-    """Return the 8 default rules in priority order.
+    """Return the 9 default rules in priority order.
 
-    SafetyRule is always last and cannot be disabled.
+    SafetyRule is always last and cannot be disabled. SavingSessionRule
+    sits AFTER ExportWindowRule + EveningProtectRule so an active
+    session always wins over a normal export window or evening floor:
+    SPEC §9 says drain to min_soc regardless of the standard Agile
+    threshold or evening reserve.
     """
     return [
         BaselineRule(),
@@ -25,6 +30,7 @@ def default_rules() -> list[Rule]:
         SolarSurplusRule(),
         ExportWindowRule(),
         EveningProtectRule(),
+        SavingSessionRule(),
         IGODispatchRule(),
         EVChargingRule(),
         SafetyRule(),
