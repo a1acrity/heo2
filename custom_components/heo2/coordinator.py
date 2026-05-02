@@ -307,6 +307,13 @@ class HEO2Coordinator(DataUpdateCoordinator):
         )
 
         solar = self._read_solar_forecast(now)
+        solar_tomorrow = self._read_solar_forecast(
+            now, entity_override=self._config.get(
+                "solcast_tomorrow_entity",
+                "sensor.solcast_pv_forecast_forecast_tomorrow",
+            ),
+            target_offset_days=1,
+        )
 
         # HEO-14: BottlecapDave is the PRIMARY rate source per SPEC H4.
         # AgilePredict (export) and IGO fixed-rate generator (import) are
@@ -375,6 +382,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             appliance_expected_kwh=0.0,
             live_import_rates=live_import_rates,
             live_export_rates=live_export_rates,
+            solar_forecast_kwh_tomorrow=solar_tomorrow,
         )
 
     def _read_entity_float(self, entity_id: str, default: float) -> float:
@@ -396,26 +404,40 @@ class HEO2Coordinator(DataUpdateCoordinator):
             return default
         return state.state.lower() in ("on", "true", "1")
 
-    def _read_solar_forecast(self, now) -> list[float]:
+    def _read_solar_forecast(
+        self,
+        now,
+        entity_override: str | None = None,
+        target_offset_days: int = 0,
+    ) -> list[float]:
         """Read solar forecast from HACS solcast_solar sensor attributes.
 
-        Returns 24 hourly kWh values, index 0 = 00:00 local time for today.
-        Returns zeros if the sensor is missing or has no detailedHourly
-        attribute. See HEO-4 for the history: HEO II previously made its
-        own Solcast HTTP calls and mis-aggregated the result.
+        Returns 24 hourly kWh values, index 0 = 00:00 local time for the
+        target date. Defaults to today; pass `target_offset_days=1` to
+        read tomorrow's forecast (used by rank-based pricing per SPEC §5a).
+
+        `entity_override` selects a different Solcast sensor, e.g. the
+        tomorrow-specific one. Returns zeros if the sensor is missing or
+        has no detailedHourly attribute. See HEO-4 for the history: HEO II
+        previously made its own Solcast HTTP calls and mis-aggregated the
+        result.
         """
+        from datetime import timedelta
         from zoneinfo import ZoneInfo
         tz_name = (self.hass.config.time_zone
                    if self.hass and self.hass.config.time_zone
                    else "UTC")
         tz = ZoneInfo(tz_name)
-        target_date = now.astimezone(tz).date()
+        target_date = (
+            now.astimezone(tz).date() + timedelta(days=target_offset_days)
+        )
 
-        state = self.hass.states.get(self._solar_entity) if self.hass else None
+        entity = entity_override or self._solar_entity
+        state = self.hass.states.get(entity) if self.hass else None
         if state is None or state.state in ("unknown", "unavailable"):
             logger.warning(
                 "Solar forecast entity %s not available, using zero forecast",
-                self._solar_entity,
+                entity,
             )
             return [0.0] * 24
 
@@ -423,7 +445,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
         if not detailed:
             logger.warning(
                 "Solar forecast entity %s has no detailedHourly attribute",
-                self._solar_entity,
+                entity,
             )
             return [0.0] * 24
 
