@@ -91,6 +91,11 @@ class BottlecapDaveRates:
     Lists are empty and `*_now_pence` are None when the corresponding
     BottlecapDave entity is missing or unavailable - callers must
     handle absence rather than falling back silently.
+
+    `import_meter_key` and `export_meter_key` are tracked separately
+    because UK installs commonly have different MPAN/serials per
+    direction (e.g. an Octopus Outgoing export meter alongside an IGO
+    import meter). Single-meter installs see the same value in both.
     """
 
     import_today: list[RateSlot] = field(default_factory=list)
@@ -99,7 +104,18 @@ class BottlecapDaveRates:
     export_tomorrow: list[RateSlot] = field(default_factory=list)
     import_now_pence: float | None = None
     export_now_pence: float | None = None
-    meter_key: str | None = None
+    import_meter_key: str | None = None
+    export_meter_key: str | None = None
+
+    @property
+    def meter_key(self) -> str | None:
+        """Diagnostic alias - returns import key if set, else export.
+
+        Kept for backward compatibility with callers from before the
+        split-meter fix. New code should read `import_meter_key` or
+        `export_meter_key` directly.
+        """
+        return self.import_meter_key or self.export_meter_key
 
     @property
     def has_any_data(self) -> bool:
@@ -121,7 +137,8 @@ class BottlecapDaveRates:
 
 def discover_meter_keys(entity_ids: Iterable[str]) -> set[str]:
     """Return all unique BottlecapDave meter keys (`{mpan}_{serial}`) found
-    in the given entity ids. Empty set if BottlecapDave isn't installed.
+    in the given entity ids, regardless of direction (import/export).
+    Empty set if BottlecapDave isn't installed.
     """
     keys: set[str] = set()
     for eid in entity_ids:
@@ -134,6 +151,26 @@ def discover_meter_keys(entity_ids: Iterable[str]) -> set[str]:
                 keys.add(m.group("key"))
                 break
     return keys
+
+
+def classify_entity(entity_id: str) -> tuple[str, bool] | None:
+    """Match a BD entity id and return `(meter_key, is_export)`.
+
+    Returns None for non-BD ids. The is_export flag distinguishes
+    `_export_*_rates` and `_export_current_rate` (True) from their
+    import counterparts (False) so callers can build per-direction
+    indices for split-meter installs.
+    """
+    if not isinstance(entity_id, str):
+        return None
+    norm = entity_id.lower()
+    for pattern in (RATES_EVENT_PATTERN, RATE_SENSOR_PATTERN):
+        m = pattern.match(norm)
+        if not m:
+            continue
+        export_grp = m.group("export") or ""
+        return m.group("key"), bool(export_grp)
+    return None
 
 
 def pick_freshest_meter_key(
@@ -156,6 +193,24 @@ def pick_freshest_meter_key(
         return ts if ts is not None else oldest
 
     return max(keys_to_freshness, key=freshness)
+
+
+def pick_meter_keys_per_direction(
+    keys_freshness: Mapping[tuple[str, bool], datetime | None],
+) -> tuple[str | None, str | None]:
+    """Pick the freshest meter key for import and for export independently.
+
+    Input maps `(meter_key, is_export)` tuples to a freshness timestamp
+    (None permitted for missing). Returns `(import_key, export_key)`.
+
+    UK installs frequently publish import on one MPAN/serial and export
+    on a separate one (Outgoing on a dedicated meter, IGO on another).
+    Picking a single key for both directions silently drops one side -
+    this helper avoids that by treating the directions independently.
+    """
+    imports = {k: ts for (k, is_exp), ts in keys_freshness.items() if not is_exp}
+    exports = {k: ts for (k, is_exp), ts in keys_freshness.items() if is_exp}
+    return pick_freshest_meter_key(imports), pick_freshest_meter_key(exports)
 
 
 def parse_event_rates(attr_rates: object) -> list[RateSlot]:
@@ -243,6 +298,11 @@ def merge_rate_sources(
 def read_bottlecapdave_rates(hass) -> BottlecapDaveRates:
     """Read all BottlecapDave rate data from HA into a single snapshot.
 
+    Discovers import and export meter keys *independently* so installs
+    with separate import and export MPAN/serials are read correctly
+    (common with Octopus Outgoing on a dedicated meter alongside IGO).
+    Within each direction, the freshest key wins.
+
     Returns an empty `BottlecapDaveRates` when BottlecapDave isn't
     installed or no entities are populated yet (HA startup race).
     Never raises - always returns a usable structure so the coordinator
@@ -257,30 +317,22 @@ def read_bottlecapdave_rates(hass) -> BottlecapDaveRates:
     except Exception:  # pragma: no cover - defensive for stub envs
         return BottlecapDaveRates()
 
-    # Group states by meter key, tracking max last_updated for freshness.
-    keys_to_freshness: dict[str, datetime | None] = {}
+    # Track freshness per (meter_key, is_export) so we can pick the
+    # active meter for each direction independently.
+    keys_freshness: dict[tuple[str, bool], datetime | None] = {}
     for state in all_states:
         eid = getattr(state, "entity_id", "")
-        if not eid:
+        cls = classify_entity(eid)
+        if cls is None:
             continue
-        norm = eid.lower()
-        match = (
-            RATES_EVENT_PATTERN.match(norm)
-            or RATE_SENSOR_PATTERN.match(norm)
-        )
-        if not match:
-            continue
-        key = match.group("key")
         ts = getattr(state, "last_updated", None)
-        prev = keys_to_freshness.get(key)
+        prev = keys_freshness.get(cls)
         if prev is None or (ts is not None and ts > prev):
-            keys_to_freshness[key] = ts
+            keys_freshness[cls] = ts
 
-    chosen = pick_freshest_meter_key(keys_to_freshness)
-    if chosen is None:
+    import_key, export_key = pick_meter_keys_per_direction(keys_freshness)
+    if import_key is None and export_key is None:
         return BottlecapDaveRates()
-
-    base = f"octopus_energy_electricity_{chosen}"
 
     def _state(entity_id: str):
         st = hass.states.get(entity_id)
@@ -295,18 +347,37 @@ def read_bottlecapdave_rates(hass) -> BottlecapDaveRates:
         attrs = getattr(st, "attributes", None) or {}
         return attrs.get("rates")
 
+    import_today: list[RateSlot] = []
+    import_tomorrow: list[RateSlot] = []
+    import_now_pence: float | None = None
+    if import_key is not None:
+        ibase = f"octopus_energy_electricity_{import_key}"
+        import_today = parse_event_rates(_attr_rates(f"event.{ibase}_current_day_rates"))
+        import_tomorrow = parse_event_rates(_attr_rates(f"event.{ibase}_next_day_rates"))
+        import_now_pence = parse_current_rate_pence(_state(f"sensor.{ibase}_current_rate"))
+
+    export_today: list[RateSlot] = []
+    export_tomorrow: list[RateSlot] = []
+    export_now_pence: float | None = None
+    if export_key is not None:
+        ebase = f"octopus_energy_electricity_{export_key}"
+        export_today = parse_event_rates(
+            _attr_rates(f"event.{ebase}_export_current_day_rates")
+        )
+        export_tomorrow = parse_event_rates(
+            _attr_rates(f"event.{ebase}_export_next_day_rates")
+        )
+        export_now_pence = parse_current_rate_pence(
+            _state(f"sensor.{ebase}_export_current_rate")
+        )
+
     return BottlecapDaveRates(
-        import_today=parse_event_rates(_attr_rates(f"event.{base}_current_day_rates")),
-        import_tomorrow=parse_event_rates(_attr_rates(f"event.{base}_next_day_rates")),
-        export_today=parse_event_rates(
-            _attr_rates(f"event.{base}_export_current_day_rates")
-        ),
-        export_tomorrow=parse_event_rates(
-            _attr_rates(f"event.{base}_export_next_day_rates")
-        ),
-        import_now_pence=parse_current_rate_pence(_state(f"sensor.{base}_current_rate")),
-        export_now_pence=parse_current_rate_pence(
-            _state(f"sensor.{base}_export_current_rate")
-        ),
-        meter_key=chosen,
+        import_today=import_today,
+        import_tomorrow=import_tomorrow,
+        export_today=export_today,
+        export_tomorrow=export_tomorrow,
+        import_now_pence=import_now_pence,
+        export_now_pence=export_now_pence,
+        import_meter_key=import_key,
+        export_meter_key=export_key,
     )

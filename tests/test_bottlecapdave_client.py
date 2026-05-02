@@ -16,11 +16,13 @@ import pytest
 from heo2.bottlecapdave_client import (
     GBP_TO_PENCE,
     BottlecapDaveRates,
+    classify_entity,
     discover_meter_keys,
     merge_rate_sources,
     parse_current_rate_pence,
     parse_event_rates,
     pick_freshest_meter_key,
+    pick_meter_keys_per_direction,
     read_bottlecapdave_rates,
 )
 from heo2.models import RateSlot
@@ -236,6 +238,88 @@ class TestDiscoverMeterKeys:
 # ---------------------------------------------------------------------------
 
 
+class TestClassifyEntity:
+    def test_import_event(self):
+        result = classify_entity(
+            "event.octopus_energy_electricity_meter1_meter1_current_day_rates"
+        )
+        assert result == ("meter1_meter1", False)
+
+    def test_export_event(self):
+        result = classify_entity(
+            "event.octopus_energy_electricity_meter1_meter1_export_current_day_rates"
+        )
+        assert result == ("meter1_meter1", True)
+
+    def test_import_sensor(self):
+        result = classify_entity(
+            "sensor.octopus_energy_electricity_meter1_meter1_current_rate"
+        )
+        assert result == ("meter1_meter1", False)
+
+    def test_export_sensor(self):
+        result = classify_entity(
+            "sensor.octopus_energy_electricity_meter1_meter1_export_current_rate"
+        )
+        assert result == ("meter1_meter1", True)
+
+    def test_non_octopus_returns_none(self):
+        assert classify_entity("sensor.solcast_pv_forecast_today") is None
+        assert classify_entity("binary_sensor.heo_ii_healthy") is None
+
+    def test_non_string_returns_none(self):
+        assert classify_entity(None) is None
+        assert classify_entity(42) is None
+
+
+class TestPickMeterKeysPerDirection:
+    def test_split_meters(self):
+        """Different keys per direction - the typical UK Outgoing+IGO setup."""
+        i_ts = datetime(2026, 4, 30, 4, 0, tzinfo=UTC)
+        e_ts = datetime(2026, 4, 30, 8, 0, tzinfo=UTC)
+        result = pick_meter_keys_per_direction({
+            ("import_meter", False): i_ts,
+            ("export_meter", True): e_ts,
+        })
+        assert result == ("import_meter", "export_meter")
+
+    def test_single_meter_both_directions(self):
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        result = pick_meter_keys_per_direction({
+            ("only_meter", False): ts,
+            ("only_meter", True): ts,
+        })
+        assert result == ("only_meter", "only_meter")
+
+    def test_import_only_install(self):
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        result = pick_meter_keys_per_direction({
+            ("imp_meter", False): ts,
+        })
+        assert result == ("imp_meter", None)
+
+    def test_export_only_install(self):
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        result = pick_meter_keys_per_direction({
+            ("exp_meter", True): ts,
+        })
+        assert result == (None, "exp_meter")
+
+    def test_empty_returns_pair_of_nones(self):
+        assert pick_meter_keys_per_direction({}) == (None, None)
+
+    def test_freshest_wins_within_direction(self):
+        old = datetime(2026, 4, 30, 6, 0, tzinfo=UTC)
+        new = datetime(2026, 4, 30, 16, 0, tzinfo=UTC)
+        result = pick_meter_keys_per_direction({
+            ("imp_old", False): old,
+            ("imp_new", False): new,
+            ("exp_old", True): old,
+            ("exp_new", True): new,
+        })
+        assert result == ("imp_new", "exp_new")
+
+
 class TestPickFreshestMeterKey:
     def test_returns_most_recent(self):
         old = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
@@ -362,7 +446,9 @@ class TestReadBottlecapDaveRates:
                                              with_tomorrow=True))
         result = read_bottlecapdave_rates(hass)
 
-        assert result.meter_key == "1850009498_2394300396097"
+        assert result.import_meter_key == "1850009498_2394300396097"
+        assert result.export_meter_key == "1850009498_2394300396097"
+        assert result.meter_key == "1850009498_2394300396097"  # legacy alias
         assert result.has_any_data is True
         assert result.import_now_pence == pytest.approx(4.952)
         assert result.export_now_pence == pytest.approx(13.150)
@@ -370,6 +456,43 @@ class TestReadBottlecapDaveRates:
         assert len(result.export_today) == 2
         assert len(result.import_tomorrow) == 2
         assert len(result.export_tomorrow) == 2
+
+    def test_split_meters_import_and_export_have_different_keys(self):
+        """Real-world UK install: Octopus Outgoing on a dedicated export
+        meter, IGO on a separate import meter. Must read both."""
+        import_ts = datetime(2026, 4, 30, 4, 30, tzinfo=UTC)
+        export_ts = datetime(2026, 4, 30, 8, 0, tzinfo=UTC)
+        states = []
+        # Import-only meter: just current_rate sensor + current_day_rates event
+        ibase = "octopus_energy_electricity_18p5009498_2372761090617"
+        states.append(_state(f"sensor.{ibase}_current_rate", "0.04952", import_ts))
+        states.append(_state(
+            f"event.{ibase}_current_day_rates",
+            "today",
+            import_ts,
+            attributes={"rates": SAMPLE_IMPORT_TODAY_RATES},
+        ))
+        # Export-only meter: export_current_rate sensor + export_current_day_rates event
+        ebase = "octopus_energy_electricity_18p5009498_2394300396097"
+        states.append(_state(f"sensor.{ebase}_export_current_rate", "0.13150", export_ts))
+        states.append(_state(
+            f"event.{ebase}_export_current_day_rates",
+            "today",
+            export_ts,
+            attributes={"rates": SAMPLE_EXPORT_TODAY_RATES},
+        ))
+        hass = _make_hass(states)
+
+        result = read_bottlecapdave_rates(hass)
+
+        # Both directions populated with their distinct keys
+        assert result.import_meter_key == "18p5009498_2372761090617"
+        assert result.export_meter_key == "18p5009498_2394300396097"
+        # Both rates reflect their respective sources
+        assert result.import_now_pence == pytest.approx(4.952)
+        assert result.export_now_pence == pytest.approx(13.150)
+        assert len(result.import_today) == 2
+        assert len(result.export_today) == 2
 
     def test_returns_empty_when_bd_not_installed(self):
         # Only non-octopus entities present
@@ -379,7 +502,8 @@ class TestReadBottlecapDaveRates:
         ])
         result = read_bottlecapdave_rates(hass)
         assert result.has_any_data is False
-        assert result.meter_key is None
+        assert result.import_meter_key is None
+        assert result.export_meter_key is None
         assert result.import_today == []
         assert result.export_today == []
         assert result.import_now_pence is None
@@ -387,9 +511,11 @@ class TestReadBottlecapDaveRates:
     def test_returns_empty_when_hass_none(self):
         result = read_bottlecapdave_rates(None)
         assert result.has_any_data is False
-        assert result.meter_key is None
+        assert result.import_meter_key is None
+        assert result.export_meter_key is None
 
-    def test_picks_freshest_meter_when_multiple(self):
+    def test_picks_freshest_meter_when_multiple_per_direction(self):
+        """Same direction with two meter keys - freshest wins."""
         old = datetime(2026, 4, 30, 6, 0, tzinfo=UTC)
         new = datetime(2026, 4, 30, 16, 0, tzinfo=UTC)
         states = (
@@ -398,7 +524,8 @@ class TestReadBottlecapDaveRates:
         )
         hass = _make_hass(states)
         result = read_bottlecapdave_rates(hass)
-        assert result.meter_key == "freshmeter_bbbb"
+        assert result.import_meter_key == "freshmeter_bbbb"
+        assert result.export_meter_key == "freshmeter_bbbb"
 
     def test_partial_data_ok(self):
         """Today's import published, but export tomorrow not yet -
@@ -496,8 +623,20 @@ class TestBottlecapDaveRatesDataclass:
         assert r.export_today == []
         assert r.import_now_pence is None
         assert r.export_now_pence is None
+        assert r.import_meter_key is None
+        assert r.export_meter_key is None
         assert r.meter_key is None
 
     def test_has_any_data_true_with_just_one_field(self):
         r = BottlecapDaveRates(import_now_pence=4.95)
         assert r.has_any_data is True
+
+    def test_meter_key_alias_returns_import_or_export(self):
+        """Backwards-compat: callers reading .meter_key should get
+        a usable identifier whether the install is single or split."""
+        r = BottlecapDaveRates(import_meter_key="imp", export_meter_key="exp")
+        assert r.meter_key == "imp"
+        r2 = BottlecapDaveRates(export_meter_key="exp_only")
+        assert r2.meter_key == "exp_only"
+        r3 = BottlecapDaveRates()
+        assert r3.meter_key is None
