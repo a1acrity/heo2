@@ -85,39 +85,47 @@ def format_time(t: time | str) -> str:
 
 
 def format_grid_charge(enabled: bool) -> str:
-    """SA expects 'Enabled' / 'Disabled' as the setting value."""
-    return "Enabled" if enabled else "Disabled"
+    """SA's grid_charge_point_N set-topic accepts 'true' / 'false'.
+
+    Pre-HEO-32 (2026-04 and earlier) SA used 'Enabled' / 'Disabled' here.
+    The current SA build rejects those with `Error: Invalid value
+    'Enabled' for 'Grid charge point N'. Valid values: true, false.`
+    so any HEO II writer talking to a current SA must emit lowercase
+    booleans.
+    """
+    return "true" if enabled else "false"
 
 
-def parse_response_message(
-    response: str, expected_setting: str,
-) -> tuple[bool, str | None]:
+def parse_response_message(response: str) -> tuple[bool, str | None]:
     """Parse an SA response_message payload.
 
     Returns (success, error_detail_or_none). `success` is True iff the
-    response is for the expected setting and ends with ": Saved."
-    Any other outcome (Error, different setting, malformed) is False.
+    response is "Saved" (with optional trailing punctuation/whitespace).
+    Anything starting "Error:" is an explicit failure with the error
+    text returned as the detail.
 
-    SA format observed in production:
-        Set 'Capacity point 1' to '97': Saved.
-        Set 'Grid charge' to 'Disabled': Error: No response.
+    Current SA format observed 2026-05-02:
+        Saved
+        Error: Invalid value 'Enabled' for 'Grid charge point 1'. ...
+        Error: No response.
+
+    Pre-2026-05 SA prefixed every response with `Set 'Name' to 'Value': `.
+    The payload no longer carries the setting name, so callers must
+    correlate responses to writes by FIFO ordering rather than by
+    parsing the response payload (handled by `_publish_and_confirm`).
     """
-    if not response or "Set '" not in response:
-        return False, f"malformed response: {response!r}"
+    if not response:
+        return False, "empty response"
 
-    if expected_setting not in response:
-        # Response is for some other concurrent write; not ours
-        return False, f"response for different setting: {response!r}"
-
-    if response.rstrip(".").endswith("Saved"):
+    text = response.strip().rstrip(".")
+    if text == "Saved" or text.endswith(": Saved"):
         return True, None
 
-    # Everything else is an error; extract the detail after "Error:"
     marker = "Error:"
-    if marker in response:
-        detail = response[response.index(marker) + len(marker):].strip().rstrip(".")
-        return False, detail
-    return False, f"unknown failure: {response!r}"
+    if marker in text:
+        detail = text[text.index(marker) + len(marker):].strip().rstrip(".")
+        return False, detail or "unspecified error"
+    return False, f"unrecognised response: {response!r}"
 
 
 class MqttWriter:
@@ -231,7 +239,16 @@ class MqttWriter:
     async def write_registers(self, writes: list[SlotWrite]) -> MqttWriteResult:
         """Publish each setting change and wait for SA to confirm each
         one via response_message. Returns on first unrecoverable failure
-        or when all writes are confirmed."""
+        or when all writes are confirmed.
+
+        SA's response payload no longer includes the setting name (just
+        "Saved" or "Error: ..."), so we correlate responses to writes
+        by strict FIFO. We subscribe once per batch, push every incoming
+        response onto an asyncio.Queue, and `_publish_and_confirm` pops
+        exactly one item per publish. Writes are sequential by design
+        (see HEO-32) so the next response is always for the most recent
+        publish.
+        """
         result = MqttWriteResult(writes_attempted=0)
 
         if self._dry_run:
@@ -243,24 +260,20 @@ class MqttWriter:
             result.success = True
             return result
 
-        # Subscribe to the response topic ONCE for the whole batch. Each
-        # write temporarily attaches its own future to the subscription
-        # handler via the shared self._response_futures dict.
-        self._response_futures: dict[str, asyncio.Future[tuple[bool, str | None]]] = {}
+        self._response_queue: asyncio.Queue[str] = asyncio.Queue()
 
         async def _on_response(topic: str, payload: str) -> None:
-            for setting_display, fut in list(self._response_futures.items()):
-                if fut.done():
-                    continue
-                if setting_display in payload:
-                    ok, detail = parse_response_message(payload, setting_display)
-                    if not fut.done():
-                        fut.set_result((ok, detail))
+            await self._response_queue.put(payload)
 
         unsubscribe = await self._transport.subscribe(
             self._response_topic(), _on_response,
         )
         try:
+            # Drain any responses that may have queued up before our
+            # write loop starts (retained messages, slow connect handshake).
+            while not self._response_queue.empty():
+                self._response_queue.get_nowait()
+
             for write in writes:
                 for param, topic, payload, setting_display in self._ops_for_slot(write):
                     result.writes_attempted += 1
@@ -284,48 +297,54 @@ class MqttWriter:
     async def _publish_and_confirm(
         self, topic: str, payload: str, setting_display: str,
     ) -> tuple[bool, str | None]:
-        """Publish once and wait for response. Retry on timeout only
-        (not on Error responses, since SA already tried and reported
-        failure from the inverter end).
+        """Publish once and pop the next response off the FIFO queue.
 
-        Returns (success, reason_if_failed).
+        Retries on timeout (no response) but NOT on explicit Error
+        responses - SA already attempted the write and reported failure
+        from the inverter end.
+
+        Returns (success, reason_if_failed). The setting_display name is
+        included in log lines for diagnosis but is no longer used to
+        match responses to publishes (HEO-32: SA simplified the payload).
         """
         last_reason: str | None = None
 
         for attempt in range(1, MQTT_MAX_RETRIES + 1):
-            fut: asyncio.Future[tuple[bool, str | None]] = asyncio.get_event_loop().create_future()
-            self._response_futures[setting_display] = fut
-
             try:
                 await self._transport.publish(topic, payload)
+            except Exception as exc:
+                last_reason = f"publish failed: {exc}"
+                logger.warning(
+                    "HEO-2: %s attempt %d/%d publish error on %s: %s",
+                    setting_display, attempt, MQTT_MAX_RETRIES, topic, exc,
+                )
+                continue
 
-                try:
-                    ok, detail = await asyncio.wait_for(
-                        fut, timeout=MQTT_WRITE_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    last_reason = f"no response within {MQTT_WRITE_TIMEOUT_SECONDS}s"
-                    logger.warning(
-                        "HEO-2: %s attempt %d/%d timeout on %s",
-                        setting_display, attempt, MQTT_MAX_RETRIES, topic,
-                    )
-                    continue
+            try:
+                response = await asyncio.wait_for(
+                    self._response_queue.get(),
+                    timeout=MQTT_WRITE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                last_reason = f"no response within {MQTT_WRITE_TIMEOUT_SECONDS}s"
+                logger.warning(
+                    "HEO-2: %s attempt %d/%d timeout on %s",
+                    setting_display, attempt, MQTT_MAX_RETRIES, topic,
+                )
+                continue
 
-                if ok:
-                    logger.info(
-                        "HEO-2: %s confirmed (attempt %d)",
-                        setting_display, attempt,
-                    )
-                    return True, None
-                else:
-                    # Explicit Error from SA. No retry.
-                    logger.warning(
-                        "HEO-2: %s rejected by SA: %s",
-                        setting_display, detail,
-                    )
-                    return False, detail
-            finally:
-                self._response_futures.pop(setting_display, None)
+            ok, detail = parse_response_message(response)
+            if ok:
+                logger.info(
+                    "HEO-2: %s confirmed (attempt %d): %r",
+                    setting_display, attempt, response,
+                )
+                return True, None
+            logger.warning(
+                "HEO-2: %s rejected by SA: %s (raw=%r)",
+                setting_display, detail, response,
+            )
+            return False, detail
 
         return False, last_reason
 
