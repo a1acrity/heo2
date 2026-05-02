@@ -334,21 +334,23 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # data, which violates SPEC H4 once it reaches the inverter.
         prev_present = self._live_rates_present
         self._live_rates_present = bool(live_import_rates) and bool(live_export_rates)
-        self._bottlecapdave_meter_key = bd_rates.meter_key
+        self._bottlecapdave_meter_key = (
+            f"import={bd_rates.import_meter_key} export={bd_rates.export_meter_key}"
+        )
 
         if not self._live_rates_present:
             logger.warning(
-                "HEO-14: BottlecapDave incomplete (import=%d slots, export=%d slots, "
-                "meter_key=%s); blocking writes per SPEC H4",
-                len(live_import_rates), len(live_export_rates),
-                bd_rates.meter_key,
+                "HEO-14: BottlecapDave incomplete (import=%d slots key=%s, "
+                "export=%d slots key=%s); blocking writes per SPEC H4",
+                len(live_import_rates), bd_rates.import_meter_key,
+                len(live_export_rates), bd_rates.export_meter_key,
             )
         elif not prev_present:
             logger.warning(
-                "HEO-14: BottlecapDave rates restored (meter_key=%s, import=%d, "
-                "export=%d slots); writes unblocked",
-                bd_rates.meter_key,
-                len(live_import_rates), len(live_export_rates),
+                "HEO-14: BottlecapDave rates restored (import_key=%s %d slots, "
+                "export_key=%s %d slots); writes unblocked",
+                bd_rates.import_meter_key, len(live_import_rates),
+                bd_rates.export_meter_key, len(live_export_rates),
             )
 
         load_profile = self._load_builder.build()
