@@ -17,6 +17,7 @@ def _compute_writes_blocked(
     transport_exists: bool,
     transport_connected: bool,
     host: str,
+    live_rates_present: bool = True,
 ) -> tuple[bool, str]:
     """Determine if writes are currently blocked and why.
 
@@ -24,10 +25,16 @@ def _compute_writes_blocked(
     When blocked=True, reason is a short human-readable explanation for
     the dashboard.
 
-    Order of checks matters: dry_run takes precedence over transport
-    state because dry_run is an intentional user choice - reporting
-    "transport disconnected" when the user has explicitly disabled
-    writes would be misleading.
+    Order of checks matters:
+      1. dry_run takes precedence over everything else - it's an
+         intentional user choice; reporting any other reason would be
+         misleading.
+      2. Transport readiness comes next so early-startup state is
+         described accurately.
+      3. SPEC H4 (live-prices-only writes) is checked last: by this
+         point the transport is up, so the only remaining reason to
+         block is missing live BottlecapDave rates. The default True
+         keeps backward compatibility for callers that pre-date HEO-14.
     """
     if dry_run:
         return True, "dry_run enabled"
@@ -35,4 +42,6 @@ def _compute_writes_blocked(
         return True, "MQTT writer not yet initialised"
     if not transport_connected:
         return True, f"MQTT transport disconnected from {host}"
+    if not live_rates_present:
+        return True, "HEO-14: no live BottlecapDave rates (SPEC H4)"
     return False, ""

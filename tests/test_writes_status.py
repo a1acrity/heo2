@@ -73,6 +73,48 @@ class TestComputeWritesBlocked:
         assert blocked is False
         assert reason == ""
 
+    def test_no_live_rates_blocks_writes(self):
+        """HEO-14: SPEC H4 forbids inverter writes without live BD rates."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            live_rates_present=False,
+        )
+        assert blocked is True
+        assert "BottlecapDave" in reason or "HEO-14" in reason
+        assert "H4" in reason
+
+    def test_dry_run_takes_precedence_over_no_live_rates(self):
+        """If user has explicitly disabled writes, that's the reason
+        reported - not a downstream H4 reason that's also true."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=True,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            live_rates_present=False,
+        )
+        assert blocked is True
+        assert "dry_run" in reason
+        assert "H4" not in reason
+
+    def test_default_live_rates_present_is_true(self):
+        """Backward-compat: callers from before HEO-14 don't pass the
+        flag, so the default must not silently start blocking."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+        )
+        assert blocked is False
+        assert reason == ""
+
     def test_host_appears_in_disconnect_reason(self):
         """Custom host should appear in the reason so multi-install
         users can tell which SA broker has disconnected."""

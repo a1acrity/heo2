@@ -169,7 +169,18 @@ class ProgrammeState:
 
 @dataclass
 class ProgrammeInputs:
-    """All inputs gathered by the coordinator for a programme calculation."""
+    """All inputs gathered by the coordinator for a programme calculation.
+
+    `import_rates` and `export_rates` are the merged "best available"
+    schedules: BottlecapDave's published Octopus rates first, with
+    AgilePredict (export) and IGO fixed-rate slots (import) filling any
+    gaps beyond BD's horizon. Rules and dashboard sensors read these.
+
+    `live_import_rates` and `live_export_rates` are the BottlecapDave-only
+    subset, used to enforce SPEC hard rule H4 (Live-prices-only writes).
+    Empty when BD is unavailable; the coordinator blocks inverter writes
+    in that state. Predictions never reach the inverter.
+    """
     now: datetime
     current_soc: float
     battery_capacity_kwh: float
@@ -186,6 +197,8 @@ class ProgrammeInputs:
     grid_connected: bool
     active_appliances: list[str]
     appliance_expected_kwh: float
+    live_import_rates: list[RateSlot] = field(default_factory=list)
+    live_export_rates: list[RateSlot] = field(default_factory=list)
 
     def rate_at(self, dt: datetime) -> float | None:
         """Find the import rate at a specific datetime. Returns None if no rate covers it."""
