@@ -33,11 +33,14 @@ class FakeTransport:
     Records every publish. After each publish, optionally dispatches a
     scripted response to whoever is subscribed to response_message/state.
 
+    Post-HEO-32 SA payload format: a bare "Saved" or "Error: <reason>"
+    string with no setting prefix. Scripted responses must match.
+
     Usage:
         transport = FakeTransport()
         transport.script_responses([
-            "Set 'Capacity point 1' to '95': Saved.",
-            "Set 'Grid charge point 2' to 'Enabled': Saved.",
+            "Saved",
+            "Error: No response.",
         ])
     """
 
@@ -192,11 +195,14 @@ class TestTopicGeneration:
 # -----------------------------------------------------------------------
 
 class TestFormatters:
-    def test_format_grid_charge_true_is_Enabled(self):
-        assert format_grid_charge(True) == "Enabled"
+    def test_format_grid_charge_true_is_lowercase_true(self):
+        """HEO-32: SA accepts only lowercase 'true'/'false' for
+        grid_charge_point_N. Pre-HEO-32 'Enabled'/'Disabled' is
+        rejected with `Error: Invalid value 'Enabled' for ...`."""
+        assert format_grid_charge(True) == "true"
 
-    def test_format_grid_charge_false_is_Disabled(self):
-        assert format_grid_charge(False) == "Disabled"
+    def test_format_grid_charge_false_is_lowercase_false(self):
+        assert format_grid_charge(False) == "false"
 
     def test_format_time_accepts_time_object(self):
         assert format_time(time(23, 30)) == "23:30"
@@ -206,63 +212,55 @@ class TestFormatters:
 
 
 # -----------------------------------------------------------------------
-# parse_response_message - pure function covering SA's actual formats
+# parse_response_message - pure function covering SA's current format
 # -----------------------------------------------------------------------
 
 class TestParseResponseMessage:
-    def test_saved_returns_success(self):
-        ok, reason = parse_response_message(
-            "Set 'Capacity point 1' to '97': Saved.",
-            "Capacity point 1",
-        )
+    def test_bare_saved_returns_success(self):
+        """HEO-32: post-2026-05 SA payload is just 'Saved' - no
+        'Set <name> to <value>:' prefix."""
+        ok, reason = parse_response_message("Saved")
         assert ok is True
         assert reason is None
 
-    def test_saved_without_trailing_period(self):
-        """Defensive - some SA variants may omit the trailing dot."""
+    def test_legacy_set_prefix_saved_still_recognised(self):
+        """Backward compat with older SA builds that still wrote
+        the verbose `Set 'X' to 'Y': Saved.` format."""
         ok, reason = parse_response_message(
-            "Set 'Capacity point 1' to '97': Saved",
-            "Capacity point 1",
+            "Set 'Capacity point 1' to '97': Saved.",
         )
         assert ok is True
 
     def test_error_no_response_is_failure(self):
-        """Live SA log shows this error shape verbatim."""
+        """Live SA log shape: bare 'Error: No response' with no prefix."""
+        ok, reason = parse_response_message("Error: No response.")
+        assert ok is False
+        assert reason == "No response"
+
+    def test_error_invalid_value_captures_detail(self):
+        """The actual error from SA when sent legacy 'Enabled'."""
+        ok, reason = parse_response_message(
+            "Error: Invalid value 'Enabled' for 'Grid charge point 1'. "
+            "Valid values: true, false."
+        )
+        assert ok is False
+        assert "Invalid value" in reason
+
+    def test_legacy_set_prefix_error_still_recognised(self):
         ok, reason = parse_response_message(
             "Set 'Grid charge' to 'Disabled': Error: No response.",
-            "Grid charge",
         )
         assert ok is False
         assert reason == "No response"
 
-    def test_error_with_explanation_captures_detail(self):
-        ok, reason = parse_response_message(
-            "Set 'Work mode' to 'Selling first': Error: Value rejected by inverter.",
-            "Work mode",
-        )
-        assert ok is False
-        assert "rejected" in reason
-
-    def test_response_for_different_setting_is_failure(self):
-        """If SA responds about something else, don't claim our success."""
-        ok, reason = parse_response_message(
-            "Set 'Energy pattern' to 'Battery first': Saved.",
-            "Capacity point 1",
-        )
-        assert ok is False
-        assert "different setting" in reason
-
     def test_empty_response_is_failure(self):
-        ok, reason = parse_response_message("", "Capacity point 1")
+        ok, reason = parse_response_message("")
         assert ok is False
 
-    def test_malformed_response_is_failure(self):
-        ok, reason = parse_response_message(
-            "something else entirely",
-            "Capacity point 1",
-        )
+    def test_unrecognised_response_is_failure(self):
+        ok, reason = parse_response_message("something else entirely")
         assert ok is False
-        assert "malformed" in reason
+        assert "unrecognised" in reason
 
 
 # -----------------------------------------------------------------------
@@ -273,9 +271,7 @@ class TestWriteRegisters:
     @pytest.mark.asyncio
     async def test_happy_path_capacity_write_confirmed(self):
         transport = FakeTransport()
-        transport.script_responses([
-            "Set 'Capacity point 1' to '80': Saved.",
-        ])
+        transport.script_responses(["Saved"])
         writer = MqttWriter(transport=transport)
 
         result = await writer.write_registers([
@@ -292,11 +288,10 @@ class TestWriteRegisters:
         )
 
     @pytest.mark.asyncio
-    async def test_grid_charge_serialised_as_Enabled_or_Disabled(self):
+    async def test_grid_charge_serialised_as_lowercase_bool(self):
+        """HEO-32: SA's grid_charge_point_N expects 'true'/'false'."""
         transport = FakeTransport()
-        transport.script_responses([
-            "Set 'Grid charge point 2' to 'Enabled': Saved.",
-        ])
+        transport.script_responses(["Saved"])
         writer = MqttWriter(transport=transport)
 
         await writer.write_registers([
@@ -304,15 +299,12 @@ class TestWriteRegisters:
         ])
 
         _topic, payload = transport.published[0]
-        assert payload == "Enabled"
+        assert payload == "true"
 
     @pytest.mark.asyncio
     async def test_multiple_slots_published_in_order(self):
         transport = FakeTransport()
-        transport.script_responses([
-            "Set 'Capacity point 1' to '80': Saved.",
-            "Set 'Grid charge point 3' to 'Enabled': Saved.",
-        ])
+        transport.script_responses(["Saved", "Saved"])
         writer = MqttWriter(transport=transport)
 
         result = await writer.write_registers([
@@ -333,9 +325,7 @@ class TestWriteRegisters:
         """When SA says 'Error: No response', the inverter already tried
         and rejected. No point retrying - fail fast."""
         transport = FakeTransport()
-        transport.script_responses([
-            "Set 'Capacity point 1' to '80': Error: No response.",
-        ])
+        transport.script_responses(["Error: No response."])
         writer = MqttWriter(transport=transport)
 
         result = await writer.write_registers([
@@ -352,14 +342,13 @@ class TestWriteRegisters:
     @pytest.mark.asyncio
     async def test_timeout_triggers_retry_then_success(self, monkeypatch):
         """If no response arrives in time, retry up to MQTT_MAX_RETRIES."""
-        # Shorten the timeout so the test finishes quickly
         monkeypatch.setattr(
             "heo2.mqtt_writer.MQTT_WRITE_TIMEOUT_SECONDS", 0.05
         )
         transport = FakeTransport()
         transport.script_responses([
             None,  # first attempt: no response
-            "Set 'Capacity point 1' to '80': Saved.",  # second: success
+            "Saved",  # second attempt: success
         ])
         writer = MqttWriter(transport=transport)
 
@@ -397,7 +386,7 @@ class TestWriteRegisters:
         Partial writes would leave the inverter in an inconsistent state."""
         transport = FakeTransport()
         transport.script_responses([
-            "Set 'Capacity point 1' to '80': Error: Inverter rejected.",
+            "Error: Inverter rejected.",
             # No second response scripted - we should never get here
         ])
         writer = MqttWriter(transport=transport)
@@ -412,6 +401,25 @@ class TestWriteRegisters:
         # Slot 2 never got published
         assert len(transport.published) == 1
         assert "capacity_point_1" in transport.published[0][0]
+
+    @pytest.mark.asyncio
+    async def test_responses_correlated_by_fifo_order(self):
+        """HEO-32: SA's bare 'Saved'/'Error:' payload doesn't carry the
+        setting name, so writes are sequential and the queue pops one
+        response per publish in order. A delayed first response still
+        attaches to the first publish, not the second.
+        """
+        transport = FakeTransport()
+        # Both succeed - confirms the queue feeds one response per publish.
+        transport.script_responses(["Saved", "Saved"])
+        writer = MqttWriter(transport=transport)
+
+        result = await writer.write_registers([
+            SlotWrite(slot_number=1, capacity_soc=80),
+            SlotWrite(slot_number=2, capacity_soc=70),
+        ])
+        assert result.success is True
+        assert result.writes_confirmed == 2
 
     @pytest.mark.asyncio
     async def test_dry_run_logs_without_publishing(self):
@@ -470,9 +478,7 @@ class TestApplyProgrammeDiff:
         """After a successful write, last_known should reflect the new
         programme so the next tick sees no diff."""
         transport = FakeTransport()
-        transport.script_responses([
-            "Set 'Capacity point 1' to '80': Saved.",
-        ])
+        transport.script_responses(["Saved"])
         writer = MqttWriter(transport=transport)
 
         current = _baseline_programme()
@@ -493,9 +499,7 @@ class TestApplyProgrammeDiff:
         """If SA rejects the write, last_known must NOT advance.
         Next tick should then retry the same diff."""
         transport = FakeTransport()
-        transport.script_responses([
-            "Set 'Capacity point 1' to '80': Error: Inverter unreachable.",
-        ])
+        transport.script_responses(["Error: Inverter unreachable."])
         writer = MqttWriter(transport=transport)
 
         current = _baseline_programme()
@@ -543,8 +547,8 @@ class TestApplyProgrammeDiff:
         retries everything."""
         transport = FakeTransport()
         transport.script_responses([
-            "Set 'Capacity point 1' to '80': Saved.",  # 1 ok
-            "Set 'Capacity point 2' to '60': Error: No response.",  # 2 fails
+            "Saved",  # 1 ok
+            "Error: No response.",  # 2 fails
             # slot 3 never attempted
         ])
         writer = MqttWriter(transport=transport)
