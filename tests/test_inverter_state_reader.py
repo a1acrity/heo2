@@ -88,12 +88,15 @@ class TestReadProgrammeState:
         assert state.slots[4].capacity_soc == 20
         for slot in state.slots:
             assert slot.grid_charge is False
-        # Slot 1 starts at time_point_6 (the previous slot end), ends at time_point_1
-        assert state.slots[0].start_time == time(0, 0)
-        assert state.slots[0].end_time == time(5, 30)
-        # Slot 2 starts at time_point_1, ends at time_point_2
-        assert state.slots[1].start_time == time(5, 30)
-        assert state.slots[1].end_time == time(18, 30)
+        # Slot 1 starts at time_point_1 (Sunsynk timer convention), ends at time_point_2
+        assert state.slots[0].start_time == time(5, 30)
+        assert state.slots[0].end_time == time(18, 30)
+        # Slot 2 starts at time_point_2, ends at time_point_3
+        assert state.slots[1].start_time == time(18, 30)
+        assert state.slots[1].end_time == time(23, 30)
+        # Slot 6 wraps midnight: starts at time_point_6, ends at time_point_1
+        assert state.slots[5].start_time == time(0, 0)
+        assert state.slots[5].end_time == time(5, 30)
 
 
     def test_grid_charge_variants_parsed_correctly(self):

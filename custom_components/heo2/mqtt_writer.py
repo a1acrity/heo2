@@ -163,7 +163,14 @@ class MqttWriter:
     # --- diff -----------------------------------------------------------
 
     def diff(self, current: ProgrammeState, new: ProgrammeState) -> list[SlotWrite]:
-        """Compare two programmes and return a list of register writes."""
+        """Compare two programmes and return a list of register writes.
+
+        `time_point_N` on the inverter is slot N's START time (Sunsynk
+        timer convention - verified against the SA UI). So we write
+        `slot.start_time` to time_point_N. Pre-2026-05-02 this used
+        `slot.end_time`, which produced an off-by-one shift relative
+        to the intended time windows (HEO-31 fix).
+        """
         writes: list[SlotWrite] = []
 
         for i in range(6):
@@ -172,8 +179,8 @@ class MqttWriter:
             slot_num = i + 1
 
             cap = nw.capacity_soc if nw.capacity_soc != cur.capacity_soc else None
-            cur_time = cur.end_time.strftime("%H:%M")
-            new_time = nw.end_time.strftime("%H:%M")
+            cur_time = cur.start_time.strftime("%H:%M")
+            new_time = nw.start_time.strftime("%H:%M")
             tp = new_time if new_time != cur_time else None
             gc = nw.grid_charge if nw.grid_charge != cur.grid_charge else None
 
