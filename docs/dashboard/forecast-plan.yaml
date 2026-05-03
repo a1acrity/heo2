@@ -39,14 +39,15 @@ cards:
         stroke_width: 2
         stroke_dash: 4
 
-  # SOC trajectory chart
+  # SOC trajectory chart. trajectory[i] is the projected SOC i hours
+  # FROM TICK TIME, not at clock hour i. Use the start_hour attribute
+  # to anchor the x-axis to the correct wall-clock hour, otherwise
+  # tomorrow morning's solar charge plots on today's evening axis.
   - type: custom:apexcharts-card
     header:
       title: Battery SOC Trajectory
       show: true
     graph_span: 24h
-    span:
-      start: day
     yaxis:
       - min: 0
         max: 100
@@ -54,9 +55,11 @@ cards:
       - entity: sensor.heo2_soc_trajectory
         data_generator: |
           const trajectory = entity.attributes.trajectory || [];
+          const startHour = entity.attributes.start_hour ?? 0;
+          const base = new Date();
+          base.setHours(startHour, 0, 0, 0);
           return trajectory.map((val, i) => {
-            const d = new Date();
-            d.setHours(i, 0, 0, 0);
+            const d = new Date(base.getTime() + i * 3600 * 1000);
             return [d.getTime(), val];
           });
         name: SOC (%)
