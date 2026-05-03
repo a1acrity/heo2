@@ -262,10 +262,15 @@ class ProgrammeInputs:
     # is supplying via EPS. Drives EPSModeRule (cap=0% / no GC) and
     # writes_blocked H3. Defaults False so existing tests pre-EPS pass.
     eps_active: bool = False
-    # SPEC §9 row 5: implicit Winter low-PV mode. Computed by the
-    # coordinator as `sum(solar_today) < sum(load_today)`. When True,
-    # WinterLowPVRule raises overnight charge target and tightens the
-    # export-window selectivity (preserve cycles for own use).
+    # `is_winter_low_pv` was the trigger for the old WinterLowPVRule,
+    # which forced GC slots to 100% whenever sum(solar) < sum(load).
+    # The rule was removed (2026-05-03) because it overrode
+    # CheapRateChargeRule's smart bridge-to-PV-takeover sizing.
+    # Winter behaviour is now an emergent property of CheapRateCharge:
+    # if PV never overtakes load on the next-day forecast, the bridge
+    # accumulates the full day's deficit and target clamps to
+    # `max_target_soc` - same end-state, principled derivation.
+    # Field kept as a stub for backward compat with tests; not read.
     is_winter_low_pv: bool = False
     # SPEC §12 EV deferral: True when the user has flagged
     # `switch.heo_ii_defer_ev_when_export_high` ON, indicating the car

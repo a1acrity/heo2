@@ -12,14 +12,13 @@ from .evening_protect import EveningProtectRule
 from .igo_dispatch import IGODispatchRule
 from .ev_charging import EVChargingRule
 from .saving_session import SavingSessionRule
-from .winter_low_pv import WinterLowPVRule
 from .ev_deferral import EVDeferralRule
 from .eps_mode import EPSModeRule
 from .safety import SafetyRule
 
 
 def default_rules() -> list[Rule]:
-    """Return the 12 default rules in priority order.
+    """Return the 11 default rules in priority order.
 
     SafetyRule is always last and cannot be disabled. EPSModeRule sits
     JUST before SafetyRule because it must override every other rule's
@@ -27,6 +26,15 @@ def default_rules() -> list[Rule]:
     EVDeferralRule sits BEFORE EVChargingRule so the deferral signal
     can override EVChargingRule's "hold SOC" behaviour (we WANT to
     drain the battery to grid in deferral mode).
+
+    WinterLowPVRule was removed (PR #67 / 2026-05-03): the old rule
+    forced GC slots to 100% whenever sum(solar) < sum(load), which
+    undid CheapRateChargeRule's smart bridge-to-PV-takeover sizing.
+    Winter behaviour is now handled inside CheapRateChargeRule itself:
+    when PV never overtakes load on tomorrow's forecast, the bridge
+    accumulates the whole day's deficit and the target clamps to
+    max_target_soc - same end-state as the old WinterLowPV did, but
+    arrived at via the same maths the rest of the year uses.
     """
     return [
         BaselineRule(),
@@ -34,7 +42,6 @@ def default_rules() -> list[Rule]:
         SolarSurplusRule(),
         ExportWindowRule(),
         EveningProtectRule(),
-        WinterLowPVRule(),
         SavingSessionRule(),
         IGODispatchRule(),
         EVDeferralRule(),

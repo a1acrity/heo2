@@ -757,14 +757,6 @@ class HEO2Coordinator(DataUpdateCoordinator):
             eps_active=eps_active,
             # SPEC §9 row 5: implicit winter mode when daily PV
             # forecast is below daily load. Guarded: only fire when
-            # we have a believable solar forecast (sum > 0). A zero
-            # sum means Solcast returned empty (data fetch race, rate
-            # limit, etc.) - we can't decide "is it winter" from no
-            # data, so default to NOT firing rather than misclassifying
-            # missing data as a winter signal.
-            is_winter_low_pv=(
-                sum(solar) > 0 and sum(solar) < sum(load_forecast)
-            ),
             # SPEC §12 EV deferral signals.
             defer_ev_eligible=bool(
                 self._config.get("defer_ev_when_export_high", False),
