@@ -13,6 +13,19 @@ from .const import DOMAIN, DEFAULT_MIN_SOC
 from .coordinator import HEO2Coordinator
 
 
+async def _persist_option(
+    hass: HomeAssistant, entry: ConfigEntry, key: str, value,
+) -> None:
+    """Write a single option into entry.options so it survives HA
+    restart. Mirror the value into coordinator._config too so the
+    next tick sees it without waiting for the update_listener reload.
+    """
+    new_options = {**(entry.options or {}), key: value}
+    hass.config_entries.async_update_entry(entry, options=new_options)
+    coordinator: HEO2Coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator._config[key] = value
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -43,7 +56,9 @@ class MinSocNumber(CoordinatorEntity, NumberEntity):
         return self.coordinator._config.get("min_soc", DEFAULT_MIN_SOC)
 
     async def async_set_native_value(self, value: float) -> None:
-        self.coordinator._config["min_soc"] = value
+        await _persist_option(
+            self.hass, self.coordinator._entry, "min_soc", value,
+        )
         await self.coordinator.async_request_refresh()
 
 
@@ -64,7 +79,9 @@ class SystemCostNumber(CoordinatorEntity, NumberEntity):
         return self.coordinator._config.get("system_cost", 16800.0)
 
     async def async_set_native_value(self, value: float) -> None:
-        self.coordinator._config["system_cost"] = value
+        await _persist_option(
+            self.hass, self.coordinator._entry, "system_cost", value,
+        )
         self.async_write_ha_state()
 
 
@@ -85,5 +102,7 @@ class AdditionalCostsNumber(CoordinatorEntity, NumberEntity):
         return self.coordinator._config.get("additional_costs", 0.0)
 
     async def async_set_native_value(self, value: float) -> None:
-        self.coordinator._config["additional_costs"] = value
+        await _persist_option(
+            self.hass, self.coordinator._entry, "additional_costs", value,
+        )
         self.async_write_ha_state()
