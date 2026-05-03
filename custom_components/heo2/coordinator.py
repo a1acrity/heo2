@@ -20,6 +20,7 @@ from .const import (
     DEFAULT_REPLAN_LOAD_PCT,
     DEFAULT_REPLAN_SOC_PCT,
     DEFAULT_PEAK_THRESHOLD_PENCE,
+    DEFAULT_IGO_OFF_PEAK_PENCE,
     DEFAULT_SELL_TOP_PCT,
     DEFAULT_CHEAP_CHARGE_BOTTOM_PCT,
     DEFAULT_MAX_CHARGE_KW,
@@ -254,6 +255,9 @@ class HEO2Coordinator(DataUpdateCoordinator):
             charge_efficiency=self._charge_efficiency,
             discharge_efficiency=self._discharge_efficiency,
             tz=tz,
+            igo_off_peak_p=self._config.get(
+                "igo_night_rate", DEFAULT_IGO_OFF_PEAK_PENCE,
+            ),
         )
         self._validation_warnings = validation.warnings
         self._last_projection = validation.projection

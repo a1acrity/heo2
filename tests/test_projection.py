@@ -179,6 +179,51 @@ class TestProjectDay:
         assert p.peak_import_kwh == pytest.approx(p.imports_kwh, abs=0.5)
         assert p.peak_import_kwh > 20.0
 
+    def test_planned_dispatch_overrides_published_rate_to_off_peak(self):
+        """Octopus retroactively bills any import inside a smart-charge
+        dispatch at the IGO off-peak rate, regardless of what the
+        published live-rate sensor said at the moment of import. The
+        projection must reflect this so it doesn't false-alarm on
+        peak-rate import while the EV is being smart-charged.
+        """
+        from datetime import timedelta as _td
+        from heo2.models import PlannedDispatch
+        prog = ProgrammeState(slots=[
+            _slot(0, 0, 4, 0, 100, True),
+            _slot(4, 0, 8, 0, 10, False),
+            _slot(8, 0, 12, 0, 10, False),
+            _slot(12, 0, 16, 0, 10, False),
+            _slot(16, 0, 20, 0, 10, False),
+            _slot(20, 0, 0, 0, 10, False),
+        ])
+        midnight = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+        # All-day 25p (above peak threshold). Without the dispatch
+        # override, slot 1's grid_charge=True window books at 25p.
+        # With the override it books at the off-peak 4.95p.
+        inputs = _inputs_at_midnight(
+            current_soc=10.0,
+            import_rates=_half_hour_rates(midnight, 24, 25.0),
+            load_24=[0.0] * 24,
+        )
+        # Dispatch covers the whole 00:00-04:00 charge window
+        inputs.planned_dispatches = [PlannedDispatch(
+            start=midnight,
+            end=midnight + _td(hours=4),
+        )]
+
+        p = project_day(
+            prog, inputs,
+            battery_capacity_kwh=20.0,
+            peak_threshold_p=24.0,
+            igo_off_peak_p=4.95,
+        )
+        # All imports during the dispatch window -> none should land
+        # in peak_import_kwh.
+        assert p.peak_import_kwh == pytest.approx(0.0, abs=0.01)
+        # imports_avg should reflect the off-peak rate.
+        assert p.imports_avg_pence is not None
+        assert p.imports_avg_pence == pytest.approx(4.95, abs=0.5)
+
     def test_top_export_window_drains_battery_to_grid(self):
         """When SOC is high and export rate is in top-N% with capacity_soc
         below current SOC, projection sells to grid."""

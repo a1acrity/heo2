@@ -136,6 +136,24 @@ def _top_export_window_starts(
     return {r.start for r in ordered[:count]}
 
 
+def _step_in_planned_dispatch(
+    step_start: datetime, dispatches: list,
+) -> bool:
+    """True if any planned IGO dispatch covers this 30-min step start.
+
+    Used to override the published import rate with the IGO off-peak
+    price during smart-charge windows: Octopus retroactively bills
+    those imports at the cheap rate even though the live rate sensor
+    shows the day rate at the moment of import.
+    """
+    if not dispatches:
+        return False
+    for d in dispatches:
+        if d.start <= step_start < d.end:
+            return True
+    return False
+
+
 def project_day(
     programme: ProgrammeState,
     inputs: ProgrammeInputs,
@@ -150,6 +168,7 @@ def project_day(
     replacement_cost_p: float = 4.95,
     horizon_hours: int = 24,
     tz: ZoneInfo | None = None,
+    igo_off_peak_p: float = 4.95,
 ) -> Projection:
     """Forward-simulate the next `horizon_hours` and return a Projection.
 
@@ -202,6 +221,15 @@ def project_day(
         exp = _rate_at(inputs.export_rates, step_start)
         imp_p = imp.rate_pence if imp is not None else 0.0
         exp_p = exp.rate_pence if exp is not None else 0.0
+
+        # IGO smart-charge windows: Octopus retroactively re-bills any
+        # import landing inside a planned dispatch at the IGO off-peak
+        # rate, regardless of what the published live-rate sensor said
+        # at the moment of import. Reflect that in the projection so we
+        # don't false-alarm on "peak-rate import" when the EV is on
+        # a smart charge.
+        if _step_in_planned_dispatch(step_start, inputs.planned_dispatches):
+            imp_p = igo_off_peak_p
 
         # Solar / load at this step. Forecasts are hourly; pro-rate to 30 min.
         hour_idx = step_local.hour
