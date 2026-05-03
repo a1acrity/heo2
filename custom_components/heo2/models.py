@@ -75,11 +75,15 @@ class ProgrammeState:
     Valid values per SA discovery:
       work_mode: "Selling first" | "Zero export to load" | "Zero export to CT"
       energy_pattern: "Battery first" | "Load first"
+      max_charge_a / max_discharge_a: 0..350 A (Sunsynk 5kW limit ~100A
+        at 51.2V battery nominal)
     """
     slots: list[SlotConfig]
     reason_log: list[str] = field(default_factory=list)
     work_mode: Optional[str] = None
     energy_pattern: Optional[str] = None
+    max_charge_a: Optional[float] = None
+    max_discharge_a: Optional[float] = None
 
     @classmethod
     def default(cls, min_soc: int = 20) -> ProgrammeState:

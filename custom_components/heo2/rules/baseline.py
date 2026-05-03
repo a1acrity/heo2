@@ -52,13 +52,19 @@ class BaselineRule(Rule):
         # `Load first` energy_pattern means the inverter prioritises
         # supplying load before charging the battery from solar - the
         # right default for a UK house with day load + Octopus IGO.
+        # Charge / discharge limits at 100A match the Sunsynk 5kW
+        # nominal max (100A * ~51.2V = 5120W) - leaves the inverter
+        # free to use its full rate when needed.
         state.work_mode = "Zero export to CT"
         state.energy_pattern = "Load first"
+        state.max_charge_a = 100.0
+        state.max_discharge_a = 100.0
 
         state.reason_log.append(
             f"Baseline: overnight charge to 100% until {self.off_peak_end}, "
             f"solar day until {self.evening_start}, "
             f"evening drain to {min_soc}%; "
-            f"work_mode=Zero export to CT, energy_pattern=Load first"
+            f"work_mode=Zero export to CT, energy_pattern=Load first, "
+            f"max_charge=100A, max_discharge=100A"
         )
         return state

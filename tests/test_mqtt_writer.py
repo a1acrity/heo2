@@ -637,6 +637,46 @@ class TestDiffGlobals:
         out = writer.diff_globals(cur, new)
         assert [w.setting for w in out] == ["work_mode", "energy_pattern"]
 
+    def test_max_charge_amp_change_detected(self):
+        cur = _baseline_programme()
+        cur.max_charge_a = 100.0
+        new = _baseline_programme()
+        new.max_charge_a = 50.0
+        writer = MqttWriter(client=MagicMock())
+        out = writer.diff_globals(cur, new)
+        assert len(out) == 1
+        assert out[0].setting == "max_charge_current"
+        assert out[0].value == "50"
+
+    def test_max_charge_amp_within_tolerance_skipped(self):
+        """SA reports floats with one decimal; small rounding shouldn't
+        re-write every tick."""
+        cur = _baseline_programme()
+        cur.max_charge_a = 100.0
+        new = _baseline_programme()
+        new.max_charge_a = 100.2  # within 0.5 A tolerance
+        writer = MqttWriter(client=MagicMock())
+        assert writer.diff_globals(cur, new) == []
+
+    def test_max_discharge_amp_change_detected(self):
+        cur = _baseline_programme()
+        cur.max_discharge_a = 100.0
+        new = _baseline_programme()
+        new.max_discharge_a = 25.0
+        writer = MqttWriter(client=MagicMock())
+        out = writer.diff_globals(cur, new)
+        assert len(out) == 1
+        assert out[0].setting == "max_discharge_current"
+        assert out[0].value == "25"
+
+    def test_none_amp_value_does_not_trigger_write(self):
+        cur = _baseline_programme()
+        cur.max_charge_a = 100.0
+        new = _baseline_programme()
+        new.max_charge_a = None
+        writer = MqttWriter(client=MagicMock())
+        assert writer.diff_globals(cur, new) == []
+
 
 class TestWriteGlobals:
     @pytest.mark.asyncio
