@@ -33,6 +33,12 @@ _TIME_FMT = "sensor.sa_inverter_{inv}_time_point_{n}"
 # returns the current value.
 _WORK_MODE_FMT = "sensor.sa_inverter_{inv}_work_mode"
 _ENERGY_PATTERN_FMT = "sensor.sa_inverter_{inv}_energy_pattern"
+# SA exposes charge/discharge limits as numeric current sensors in
+# Amps. ProgrammeState carries them as `max_charge_a` / `max_discharge_a`
+# floats; conversion to/from watts is the user's concern (multiply by
+# battery nominal voltage, ~51.2V for 4x BP51.2 in series).
+_MAX_CHARGE_CURRENT_FMT = "sensor.sa_inverter_{inv}_max_charge_current"
+_MAX_DISCHARGE_CURRENT_FMT = "sensor.sa_inverter_{inv}_max_discharge_current"
 
 
 # Fallback defaults when an entity is missing or unparseable. Chosen to
@@ -138,11 +144,28 @@ def read_programme_state(
     energy_pattern_raw = state_lookup(_ENERGY_PATTERN_FMT.format(inv=inv))
     energy_pattern = energy_pattern_raw.strip() if energy_pattern_raw else None
 
+    def _parse_amps(raw: str | None) -> float | None:
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
+    max_charge_a = _parse_amps(
+        state_lookup(_MAX_CHARGE_CURRENT_FMT.format(inv=inv))
+    )
+    max_discharge_a = _parse_amps(
+        state_lookup(_MAX_DISCHARGE_CURRENT_FMT.format(inv=inv))
+    )
+
     return ProgrammeState(
         slots=slots,
         reason_log=[],
         work_mode=work_mode,
         energy_pattern=energy_pattern,
+        max_charge_a=max_charge_a,
+        max_discharge_a=max_discharge_a,
     )
 
 

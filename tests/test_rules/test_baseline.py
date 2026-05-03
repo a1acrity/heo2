@@ -105,3 +105,13 @@ class TestBaselineRule:
         state = ProgrammeState.default(min_soc=20)
         result = rule.apply(state, default_inputs)
         assert result.energy_pattern == "Load first"
+
+    def test_sets_default_charge_discharge_rates(self, default_inputs):
+        """SPEC §2: leave the inverter free to use its full Sunsynk 5kW
+        nominal rate by default. Other rules can lower if needed
+        (e.g. Winter low-PV preserving cycles)."""
+        rule = BaselineRule()
+        state = ProgrammeState.default(min_soc=20)
+        result = rule.apply(state, default_inputs)
+        assert result.max_charge_a == 100.0
+        assert result.max_discharge_a == 100.0

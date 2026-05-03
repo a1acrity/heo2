@@ -188,7 +188,7 @@ class MqttWriter:
         """
         out: list[GlobalWrite] = []
 
-        def _check(field_name: str, topic_name: str) -> None:
+        def _check_str(field_name: str, topic_name: str) -> None:
             new_val = getattr(new, field_name)
             if new_val is None:
                 return
@@ -198,8 +198,26 @@ class MqttWriter:
                     setting=topic_name, value=new_val.strip(),
                 ))
 
-        _check("work_mode", "work_mode")
-        _check("energy_pattern", "energy_pattern")
+        def _check_float(
+            field_name: str, topic_name: str, tol: float = 0.5,
+        ) -> None:
+            new_val = getattr(new, field_name)
+            if new_val is None:
+                return
+            cur_val = getattr(current, field_name)
+            if cur_val is None or abs(float(cur_val) - float(new_val)) > tol:
+                # SA accepts the value as a plain number string;
+                # %g trims trailing zeros without scientific notation
+                # for the typical 0..350 A range.
+                out.append(GlobalWrite(
+                    setting=topic_name,
+                    value=f"{float(new_val):g}",
+                ))
+
+        _check_str("work_mode", "work_mode")
+        _check_str("energy_pattern", "energy_pattern")
+        _check_float("max_charge_a", "max_charge_current")
+        _check_float("max_discharge_a", "max_discharge_current")
         return out
 
     def diff(self, current: ProgrammeState, new: ProgrammeState) -> list[SlotWrite]:
