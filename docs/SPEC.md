@@ -25,7 +25,11 @@
 ## 2. Outputs HEO II writes to the inverter
 
 HEO II controls these settings via MQTT direct to Solar Assistant's broker.
-Master/slave RS485 link mirrors changes to inverter 2.
+Master/slave RS485 link mirrors changes to inverter 2 -- HEO II writes
+ONLY to `solar_assistant/inverter_1/...` topics; inverter 2 picks up the
+same setting over RS485 automatically. There is intentionally no
+inverter 2 write path in MqttWriter; adding one would risk both
+inverters racing each other for the master role.
 
 ### Per-slot (6 timed slots, programme rewritten as needed)
 1. Slot N start time (`time_point_N`)
