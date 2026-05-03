@@ -45,6 +45,7 @@ async def async_setup_entry(
     entities.append(ActiveRulesSensor(coordinator, entry))
     entities.append(ProjectionTodaySensor(coordinator, entry))
     entities.append(GranularitySnapSensor(coordinator, entry))
+    entities.append(CyclesTodaySensor(coordinator, entry))
 
     # Dashboard sensors (Group 2: Cost Accumulator)
     entities.append(DailyImportCostSensor(coordinator, entry))
@@ -492,6 +493,24 @@ class ProjectionTodaySensor(CoordinatorEntity, SensorEntity):
             "peak_import_kwh": round(p.peak_import_kwh, 2),
             "warnings": self.coordinator.validation_warnings,
         }
+
+
+class CyclesTodaySensor(CoordinatorEntity, SensorEntity):
+    """SPEC H7: cycles consumed since the last local-midnight reset.
+    Soft target is <=2 cycles/day; a follow-up binary_sensor can fire
+    when 3 consecutive days breach. Native value is float (e.g. 1.42)."""
+
+    _attr_native_unit_of_measurement = "cycles"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: HEO2Coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_cycles_today"
+        self._attr_name = "HEO II Cycles Today"
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.cycle_tracker.cycles_today, 3)
 
 
 class GranularitySnapSensor(CoordinatorEntity, SensorEntity):

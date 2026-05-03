@@ -44,6 +44,7 @@ from .appliance_timing import ApplianceTimingCalculator, ApplianceSuggestion
 from .const import DEFAULT_APPLIANCES
 from .soc_trajectory import calculate_soc_trajectory
 from .cost_tracker import CostAccumulator
+from .cycle_tracker import CycleTracker
 from .octopus import OctopusBillingFetcher
 from .const import DEFAULT_FLAT_RATE_PENCE
 from .mqtt_writer import MqttWriter, apply_programme_diff
@@ -170,6 +171,11 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # Dashboard state
         self.soc_trajectory: list[float] = [0.0] * 24
         self.cost_accumulator = CostAccumulator()
+        self.cycle_tracker = CycleTracker(
+            battery_capacity_kwh=self._config.get(
+                "battery_capacity_kwh", 20.0,
+            ),
+        )
         self.octopus: OctopusBillingFetcher | None = None
 
         # ROI state (seeded from config)
@@ -319,6 +325,19 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
         self.cost_accumulator.calculate_savings_vs_flat(flat_rate)
+
+        # H7 cycle tracker: read SA's cumulative battery-out energy
+        # counter so the next cycles_today reflects what the inverter
+        # has actually drained today. Default entity ID matches Paddy's
+        # install; users with a different SA build can override via
+        # `battery_energy_out_entity` config.
+        bo_entity = self._config.get(
+            "battery_energy_out_entity",
+            "sensor.solar_assistant_solar_assistant_total_battery_energy_out_state",
+        )
+        bo_kwh = self._read_entity_float(bo_entity, default=-1.0)
+        if bo_kwh >= 0:
+            self.cycle_tracker.observe(bo_kwh)
 
     def _cfg_float(self, key: str, default: float) -> float:
         """Read a runtime-tunable knob from `_config` as float. Read
