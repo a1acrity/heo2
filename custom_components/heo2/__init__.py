@@ -108,7 +108,8 @@ async def async_setup_entry(hass, entry) -> bool:
     def _daily_reset(_now) -> None:
         now = datetime.now(timezone.utc)
         coordinator.cost_accumulator.reset_daily(now)
-        logger.info("CostTracker: daily reset")
+        coordinator.cycle_tracker.reset_daily()
+        logger.info("CostTracker + CycleTracker: daily reset")
 
     unsub_callbacks.append(
         async_track_time_change(hass, _daily_reset, hour=0, minute=0, second=0)
