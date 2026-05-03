@@ -18,6 +18,12 @@ PLATFORMS = ["sensor", "binary_sensor", "switch", "number"]
 _CYCLE_STORE_VERSION = 1
 _CYCLE_STORE_KEY_FMT = "heo2_cycle_history_{entry_id}"
 
+# Last-known SOC persistence. Survives HA restart so the SOC fallback
+# ladder (live > cache > 50% cold-boot) doesn't flunk to 50% just
+# because SA's SOC entity hasn't populated yet on first tick.
+_SOC_STORE_VERSION = 1
+_SOC_STORE_KEY_FMT = "heo2_last_known_soc_{entry_id}"
+
 
 async def async_setup_entry(hass, entry) -> bool:
     """Set up HEO II from a config entry."""
@@ -48,6 +54,20 @@ async def async_setup_entry(hass, entry) -> bool:
             float(c) for c in history if isinstance(c, (int, float))
         ]
     coordinator._cycle_store = cycle_store
+
+    # Last-known SOC: load BEFORE first_refresh so the SOC fallback
+    # ladder picks the persisted value over the 50% cold-boot when
+    # SA's entity is still `unknown` on the first tick after restart.
+    soc_store = Store(
+        hass,
+        _SOC_STORE_VERSION,
+        _SOC_STORE_KEY_FMT.format(entry_id=entry.entry_id),
+    )
+    soc_stored = await soc_store.async_load() or {}
+    saved_soc = soc_stored.get("last_known_soc")
+    if isinstance(saved_soc, (int, float)) and 0 <= saved_soc <= 100:
+        coordinator._last_known_soc = float(saved_soc)
+    coordinator._soc_store = soc_store
 
     await coordinator.async_config_entry_first_refresh()
 
