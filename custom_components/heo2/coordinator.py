@@ -709,8 +709,15 @@ class HEO2Coordinator(DataUpdateCoordinator):
             planned_dispatches=planned_dispatches,
             eps_active=eps_active,
             # SPEC §9 row 5: implicit winter mode when daily PV
-            # forecast is below daily load. Triggers WinterLowPVRule.
-            is_winter_low_pv=sum(solar) < sum(load_forecast),
+            # forecast is below daily load. Guarded: only fire when
+            # we have a believable solar forecast (sum > 0). A zero
+            # sum means Solcast returned empty (data fetch race, rate
+            # limit, etc.) - we can't decide "is it winter" from no
+            # data, so default to NOT firing rather than misclassifying
+            # missing data as a winter signal.
+            is_winter_low_pv=(
+                sum(solar) > 0 and sum(solar) < sum(load_forecast)
+            ),
             # SPEC §12 EV deferral signals.
             defer_ev_eligible=bool(
                 self._config.get("defer_ev_when_export_high", False),
@@ -968,7 +975,23 @@ class HEO2Coordinator(DataUpdateCoordinator):
             )
             return [0.0] * 24
 
-        return solar_forecast_from_hacs(detailed, target_date=target_date)
+        result = solar_forecast_from_hacs(detailed, target_date=target_date)
+        # Sanity check: Solcast reports a non-zero day total but our
+        # parsed array sums to zero. Flag the mismatch so the read
+        # bug doesn't silently break the rule engine. Tolerance 0.1
+        # absorbs the case where Solcast's state is itself ~0 (winter
+        # overcast) and our parse is correct.
+        try:
+            state_total = float(state.state)
+        except (TypeError, ValueError):
+            state_total = 0.0
+        if state_total > 0.1 and sum(result) <= 0.01:
+            logger.warning(
+                "Solar forecast read mismatch on %s: state=%.2f kWh "
+                "but parsed array sum=0; first detailedHourly entry: %r",
+                entity, state_total, detailed[0] if detailed else None,
+            )
+        return result
 
     async def async_refresh_load_profile_from_recorder(
         self, days_back: int = 14,
