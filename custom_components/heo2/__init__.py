@@ -12,6 +12,12 @@ logger = logging.getLogger(__name__)
 
 PLATFORMS = ["sensor", "binary_sensor", "switch", "number"]
 
+# H7 cycle history persistence. Stored at
+# /config/.storage/heo2_cycle_history (one Store per integration
+# instance, keyed by entry_id). Bumped if the schema changes.
+_CYCLE_STORE_VERSION = 1
+_CYCLE_STORE_KEY_FMT = "heo2_cycle_history_{entry_id}"
+
 
 async def async_setup_entry(hass, entry) -> bool:
     """Set up HEO II from a config entry."""
@@ -20,10 +26,29 @@ async def async_setup_entry(hass, entry) -> bool:
         async_track_state_change_event,
         async_track_time_change,
     )
+    from homeassistant.helpers.storage import Store
 
     from .coordinator import HEO2Coordinator
 
     coordinator = HEO2Coordinator(hass, entry)
+
+    # H7: load persisted cycle history BEFORE first_refresh so the
+    # 3-day rolling alert keeps its memory across HA restarts. Without
+    # this the alert would need 3 fresh days of breaches to re-fire
+    # after every restart.
+    cycle_store = Store(
+        hass,
+        _CYCLE_STORE_VERSION,
+        _CYCLE_STORE_KEY_FMT.format(entry_id=entry.entry_id),
+    )
+    stored = await cycle_store.async_load() or {}
+    history = stored.get("daily_history") or []
+    if isinstance(history, list):
+        coordinator.cycle_tracker.daily_history = [
+            float(c) for c in history if isinstance(c, (int, float))
+        ]
+    coordinator._cycle_store = cycle_store
+
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
@@ -109,6 +134,9 @@ async def async_setup_entry(hass, entry) -> bool:
         now = datetime.now(timezone.utc)
         coordinator.cost_accumulator.reset_daily(now)
         coordinator.cycle_tracker.reset_daily()
+        # Persist the just-finished day's cycles into storage so the
+        # 3-day rolling alert survives HA restart.
+        hass.async_create_task(coordinator.persist_cycle_history())
         logger.info("CostTracker + CycleTracker: daily reset")
 
     unsub_callbacks.append(

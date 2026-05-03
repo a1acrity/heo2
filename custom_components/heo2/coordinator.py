@@ -1236,6 +1236,24 @@ class HEO2Coordinator(DataUpdateCoordinator):
         )
         return reason
 
+    async def persist_cycle_history(self) -> None:
+        """Save the cycle tracker's rolling daily_history to disk so
+        the 3-day H7 alert survives HA restart. Called from the daily
+        reset hook in __init__.py. No-op if Store wasn't wired
+        (e.g. older callers that skipped __init__.py setup).
+        """
+        store = getattr(self, "_cycle_store", None)
+        if store is None:
+            return
+        try:
+            await store.async_save({
+                "daily_history": list(self.cycle_tracker.daily_history),
+            })
+        except Exception:
+            logger.exception(
+                "H7: failed to persist cycle_tracker.daily_history",
+            )
+
     @property
     def ev_deferral_active(self) -> bool:
         """SPEC §12: True when the EV charge is currently being held
