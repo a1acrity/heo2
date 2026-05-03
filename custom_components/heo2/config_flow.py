@@ -182,11 +182,11 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-# Fields shown in the OptionsFlow. Limited to entity wiring (HEO-9
-# motivating use case) plus dry_run, which is the other knob users
-# want to flip post-setup. Everything else (battery, tariff, payback)
-# rarely changes and stays in the initial setup wizard.
-_OPTIONS_FIELDS = (
+# Fields shown in the OptionsFlow. Entity wiring (HEO-9 motivating
+# use case), dry_run, and the SPEC §10 tunable rule knobs (HEO-11).
+# Battery / tariff / payback rarely change and stay in the initial
+# setup wizard.
+_OPTIONS_ENTITY_FIELDS = (
     "soc_entity",
     "load_power_entity",
     "pv_power_entity",
@@ -196,7 +196,18 @@ _OPTIONS_FIELDS = (
     "tapo_wash_entity",
     "tapo_dryer_entity",
     "tapo_dishwasher_entity",
-    "dry_run",
+)
+
+# (key, default, type) - SPEC §10 rule knobs
+_OPTIONS_RULE_KNOBS = (
+    ("peak_threshold_p", 24.0, float),
+    ("max_target_soc", 100, int),
+    ("daily_plan_time", "18:00", str),
+    ("replan_solar_pct", 25, int),
+    ("replan_load_pct", 25, int),
+    ("replan_soc_pct", 10, int),
+    ("sell_top_pct_default", 30, int),
+    ("cheap_charge_bottom_pct", 25, int),
 )
 
 
@@ -223,16 +234,39 @@ class HEO2OptionsFlow(config_entries.OptionsFlow):
             }
             return self.async_create_entry(title="", data=cleaned)
 
-        # Pre-fill from existing options first, then data. dry_run
-        # default mirrors the services step (True for safety).
+        # Pre-fill from existing options first, then data.
         merged = {**self.config_entry.data, **self.config_entry.options}
         schema_dict: dict = {}
-        for key in _OPTIONS_FIELDS:
-            current = merged.get(key, "" if key != "dry_run" else True)
-            if key == "dry_run":
-                schema_dict[vol.Required(key, default=bool(current))] = bool
-            else:
-                schema_dict[vol.Optional(key, default=str(current))] = str
+
+        # Entity wiring fields (always strings)
+        for key in _OPTIONS_ENTITY_FIELDS:
+            schema_dict[vol.Optional(
+                key, default=str(merged.get(key, "")),
+            )] = str
+
+        # dry_run flag (always shown)
+        schema_dict[vol.Required(
+            "dry_run", default=bool(merged.get("dry_run", True)),
+        )] = bool
+
+        # SPEC §10 rule knobs (HEO-11). Coerce to the declared type at
+        # save time so the coordinator's `_cfg_float`/`_cfg_int` can
+        # parse them. Pre-fill with the user's current value or the
+        # SPEC default.
+        for key, default, kind in _OPTIONS_RULE_KNOBS:
+            current = merged.get(key, default)
+            if kind is float:
+                schema_dict[vol.Optional(
+                    key, default=float(current),
+                )] = vol.Coerce(float)
+            elif kind is int:
+                schema_dict[vol.Optional(
+                    key, default=int(current),
+                )] = vol.Coerce(int)
+            else:  # str (e.g. daily_plan_time = "HH:MM")
+                schema_dict[vol.Optional(
+                    key, default=str(current),
+                )] = str
 
         return self.async_show_form(
             step_id="init",

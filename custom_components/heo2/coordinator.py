@@ -146,29 +146,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # actively pushed (never the lazy seed).
         self._pending_verification: ProgrammeState | None = None
 
-        # SPEC §10 tunable knobs. Defaults match the SPEC table; any
-        # of these will become HA UI number entities under HEO-11.
-        self._daily_plan_time: time = self._parse_time_config(
-            "daily_plan_time", DEFAULT_DAILY_PLAN_TIME,
-        )
-        self._replan_solar_pct: float = self._config.get(
-            "replan_solar_pct", DEFAULT_REPLAN_SOLAR_PCT,
-        )
-        self._replan_load_pct: float = self._config.get(
-            "replan_load_pct", DEFAULT_REPLAN_LOAD_PCT,
-        )
-        self._replan_soc_pct: float = self._config.get(
-            "replan_soc_pct", DEFAULT_REPLAN_SOC_PCT,
-        )
-        self._peak_threshold_p: float = self._config.get(
-            "peak_threshold_p", DEFAULT_PEAK_THRESHOLD_PENCE,
-        )
-        self._sell_top_pct_default: int = self._config.get(
-            "sell_top_pct_default", DEFAULT_SELL_TOP_PCT,
-        )
-        self._cheap_bottom_pct: int = self._config.get(
-            "cheap_charge_bottom_pct", DEFAULT_CHEAP_CHARGE_BOTTOM_PCT,
-        )
+        # SPEC §10 tunable knobs. Read fresh from `_config` each tick
+        # via the `_pcfg`/`_icfg` helpers below so the OptionsFlow
+        # update_listener path takes effect on the next tick - no
+        # restart needed. Defaults match the SPEC table.
         self._max_charge_kw: float = self._config.get(
             "max_charge_kw", DEFAULT_MAX_CHARGE_KW,
         )
@@ -228,10 +209,12 @@ class HEO2Coordinator(DataUpdateCoordinator):
             inputs=inputs,
             baseline=self._baseline,
             tz=tz,
-            daily_plan_time=self._daily_plan_time,
-            replan_solar_pct=self._replan_solar_pct,
-            replan_load_pct=self._replan_load_pct,
-            replan_soc_pct=self._replan_soc_pct,
+            daily_plan_time=self._parse_time_config(
+                "daily_plan_time", DEFAULT_DAILY_PLAN_TIME,
+            ),
+            replan_solar_pct=self._cfg_float("replan_solar_pct", DEFAULT_REPLAN_SOLAR_PCT),
+            replan_load_pct=self._cfg_float("replan_load_pct", DEFAULT_REPLAN_LOAD_PCT),
+            replan_soc_pct=self._cfg_float("replan_soc_pct", DEFAULT_REPLAN_SOC_PCT),
         )
         is_daily_plan = "daily plan" in decision.reason
 
@@ -248,8 +231,8 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # rejection reason.
         validation = validate_plan(
             effective, inputs,
-            peak_threshold_p=self._peak_threshold_p,
-            cheap_bottom_pct=self._cheap_bottom_pct,
+            peak_threshold_p=self._cfg_float("peak_threshold_p", DEFAULT_PEAK_THRESHOLD_PENCE),
+            cheap_bottom_pct=self._cfg_int("cheap_charge_bottom_pct", DEFAULT_CHEAP_CHARGE_BOTTOM_PCT),
             max_charge_kw=self._max_charge_kw,
             max_discharge_kw=self._max_discharge_kw,
             charge_efficiency=self._charge_efficiency,
@@ -328,6 +311,22 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
         self.cost_accumulator.calculate_savings_vs_flat(flat_rate)
+
+    def _cfg_float(self, key: str, default: float) -> float:
+        """Read a runtime-tunable knob from `_config` as float. Read
+        each tick rather than cached at __init__, so OptionsFlow
+        changes take effect on the next tick (HEO-11)."""
+        try:
+            return float(self._config.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        """Same as _cfg_float but coerces to int."""
+        try:
+            return int(self._config.get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
 
     def _local_tz(self):
         """Resolve HA's local timezone, defaulting to UTC."""
