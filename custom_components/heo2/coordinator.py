@@ -622,7 +622,15 @@ class HEO2Coordinator(DataUpdateCoordinator):
         live_soc = self._read_entity_float(soc_entity_id, default=-1.0)
         if live_soc >= 0:
             current_soc = live_soc
-            self._last_known_soc = live_soc
+            if self._last_known_soc != live_soc:
+                self._last_known_soc = live_soc
+                # Fire-and-forget persist; failure shouldn't fail the tick.
+                if hasattr(self, "_soc_store") and self._soc_store is not None:
+                    self.hass.async_create_task(
+                        self._soc_store.async_save(
+                            {"last_known_soc": live_soc}
+                        )
+                    )
         elif self._last_known_soc is not None:
             current_soc = self._last_known_soc
             logger.warning(
