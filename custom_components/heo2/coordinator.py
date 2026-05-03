@@ -1057,3 +1057,18 @@ class HEO2Coordinator(DataUpdateCoordinator):
     @property
     def validation_warnings(self) -> list[str]:
         return list(self._validation_warnings)
+
+    @property
+    def granularity_snaps(self) -> list[str]:
+        """Latest tick's 5-min Sunsynk granularity snaps applied by
+        SafetyRule. Pulled from the current programme's reason_log so
+        the coordinator doesn't need its own bookkeeping field. Empty
+        when the rule engine produced boundaries already on 5-min."""
+        prog = self.current_programme
+        if prog is None:
+            return []
+        prefix = "GranularitySnap: "
+        for entry in reversed(prog.reason_log):
+            if entry.startswith(prefix):
+                return [s.strip() for s in entry[len(prefix):].split(";")]
+        return []

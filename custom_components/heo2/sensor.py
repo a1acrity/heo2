@@ -44,6 +44,7 @@ async def async_setup_entry(
     entities.append(ProgrammeReasonSensor(coordinator, entry))
     entities.append(ActiveRulesSensor(coordinator, entry))
     entities.append(ProjectionTodaySensor(coordinator, entry))
+    entities.append(GranularitySnapSensor(coordinator, entry))
 
     # Dashboard sensors (Group 2: Cost Accumulator)
     entities.append(DailyImportCostSensor(coordinator, entry))
@@ -489,6 +490,30 @@ class ProjectionTodaySensor(CoordinatorEntity, SensorEntity):
             "peak_import_kwh": round(p.peak_import_kwh, 2),
             "warnings": self.coordinator.validation_warnings,
         }
+
+
+class GranularitySnapSensor(CoordinatorEntity, SensorEntity):
+    """Surfaces the 5-min Sunsynk timer-granularity snaps applied by
+    SafetyRule on the latest tick. Native value is the count; the
+    `snaps` attribute is the list of `slot N <start|end> HH:MM->HH:MM`
+    strings. A non-zero value isn't a fault - it's a transparent record
+    that the rule engine produced a boundary the hardware couldn't
+    store exactly. Useful when chasing 'why did the inverter store a
+    different time than I sent' questions.
+    """
+
+    def __init__(self, coordinator: HEO2Coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_granularity_snaps"
+        self._attr_name = "HEO II Granularity Snaps"
+
+    @property
+    def native_value(self) -> int:
+        return len(self.coordinator.granularity_snaps)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"snaps": self.coordinator.granularity_snaps}
 
 
 # ---------------------------------------------------------------------------

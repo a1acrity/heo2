@@ -56,6 +56,7 @@ class SafetyRule(Rule):
     def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
         min_soc = int(inputs.min_soc)
         fixes: list[str] = []
+        snaps: list[str] = []  # 5-min granularity snaps surfaced separately
 
         # Fix slot count if wrong
         if len(state.slots) != 6:
@@ -74,18 +75,26 @@ class SafetyRule(Rule):
         # Snap every boundary to Sunsynk's 5-min granularity. Doing this
         # before the contiguous fix-up below means any boundary the rule
         # engine produced like 23:57 collapses to 23:55, both for that
-        # slot's start and the previous slot's end.
+        # slot's start and the previous slot's end. Snaps are surfaced
+        # in a dedicated `GranularitySnap:` reason_log entry so a
+        # dashboard sensor can show them separately from generic safety
+        # fixes (the snap is expected behaviour, not a fault).
         for i, slot in enumerate(state.slots):
             snapped_start = _snap_to_granularity(slot.start_time)
             if snapped_start != slot.start_time:
-                fixes.append(
-                    f"Slot {i + 1}: snapped start "
+                snaps.append(
+                    f"slot {i + 1} start "
                     f"{slot.start_time.strftime('%H:%M')}→"
-                    f"{snapped_start.strftime('%H:%M')} (5-min granularity)"
+                    f"{snapped_start.strftime('%H:%M')}"
                 )
                 slot.start_time = snapped_start
             snapped_end = _snap_to_granularity(slot.end_time)
             if snapped_end != slot.end_time:
+                snaps.append(
+                    f"slot {i + 1} end "
+                    f"{slot.end_time.strftime('%H:%M')}→"
+                    f"{snapped_end.strftime('%H:%M')}"
+                )
                 slot.end_time = snapped_end
 
         # Ensure slot 1 starts at 00:00
@@ -110,5 +119,7 @@ class SafetyRule(Rule):
 
         if fixes:
             state.reason_log.append(f"Safety: {'; '.join(fixes)}")
+        if snaps:
+            state.reason_log.append(f"GranularitySnap: {'; '.join(snaps)}")
 
         return state
