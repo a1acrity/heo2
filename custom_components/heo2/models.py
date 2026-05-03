@@ -67,19 +67,19 @@ _FILLER_THRESHOLD_MINUTES = 30
 class ProgrammeState:
     """The 6-slot programme produced by the rule engine.
 
-    `work_mode` is a SPEC §2 global setting that overrides the
-    inverter's behaviour across slots (e.g. "Selling first" during a
-    saving session, "Zero export to CT" in normal operation). None
-    means "don't touch" so older callers and tests built before the
-    work_mode wiring still produce valid programmes that don't
-    accidentally write the field.
+    `work_mode` and `energy_pattern` are SPEC §2 global settings that
+    override the inverter's behaviour across slots. None means "don't
+    touch" so older callers and tests built before SPEC §2 wiring
+    still produce valid programmes that don't clobber inverter state.
 
     Valid values per SA discovery:
-      "Selling first" | "Zero export to load" | "Zero export to CT"
+      work_mode: "Selling first" | "Zero export to load" | "Zero export to CT"
+      energy_pattern: "Battery first" | "Load first"
     """
     slots: list[SlotConfig]
     reason_log: list[str] = field(default_factory=list)
     work_mode: Optional[str] = None
+    energy_pattern: Optional[str] = None
 
     @classmethod
     def default(cls, min_soc: int = 20) -> ProgrammeState:

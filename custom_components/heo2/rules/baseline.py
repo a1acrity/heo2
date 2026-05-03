@@ -46,15 +46,19 @@ class BaselineRule(Rule):
             SlotConfig(time(23, 58), time(0, 0), min_soc, False),
         ]
 
-        # SPEC §2 work_mode default. SavingSessionRule overrides to
-        # "Selling first" while a session is active; once the session
-        # ends, BaselineRule re-runs and resets here so the inverter
-        # stops exporting.
+        # SPEC §2 globals. SavingSessionRule overrides work_mode to
+        # "Selling first" while a session is active; BaselineRule re-
+        # runs once the session ends and resets to defaults here.
+        # `Load first` energy_pattern means the inverter prioritises
+        # supplying load before charging the battery from solar - the
+        # right default for a UK house with day load + Octopus IGO.
         state.work_mode = "Zero export to CT"
+        state.energy_pattern = "Load first"
 
         state.reason_log.append(
             f"Baseline: overnight charge to 100% until {self.off_peak_end}, "
             f"solar day until {self.evening_start}, "
-            f"evening drain to {min_soc}%; work_mode=Zero export to CT"
+            f"evening drain to {min_soc}%; "
+            f"work_mode=Zero export to CT, energy_pattern=Load first"
         )
         return state
