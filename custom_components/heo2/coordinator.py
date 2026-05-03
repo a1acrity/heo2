@@ -665,6 +665,9 @@ class HEO2Coordinator(DataUpdateCoordinator):
             local_tz=self._local_tz(),
             planned_dispatches=planned_dispatches,
             eps_active=eps_active,
+            # SPEC §9 row 5: implicit winter mode when daily PV
+            # forecast is below daily load. Triggers WinterLowPVRule.
+            is_winter_low_pv=sum(solar) < sum(load_forecast),
         )
 
     def _read_eps_active(self) -> bool:
