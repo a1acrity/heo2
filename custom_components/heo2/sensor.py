@@ -387,19 +387,11 @@ class SOCTrajectorySensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        # `trajectory[i]` is the projected SOC `i` hours from the
-        # tick-time (NOT clock hour i). `start_hour` is the LOCAL
-        # clock hour at index 0 so the dashboard chart can place each
-        # point at its correct wall-clock time. Without it the chart
-        # would label e.g. trajectory[18] at "18:00" when it actually
-        # represents start_hour+18 mod 24 - in BST evening, that's
-        # tomorrow morning's solar charge.
-        inputs = self.coordinator.last_inputs
-        start_hour = inputs.now_local().hour if inputs is not None else 0
-        return {
-            "trajectory": self.coordinator.soc_trajectory,
-            "start_hour": start_hour,
-        }
+        # `trajectory[h]` is the projected SOC AT clock hour `h`
+        # local time (0..23). Hours before now hold current_soc as a
+        # neutral fill (we don't have actuals); hours from now
+        # onward are simulated. Chart can plot index directly.
+        return {"trajectory": self.coordinator.soc_trajectory}
 
 
 class ProgrammeSlotsSensor(CoordinatorEntity, SensorEntity):

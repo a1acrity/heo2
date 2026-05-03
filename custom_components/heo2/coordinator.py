@@ -150,6 +150,13 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # shutoffs once on the False -> True transition rather than
         # spamming switch.turn_off every tick.
         self._eps_active: bool = False
+        # Last successfully-read SOC. Used as a fallback when the SOC
+        # entity is briefly unavailable during HA startup. Without
+        # this, `_read_entity_float` returns its hard-coded default
+        # (50.0) which is a misleading magic number that shows up on
+        # the dashboard as "current_soc=50%" even when the battery is
+        # at 11%. None means "no good read yet" (cold boot only).
+        self._last_known_soc: float | None = None
         # SPEC §12 EV deferral: track previous-tick state so the
         # zappi `select.select_option` -> Stopped service call fires
         # ONCE on False->True. On True->False, restore the captured
@@ -606,9 +613,29 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         now = datetime.now(timezone.utc)
 
-        current_soc = self._read_entity_float(
-            self._config.get("soc_entity", ""), default=50.0
-        )
+        # SOC fallback ladder: live entity > last-known cache >
+        # 50% as ultimate cold-boot fallback. The cache fixes the
+        # restart race where SA's SOC entity is briefly unavailable
+        # post-boot and we'd otherwise serve 50% on the dashboard
+        # for one tick.
+        soc_entity_id = self._config.get("soc_entity", "")
+        live_soc = self._read_entity_float(soc_entity_id, default=-1.0)
+        if live_soc >= 0:
+            current_soc = live_soc
+            self._last_known_soc = live_soc
+        elif self._last_known_soc is not None:
+            current_soc = self._last_known_soc
+            logger.warning(
+                "SOC entity %s unavailable; using last-known %.1f%%",
+                soc_entity_id, current_soc,
+            )
+        else:
+            current_soc = 50.0
+            logger.warning(
+                "SOC entity %s unavailable and no prior reading; "
+                "using cold-boot fallback 50%%",
+                soc_entity_id,
+            )
         igo_dispatching = self._read_entity_bool(
             self._config.get("igo_dispatch_entity", ""), default=False
         )

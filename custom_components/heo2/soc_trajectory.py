@@ -20,18 +20,30 @@ def calculate_soc_trajectory(
     max_soc: float,
     current_hour: int,
 ) -> list[float]:
-    """Forward-simulate battery SOC for the next 24 hours."""
-    trajectory: list[float] = []
+    """Project SOC for each clock hour of today, indexed 0-23.
+
+    `trajectory[h]` is the projected SOC AT clock hour `h` local
+    time. Hours BEFORE `current_hour` are filled with `current_soc`
+    (we don't have actuals; this is the best we can do without
+    history). Hours from `current_hour` onward are simulated forward
+    using the programme slots and forecast arrays (which are also
+    local-hour indexed).
+
+    The chart x-axis can therefore plot `trajectory[h]` at clock hour
+    `h` directly, without any anchor offset. Pre-2026-05-03 the
+    function returned `trajectory[i] = SOC i hours from now` which
+    required the chart to know `current_hour` to place each point
+    correctly; an off-by-current_hour bug surfaced for evening users.
+    """
+    trajectory: list[float] = [current_soc] * 24
+
     soc = current_soc
+    for h in range(current_hour, 24):
+        trajectory[h] = soc
+        hour_time = time(h, 0)
 
-    for step in range(24):
-        trajectory.append(soc)
-
-        hour_idx = (current_hour + step) % 24
-        hour_time = time(hour_idx, 0)
-
-        solar_kwh = solar_forecast_kwh[hour_idx]
-        load_kwh = load_forecast_kwh[hour_idx]
+        solar_kwh = solar_forecast_kwh[h]
+        load_kwh = load_forecast_kwh[h]
 
         net_kwh = (solar_kwh * charge_efficiency) - (load_kwh / discharge_efficiency)
 
