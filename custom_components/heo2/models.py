@@ -254,6 +254,11 @@ class ProgrammeInputs:
     # is supplying via EPS. Drives EPSModeRule (cap=0% / no GC) and
     # writes_blocked H3. Defaults False so existing tests pre-EPS pass.
     eps_active: bool = False
+    # SPEC §9 row 5: implicit Winter low-PV mode. Computed by the
+    # coordinator as `sum(solar_today) < sum(load_today)`. When True,
+    # WinterLowPVRule raises overnight charge target and tightens the
+    # export-window selectivity (preserve cycles for own use).
+    is_winter_low_pv: bool = False
 
     def now_local(self) -> datetime:
         """Return `now` projected into the local timezone if known.
