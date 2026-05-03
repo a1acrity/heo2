@@ -24,7 +24,12 @@ class EVChargingRule(Rule):
         if inputs.igo_dispatching:
             return state  # IGO dispatch takes precedence
 
-        now_time = inputs.now.time().replace(second=0, microsecond=0)
+        # Use local-tz-aware lookup. inputs.now is UTC; programme slots
+        # are local time-of-day. inputs.now.time() (UTC) was aliasing
+        # against local slots in DST - same bug class as HEO-31 PR2 #39.
+        now_time = inputs.now_local().time().replace(
+            second=0, microsecond=0,
+        )
         try:
             idx = state.find_slot_at(now_time)
         except ValueError:

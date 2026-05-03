@@ -297,8 +297,12 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 appliance_name=name,
             )
 
-        from datetime import datetime, timezone
-        current_hour = datetime.now(timezone.utc).hour
+        # Forecast arrays are LOCAL-hour indexed (`solar_forecast_from_hacs`
+        # builds them aligned to local midnight). Pre-fix used
+        # `datetime.now(timezone.utc).hour` which is UTC-hour - in BST
+        # the SOC trajectory's hour-0 point would be 1 hour off,
+        # mis-attributing solar/load to the wrong slot.
+        current_hour = inputs.now_local().hour
         self.soc_trajectory = calculate_soc_trajectory(
             current_soc=inputs.current_soc,
             solar_forecast_kwh=inputs.solar_forecast_kwh,
