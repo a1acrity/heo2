@@ -71,7 +71,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=UPDATE_INTERVAL_MINUTES),
         )
         self._entry = entry
-        self._config = dict(entry.data)
+        # OptionsFlow (HEO-9 / future config tweaks) writes to
+        # entry.options; merge it over entry.data so post-setup
+        # adjustments win without users having to re-run the wizard.
+        self._config = {**entry.data, **(entry.options or {})}
 
         # Core components
         self._engine = RuleEngine(rules=default_rules())
