@@ -43,35 +43,29 @@ class WinterLowPVRule(Rule):
             return state
 
         max_target = 100
-        # The non-GC daytime floor: enough to cover the day's load
-        # without dropping below min_soc. Same maths as EveningProtect
-        # but applied to the WHOLE day, not just evening hours.
-        if inputs.battery_capacity_kwh > 0:
-            day_load_kwh = sum(inputs.load_forecast_kwh) or 0.0
-            day_floor = int(
-                inputs.min_soc
-                + (day_load_kwh / inputs.battery_capacity_kwh * 100)
-            )
-        else:
-            day_floor = int(inputs.min_soc)
-        day_floor = min(day_floor, max_target)
-
         modified: list[str] = []
+        # Winter mode raises ONLY grid_charge=True (overnight) slot
+        # caps to 100%. CheapRateChargeRule may have picked a smarter
+        # partial target based on tomorrow's solar; in winter that's
+        # wrong - the cheap window is the only meaningful charge
+        # opportunity, so use it fully.
+        #
+        # Pre-2026-05-03 the rule ALSO raised non-GC slot floors to a
+        # day-load-sized number (often clamped to 100). That was wrong:
+        # it pinned the inverter at 100% during the day AND evening,
+        # so the battery never discharged and the grid covered all
+        # load. EveningProtectRule already handles the legitimate
+        # "raise pre-evening floor for evening reserve" need; this
+        # rule deliberately does NOT touch non-GC slots.
         for i, slot in enumerate(state.slots):
-            if slot.grid_charge:
-                if slot.capacity_soc < max_target:
-                    modified.append(
-                        f"slot {i + 1} GC cap "
-                        f"{slot.capacity_soc}->{max_target}"
-                    )
-                    slot.capacity_soc = max_target
-            else:
-                if slot.capacity_soc < day_floor:
-                    modified.append(
-                        f"slot {i + 1} non-GC floor "
-                        f"{slot.capacity_soc}->{day_floor}"
-                    )
-                    slot.capacity_soc = day_floor
+            if not slot.grid_charge:
+                continue
+            if slot.capacity_soc < max_target:
+                modified.append(
+                    f"slot {i + 1} GC cap "
+                    f"{slot.capacity_soc}->{max_target}"
+                )
+                slot.capacity_soc = max_target
 
         daily_solar = sum(inputs.solar_forecast_kwh)
         daily_load = sum(inputs.load_forecast_kwh)
@@ -84,6 +78,6 @@ class WinterLowPVRule(Rule):
         else:
             state.reason_log.append(
                 f"WinterLowPV: solar {daily_solar:.1f} < load "
-                f"{daily_load:.1f} kWh; no change needed"
+                f"{daily_load:.1f} kWh; GC slots already at 100%"
             )
         return state
