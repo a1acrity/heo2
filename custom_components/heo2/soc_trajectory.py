@@ -19,31 +19,45 @@ def calculate_soc_trajectory(
     min_soc: float,
     max_soc: float,
     current_hour: int,
+    *,
+    solar_forecast_kwh_tomorrow: list[float] | None = None,
+    horizon_hours: int = 30,
 ) -> list[float]:
-    """Project SOC for each clock hour of today, indexed 0-23.
+    """Project SOC for each clock hour, indexed 0..horizon_hours-1.
 
-    `trajectory[h]` is the projected SOC AT clock hour `h` local
-    time. Hours BEFORE `current_hour` are filled with `current_soc`
-    (we don't have actuals; this is the best we can do without
-    history). Hours from `current_hour` onward are simulated forward
-    using the programme slots and forecast arrays (which are also
-    local-hour indexed).
+    Indices 0..23 correspond to today's clock hours; indices 24..29
+    (default 30-hour horizon) project into tomorrow's first 6 hours
+    so the dashboard chart can show the overnight recharge. Hours
+    BEFORE `current_hour` are filled with `current_soc` (no history).
 
-    The chart x-axis can therefore plot `trajectory[h]` at clock hour
-    `h` directly, without any anchor offset. Pre-2026-05-03 the
-    function returned `trajectory[i] = SOC i hours from now` which
-    required the chart to know `current_hour` to place each point
-    correctly; an off-by-current_hour bug surfaced for evening users.
+    `solar_forecast_kwh_tomorrow` is optional: when present, indices
+    24+ use tomorrow's solar; when absent, they wrap today's array
+    (less accurate but better than nothing). Load forecast wraps
+    today's array since HEO-5's learned profile is shape-equivalent
+    across days.
+
+    The chart x-axis can plot `trajectory[h]` at clock hour `h`
+    (clamping h>=24 to tomorrow's hours): a 30h span shows the day's
+    drain plus tomorrow's morning charge.
     """
-    trajectory: list[float] = [current_soc] * 24
+    trajectory: list[float] = [current_soc] * horizon_hours
 
     soc = current_soc
-    for h in range(current_hour, 24):
+    for h in range(current_hour, horizon_hours):
         trajectory[h] = soc
-        hour_time = time(h, 0)
 
-        solar_kwh = solar_forecast_kwh[h]
-        load_kwh = load_forecast_kwh[h]
+        # Index into local-hour-indexed forecasts. h>=24 wraps to
+        # tomorrow's forecast for solar (preferred) or today's (fallback).
+        if h < 24:
+            solar_kwh = solar_forecast_kwh[h]
+        elif solar_forecast_kwh_tomorrow:
+            solar_kwh = solar_forecast_kwh_tomorrow[h - 24]
+        else:
+            solar_kwh = solar_forecast_kwh[h - 24]
+        load_kwh = load_forecast_kwh[h % 24]
+
+        # Slot lookup uses time-of-day (0..23) wrapped via mod 24.
+        hour_time = time(h % 24, 0)
 
         net_kwh = (solar_kwh * charge_efficiency) - (load_kwh / discharge_efficiency)
 

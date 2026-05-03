@@ -40,14 +40,16 @@ cards:
         stroke_dash: 4
 
   # SOC trajectory chart. trajectory[h] is the projected SOC AT
-  # clock hour h LOCAL time (not relative to "now"). Past hours are
-  # filled with current_soc as a flat back-fill. Chart shows the
-  # full day 00:00-24:00.
+  # clock hour h LOCAL time. Past hours are flat-filled with
+  # current_soc; future hours are simulated. 30 hours of data so the
+  # chart spans today's full day plus tomorrow morning's overnight
+  # recharge - so the user can see the full charge cycle, not just
+  # the drain-to-floor portion.
   - type: custom:apexcharts-card
     header:
       title: Battery SOC Trajectory
       show: true
-    graph_span: 24h
+    graph_span: 30h
     span:
       start: day
     yaxis:
@@ -57,9 +59,10 @@ cards:
       - entity: sensor.heo2_soc_trajectory
         data_generator: |
           const trajectory = entity.attributes.trajectory || [];
+          const base = new Date();
+          base.setHours(0, 0, 0, 0);
           return trajectory.map((val, i) => {
-            const d = new Date();
-            d.setHours(i, 0, 0, 0);
+            const d = new Date(base.getTime() + i * 3600 * 1000);
             return [d.getTime(), val];
           });
         name: SOC (%)

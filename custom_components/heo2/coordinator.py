@@ -157,6 +157,14 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # the dashboard as "current_soc=50%" even when the battery is
         # at 11%. None means "no good read yet" (cold boot only).
         self._last_known_soc: float | None = None
+        # Solar forecast cache. Same restart-race pattern as SOC.
+        # Stamped with the local date the cache was created on; on
+        # load, only used when the date matches today's local date
+        # (otherwise stale data from yesterday could mislead the
+        # winter trigger).
+        self._solar_cache_today: list[float] | None = None
+        self._solar_cache_tomorrow: list[float] | None = None
+        self._solar_cache_date: str | None = None
         # SPEC §12 EV deferral: track previous-tick state so the
         # zappi `select.select_option` -> Stopped service call fires
         # ONCE on False->True. On True->False, restore the captured
@@ -344,6 +352,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
             min_soc=self._config.get("min_soc", 20.0),
             max_soc=self._config.get("max_soc", 100.0),
             current_hour=current_hour,
+            solar_forecast_kwh_tomorrow=(
+                inputs.solar_forecast_kwh_tomorrow or None
+            ),
+            horizon_hours=30,
         )
 
         flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
@@ -994,8 +1006,34 @@ class HEO2Coordinator(DataUpdateCoordinator):
         )
 
         entity = entity_override or self._solar_entity
+
+        def _serve_cache(reason: str) -> list[float] | None:
+            """Return the persisted forecast if today's local date
+            matches the cache's date stamp. Caller logs why we fell
+            back so missing-Solcast vs stale-cache are distinguishable
+            in the log."""
+            today_str = (
+                now.astimezone(tz).date() + timedelta(days=target_offset_days)
+            ).isoformat()
+            if self._solar_cache_date != today_str:
+                return None
+            cached = (
+                self._solar_cache_tomorrow if target_offset_days == 1
+                else self._solar_cache_today
+            )
+            if cached and len(cached) == 24:
+                logger.info(
+                    "Solar forecast %s using cache (%s): %.1f kWh total",
+                    entity, reason, sum(cached),
+                )
+                return list(cached)
+            return None
+
         state = self.hass.states.get(entity) if self.hass else None
         if state is None or state.state in ("unknown", "unavailable"):
+            cached = _serve_cache("entity unavailable")
+            if cached is not None:
+                return cached
             logger.warning(
                 "Solar forecast entity %s not available, using zero forecast",
                 entity,
@@ -1004,6 +1042,9 @@ class HEO2Coordinator(DataUpdateCoordinator):
 
         detailed = state.attributes.get("detailedHourly") or []
         if not detailed:
+            cached = _serve_cache("attribute missing")
+            if cached is not None:
+                return cached
             logger.warning(
                 "Solar forecast entity %s has no detailedHourly attribute",
                 entity,
@@ -1011,6 +1052,17 @@ class HEO2Coordinator(DataUpdateCoordinator):
             return [0.0] * 24
 
         result = solar_forecast_from_hacs(detailed, target_date=target_date)
+        if sum(result) > 0:
+            # Cache the parsed array stamped with today's local date.
+            # Only the today read drives the date stamp; the tomorrow
+            # read just refreshes its own slot of the cache.
+            today_str = now.astimezone(tz).date().isoformat()
+            if target_offset_days == 0:
+                self._solar_cache_today = list(result)
+                self._solar_cache_date = today_str
+            elif target_offset_days == 1:
+                self._solar_cache_tomorrow = list(result)
+            self._persist_solar_cache()
         # Sanity check: Solcast reports a non-zero day total but our
         # parsed array sums to zero. Flag the mismatch so the read
         # bug doesn't silently break the rule engine. Tolerance 0.1
@@ -1293,6 +1345,22 @@ class HEO2Coordinator(DataUpdateCoordinator):
             eps_active=self._eps_active,
         )
         return reason
+
+    def _persist_solar_cache(self) -> None:
+        """Fire-and-forget save of the solar forecast cache. Called
+        whenever a fresh successful read updates the in-memory cache."""
+        store = getattr(self, "_solar_store", None)
+        if store is None:
+            return
+        payload = {
+            "date": self._solar_cache_date,
+            "today": self._solar_cache_today,
+            "tomorrow": self._solar_cache_tomorrow,
+        }
+        try:
+            self.hass.async_create_task(store.async_save(payload))
+        except Exception:
+            logger.exception("solar_cache: persist save failed")
 
     async def persist_cycle_history(self) -> None:
         """Save the cycle tracker's rolling daily_history to disk so

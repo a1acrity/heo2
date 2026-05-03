@@ -24,6 +24,14 @@ _CYCLE_STORE_KEY_FMT = "heo2_cycle_history_{entry_id}"
 _SOC_STORE_VERSION = 1
 _SOC_STORE_KEY_FMT = "heo2_last_known_soc_{entry_id}"
 
+# Solar forecast cache. Same restart-race pattern as SOC: HACS solcast
+# entity is briefly `unknown` post-boot. Persisting the last parsed
+# 24-bucket arrays lets the first tick after restart serve a
+# day-old (at most) forecast instead of [0]*24, which would mistrigger
+# WinterLowPVRule and produce a bad first plan.
+_SOLAR_STORE_VERSION = 1
+_SOLAR_STORE_KEY_FMT = "heo2_solar_forecast_{entry_id}"
+
 
 async def async_setup_entry(hass, entry) -> bool:
     """Set up HEO II from a config entry."""
@@ -68,6 +76,25 @@ async def async_setup_entry(hass, entry) -> bool:
     if isinstance(saved_soc, (int, float)) and 0 <= saved_soc <= 100:
         coordinator._last_known_soc = float(saved_soc)
     coordinator._soc_store = soc_store
+
+    # Solar forecast cache. Loaded BEFORE first_refresh so the live-
+    # entity unknown branch in `_read_solar_forecast` can fall back
+    # to the cached array. Coordinator's persist helper writes back
+    # whenever a fresh read succeeds (with the local date stamp;
+    # cache stale beyond a day is dropped).
+    solar_store = Store(
+        hass,
+        _SOLAR_STORE_VERSION,
+        _SOLAR_STORE_KEY_FMT.format(entry_id=entry.entry_id),
+    )
+    solar_stored = await solar_store.async_load() or {}
+    if isinstance(solar_stored.get("today"), list) and len(solar_stored["today"]) == 24:
+        coordinator._solar_cache_today = [float(v) for v in solar_stored["today"]]
+    if isinstance(solar_stored.get("tomorrow"), list) and len(solar_stored["tomorrow"]) == 24:
+        coordinator._solar_cache_tomorrow = [float(v) for v in solar_stored["tomorrow"]]
+    if isinstance(solar_stored.get("date"), str):
+        coordinator._solar_cache_date = solar_stored["date"]
+    coordinator._solar_store = solar_store
 
     await coordinator.async_config_entry_first_refresh()
 
