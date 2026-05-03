@@ -42,12 +42,16 @@ class TestSOCTrajectory:
             discharge_efficiency=0.95,
             min_soc=20.0,
             max_soc=100.0,
-            current_hour=12,
+            current_hour=0,
         )
         assert len(result) == 24
         assert all(isinstance(v, float) for v in result)
 
-    def test_first_value_is_current_soc(self, flat_load, default_slots):
+    def test_value_at_current_hour_is_current_soc(
+        self, flat_load, default_slots,
+    ):
+        """trajectory[current_hour] holds the starting SOC before any
+        simulation step; later hours integrate net load/solar."""
         result = calculate_soc_trajectory(
             current_soc=65.0,
             solar_forecast_kwh=[0.0] * 24,
@@ -61,7 +65,32 @@ class TestSOCTrajectory:
             max_soc=100.0,
             current_hour=12,
         )
-        assert result[0] == 65.0
+        assert result[12] == 65.0
+
+    def test_past_hours_filled_with_current_soc(
+        self, flat_load, default_slots,
+    ):
+        """Hours BEFORE current_hour have no actuals; we fill them
+        with current_soc so the chart shows a flat back-fill rather
+        than a gap or arbitrary number."""
+        result = calculate_soc_trajectory(
+            current_soc=42.0,
+            solar_forecast_kwh=[0.0] * 24,
+            load_forecast_kwh=flat_load,
+            programme_slots=default_slots,
+            battery_capacity_kwh=20.0,
+            max_charge_kw=5.0,
+            charge_efficiency=0.95,
+            discharge_efficiency=0.95,
+            min_soc=20.0,
+            max_soc=100.0,
+            current_hour=15,
+        )
+        # Hours 0-14 are past, should all equal current_soc.
+        for h in range(15):
+            assert result[h] == 42.0, (
+                f"hour {h} expected 42 (past fill), got {result[h]}"
+            )
 
     def test_soc_decreases_with_load_no_solar(self, flat_load, default_slots):
         result = calculate_soc_trajectory(
@@ -75,8 +104,9 @@ class TestSOCTrajectory:
             discharge_efficiency=0.95,
             min_soc=20.0,
             max_soc=100.0,
-            current_hour=12,
+            current_hour=0,
         )
+        # Later simulated hour < earlier simulated hour
         assert result[5] < result[0]
 
     def test_soc_clamped_to_min(self, flat_load, default_slots):
@@ -91,7 +121,7 @@ class TestSOCTrajectory:
             discharge_efficiency=0.95,
             min_soc=20.0,
             max_soc=100.0,
-            current_hour=12,
+            current_hour=0,
         )
         assert all(v >= 20.0 for v in result)
 
@@ -107,7 +137,7 @@ class TestSOCTrajectory:
             discharge_efficiency=0.95,
             min_soc=20.0,
             max_soc=100.0,
-            current_hour=12,
+            current_hour=0,
         )
         assert all(v <= 100.0 for v in result)
 
@@ -149,4 +179,6 @@ class TestSOCTrajectory:
             max_soc=100.0,
             current_hour=6,
         )
-        assert result[6] > result[0]
+        # After several solar hours past current_hour=6, SOC should
+        # have climbed above the starting value (40%).
+        assert result[15] > result[6]
