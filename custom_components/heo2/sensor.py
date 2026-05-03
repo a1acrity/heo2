@@ -229,7 +229,8 @@ class SolarForecastHourlySensor(CoordinatorEntity, SensorEntity):
         inputs = self.coordinator.last_inputs
         if inputs is None:
             return None
-        hour = inputs.now.hour
+        # Forecast array is local-hour indexed; project UTC->local.
+        hour = inputs.now_local().hour
         return inputs.solar_forecast_kwh[hour]
 
     @property
@@ -255,7 +256,8 @@ class LoadForecastHourlySensor(CoordinatorEntity, SensorEntity):
         inputs = self.coordinator.last_inputs
         if inputs is None:
             return None
-        hour = inputs.now.hour
+        # Forecast array is local-hour indexed; project UTC->local.
+        hour = inputs.now_local().hour
         return round(inputs.load_forecast_kwh[hour] * 1000, 0)
 
     @property
