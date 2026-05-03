@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from heo2.models import SlotConfig, ProgrammeState, SlotWrite
+from heo2.models import SlotConfig, ProgrammeState, SlotWrite, GlobalWrite
 from heo2.mqtt_writer import (
     MqttWriter,
     MqttWriteResult,
@@ -569,3 +569,120 @@ class TestApplyProgrammeDiff:
         # last_known still reflects the PRE-write world
         assert returned_last_known is current
         assert returned_last_known.slots[0].capacity_soc == 100  # unchanged
+
+
+class TestDiffGlobals:
+    def test_no_change_when_work_mode_matches(self):
+        cur = _baseline_programme()
+        cur.work_mode = "Zero export to CT"
+        new = _baseline_programme()
+        new.work_mode = "Zero export to CT"
+        writer = MqttWriter(client=MagicMock())
+        assert writer.diff_globals(cur, new) == []
+
+    def test_work_mode_change_detected(self):
+        cur = _baseline_programme()
+        cur.work_mode = "Zero export to CT"
+        new = _baseline_programme()
+        new.work_mode = "Selling first"
+        writer = MqttWriter(client=MagicMock())
+        out = writer.diff_globals(cur, new)
+        assert len(out) == 1
+        assert out[0].setting == "work_mode"
+        assert out[0].value == "Selling first"
+
+    def test_none_work_mode_on_new_does_not_trigger_write(self):
+        """When the new programme leaves work_mode unset (None) we
+        don't write anything - older callers and tests don't
+        accidentally clobber the inverter setting."""
+        cur = _baseline_programme()
+        cur.work_mode = "Selling first"
+        new = _baseline_programme()
+        new.work_mode = None
+        writer = MqttWriter(client=MagicMock())
+        assert writer.diff_globals(cur, new) == []
+
+    def test_case_insensitive_match(self):
+        """Be defensive about SA vs HEO casing on the same value."""
+        cur = _baseline_programme()
+        cur.work_mode = "Zero Export To CT"
+        new = _baseline_programme()
+        new.work_mode = "zero export to ct"
+        writer = MqttWriter(client=MagicMock())
+        assert writer.diff_globals(cur, new) == []
+
+
+class TestWriteGlobals:
+    @pytest.mark.asyncio
+    async def test_happy_path_work_mode_publish_confirmed(self):
+        transport = FakeTransport()
+        transport.script_responses(["Saved"])
+        writer = MqttWriter(transport=transport)
+
+        result = await writer.write_globals([
+            GlobalWrite(setting="work_mode", value="Selling first"),
+        ])
+        assert result.success is True
+        assert result.writes_confirmed == 1
+        assert transport.published[0] == (
+            "solar_assistant/inverter_1/work_mode/set",
+            "Selling first",
+        )
+
+    @pytest.mark.asyncio
+    async def test_dry_run_logs_without_publishing(self):
+        transport = FakeTransport()
+        writer = MqttWriter(transport=transport, dry_run=True)
+        result = await writer.write_globals([
+            GlobalWrite(setting="work_mode", value="Selling first"),
+        ])
+        assert result.success is True
+        assert result.writes_confirmed == 1
+        assert len(transport.published) == 0
+        assert any("work_mode" in line for line in result.dry_run_log)
+
+
+class TestApplyProgrammeDiffGlobals:
+    @pytest.mark.asyncio
+    async def test_global_write_first_then_slots(self):
+        """SPEC §2: globals (work_mode) flush before per-slot writes
+        so the inverter is in the right mode when its slot caps drop."""
+        transport = FakeTransport()
+        transport.script_responses(["Saved", "Saved"])  # work_mode + slot
+        writer = MqttWriter(transport=transport)
+
+        cur = _baseline_programme()
+        cur.work_mode = "Zero export to CT"
+        new = _baseline_programme()
+        new.work_mode = "Selling first"
+        new.slots[0] = SlotConfig(time(0, 0), time(5, 30), 30, True)
+
+        result, last = await apply_programme_diff(writer, cur, new)
+        assert result.success is True
+        assert result.writes_attempted == 2
+        # Global was published first
+        assert "work_mode" in transport.published[0][0]
+        assert "capacity_point_1" in transport.published[1][0]
+        assert last is new
+
+    @pytest.mark.asyncio
+    async def test_global_failure_aborts_before_slot_writes(self):
+        transport = FakeTransport()
+        transport.script_responses([
+            "Error: Invalid value 'Bogus' for 'Work mode'.",
+            # no second response - shouldn't get here
+        ])
+        writer = MqttWriter(transport=transport)
+
+        cur = _baseline_programme()
+        cur.work_mode = "Zero export to CT"
+        new = _baseline_programme()
+        new.work_mode = "Bogus"
+        new.slots[0] = SlotConfig(time(0, 0), time(5, 30), 30, True)
+
+        result, last = await apply_programme_diff(writer, cur, new)
+        assert result.success is False
+        assert result.failed_param == "work_mode"
+        # slot writes never happened
+        assert len(transport.published) == 1
+        assert last is cur

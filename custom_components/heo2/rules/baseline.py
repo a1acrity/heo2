@@ -46,9 +46,15 @@ class BaselineRule(Rule):
             SlotConfig(time(23, 58), time(0, 0), min_soc, False),
         ]
 
+        # SPEC §2 work_mode default. SavingSessionRule overrides to
+        # "Selling first" while a session is active; once the session
+        # ends, BaselineRule re-runs and resets here so the inverter
+        # stops exporting.
+        state.work_mode = "Zero export to CT"
+
         state.reason_log.append(
             f"Baseline: overnight charge to 100% until {self.off_peak_end}, "
             f"solar day until {self.evening_start}, "
-            f"evening drain to {min_soc}%"
+            f"evening drain to {min_soc}%; work_mode=Zero export to CT"
         )
         return state
