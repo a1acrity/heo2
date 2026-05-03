@@ -145,6 +145,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # verify completes. Only ever holds a programme that we
         # actively pushed (never the lazy seed).
         self._pending_verification: ProgrammeState | None = None
+        # SPEC §9 / H3 EPS mode. Tracked so we can fire appliance
+        # shutoffs once on the False -> True transition rather than
+        # spamming switch.turn_off every tick.
+        self._eps_active: bool = False
 
         # SPEC §10 tunable knobs. Read fresh from `_config` each tick
         # via the `_pcfg`/`_icfg` helpers below so the OptionsFlow
@@ -568,6 +572,12 @@ class HEO2Coordinator(DataUpdateCoordinator):
         planned_dispatches = self._read_planned_dispatches(
             self._config.get("igo_dispatch_entity", ""),
         )
+        eps_active = self._read_eps_active()
+        if eps_active and not self._eps_active:
+            # Transition: just lost grid. Fire appliance shutoffs
+            # once. Guarded so we don't spam the service every tick.
+            await self._eps_shutdown_appliances()
+        self._eps_active = eps_active
         saving_session = self._read_entity_bool(
             self._config.get("saving_session_entity", ""), default=False
         )
@@ -646,7 +656,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             saving_session_start=None,
             saving_session_end=None,
             ev_charging=ev_charging,
-            grid_connected=True,
+            grid_connected=not eps_active,
             active_appliances=[],
             appliance_expected_kwh=0.0,
             live_import_rates=live_import_rates,
@@ -654,7 +664,66 @@ class HEO2Coordinator(DataUpdateCoordinator):
             solar_forecast_kwh_tomorrow=solar_tomorrow,
             local_tz=self._local_tz(),
             planned_dispatches=planned_dispatches,
+            eps_active=eps_active,
         )
+
+    def _read_eps_active(self) -> bool:
+        """SPEC §9 / H3: detect EPS / power failure.
+
+        Two ways the user can wire this:
+          1. `eps_entity`: a binary_sensor that's `on` when EPS is
+             active. Cleanest if their inverter exposes one.
+          2. `grid_voltage_entity`: a numeric V sensor; treated as
+             EPS-active when value <= `eps_voltage_threshold` (default
+             50V, well below mains 230V).
+
+        Either route returns False when not configured or unparseable,
+        so EPS stays off-by-default for setups that haven't wired the
+        signal yet.
+        """
+        eps_entity = self._config.get("eps_entity", "")
+        if eps_entity:
+            return self._read_entity_bool(eps_entity, default=False)
+
+        gv_entity = self._config.get("grid_voltage_entity", "")
+        if not gv_entity:
+            return False
+        threshold = self._cfg_float("eps_voltage_threshold", 50.0)
+        v = self._read_entity_float(gv_entity, default=-1.0)
+        if v < 0:
+            return False  # unavailable / unparseable - assume grid up
+        return v <= threshold
+
+    async def _eps_shutdown_appliances(self) -> None:
+        """SPEC H3: kill EV / washer / dryer / dishwasher when EPS goes
+        active so the EPS-supplied loop isn't dragged down by 7kW Tesla
+        + 2kW washer + 2.5kW dryer. One-shot per transition.
+        """
+        targets = [
+            self._config.get(k, "")
+            for k in (
+                "ev_status_entity",  # Tesla / EV charger switch
+                "tapo_wash_entity",
+                "tapo_dryer_entity",
+                "tapo_dishwasher_entity",
+            )
+        ]
+        for entity_id in targets:
+            if not entity_id or not entity_id.startswith("switch."):
+                continue
+            try:
+                await self.hass.services.async_call(
+                    "switch", "turn_off",
+                    {"entity_id": entity_id},
+                    blocking=False,
+                )
+                logger.warning(
+                    "H3 EPS: turn_off dispatched for %s", entity_id,
+                )
+            except Exception:
+                logger.exception(
+                    "H3 EPS: failed to turn_off %s", entity_id,
+                )
 
     def _read_planned_dispatches(self, entity_id: str) -> list:
         """HEO-8: read `planned_dispatches` from the BottlecapDave IGO
@@ -1022,6 +1091,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             live_rates_present=self._live_rates_present,
             plan_rejected_reason=self._plan_rejected_reason,
             verify_mismatch_reason=self._verify_mismatch_reason,
+            eps_active=self._eps_active,
         )
         return blocked
 
@@ -1041,8 +1111,15 @@ class HEO2Coordinator(DataUpdateCoordinator):
             live_rates_present=self._live_rates_present,
             plan_rejected_reason=self._plan_rejected_reason,
             verify_mismatch_reason=self._verify_mismatch_reason,
+            eps_active=self._eps_active,
         )
         return reason
+
+    @property
+    def eps_active(self) -> bool:
+        """SPEC §9 / H3: True when EPS is supplying the house and HEO
+        II is in power-failure mode."""
+        return self._eps_active
 
     @property
     def projection_today(self) -> Projection | None:
