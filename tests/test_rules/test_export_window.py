@@ -128,3 +128,61 @@ class TestExportWindowRule:
         rule = ExportWindowRule()
         result = rule.apply(state, default_inputs)
         assert any("ExportWindow" in r for r in result.reason_log)
+
+    def test_heo7_half_hour_slot_within_programme_slot_drains(
+        self, default_inputs,
+    ):
+        """HEO-7 regression: a worth-selling 30-min Agile slot at
+        16:30-17:00 falls inside a programme slot 16:00-20:00. Pre-fix
+        `slot_hours = set(range(16, 20)) = {16,17,18,19}` and the rate
+        slot's hour was 16, so it matched - but a programme slot
+        17:00-19:00 vs the same 16:30 rate would have hour-set
+        {17, 18} which doesn't include 16, missing the overlap.
+
+        We test the second case explicitly: programme slot 17:00-19:00
+        with a worth-selling rate at 16:30-17:00. Pre-fix would NOT
+        drain; post-fix DOES because the rate's local time-of-day
+        (16:30) falls in slot.contains_time(16:30)==False... actually
+        16:30 is BEFORE slot 17:00-19:00 starts, so it shouldn't drain
+        that slot.
+
+        Better test: a programme slot 16:30-19:00 vs a rate slot
+        starting at 16:30. Pre-fix: start_hour=16, end_hour=19,
+        slot_hours={16,17,18}, rate.hour=16 -> matches (lucky). Pre-
+        fix would also match a rate at 16:00 even though the slot
+        starts at 16:30. Post-fix is sub-hour accurate.
+        """
+        from heo2.models import SlotConfig
+        # Programme: a single drain slot 16:30-19:00, GC=False.
+        # Worth-selling rate: a single 30-min slot at 16:00-16:30
+        # (hour 16). Pre-fix: slot_hours={16,17,18} intersects {16}
+        # -> DRAIN (incorrectly, since slot starts at 16:30 AFTER the
+        # rate window has ended). Post-fix: rate.start.time()=16:00
+        # is NOT in slot 16:30-19:00 -> NO DRAIN.
+        prog = ProgrammeState(slots=[
+            SlotConfig(time(0, 0), time(5, 30), 50, True),
+            SlotConfig(time(5, 30), time(16, 30), 80, False),
+            SlotConfig(time(16, 30), time(19, 0), 80, False),
+            SlotConfig(time(19, 0), time(23, 0), 80, False),
+            SlotConfig(time(23, 0), time(23, 55), 80, False),
+            SlotConfig(time(23, 55), time(0, 0), 80, False),
+        ], reason_log=[])
+        # 48 slots flat at 3p, except 16:00-16:30 at 25p.
+        rates = [3.0] * 48
+        rates[32] = 25.0  # index 32 = 16:00 (32 * 30 / 60)
+        default_inputs.export_rates = _today_export_distribution(rates)
+        default_inputs.current_soc = 80.0
+        result = ExportWindowRule().apply(prog, default_inputs)
+        # Slot 2 (16:30-19:00) should NOT have its cap lowered by a
+        # rate that ends at 16:30 - the cheap window has passed
+        # before the slot even starts.
+        assert result.slots[2].capacity_soc == 80, (
+            f"slot 16:30-19:00 was incorrectly drained by a rate window "
+            f"ending at 16:30. Cap = {result.slots[2].capacity_soc}"
+        )
+        # The slot 2 (05:30-16:30) covers the 16:00 rate and should
+        # be drained.
+        assert result.slots[1].capacity_soc < 80, (
+            f"slot 05:30-16:30 covers the 16:00-16:30 worth-sell rate "
+            f"but cap unchanged at {result.slots[1].capacity_soc}"
+        )

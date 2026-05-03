@@ -35,22 +35,42 @@ class EveningProtectRule(Rule):
         required_soc = min(required_soc, 100)
 
         from datetime import time
-        evening_mins = self.evening_start_hour * 60
+
+        # HEO-6 fix: pre-fix logic only protected slots whose end_time
+        # was <= evening_start (e.g. a slot ending at 18:00 exactly).
+        # In Paddy's typical plan, slot 2 runs 05:30-18:30 - it spans
+        # evening_start at 18:00, so the old condition skipped it and
+        # no protection ever applied. The inverter could discharge
+        # slot 2 toward whatever low cap ExportWindow set, leaving
+        # the battery empty entering the evening window.
+        #
+        # New rule: any non-GC slot that overlaps the evening_start
+        # boundary (start_time < evening_start AND end_time > evening_start
+        # OR end_time == 00:00 wrap) gets its cap raised to required_soc.
+        # This is the slot whose `capacity_soc` is in effect AT the
+        # moment evening starts, so it determines the SOC the battery
+        # carries into the evening window.
+        evening_t = time(self.evening_start_hour, 0)
+
+        def _slot_covers_boundary(slot) -> bool:
+            # Slot covers the evening boundary iff `evening_t` falls in
+            # [slot.start_time, slot.end_time). end==00:00 wraps midnight.
+            if slot.end_time == time(0, 0):
+                # Slot wraps; covers anything >= start_time
+                return slot.start_time <= evening_t
+            return slot.start_time <= evening_t < slot.end_time
 
         modified = False
         for slot in state.slots:
-            slot_end_mins = slot.end_time.hour * 60 + slot.end_time.minute
-            if slot_end_mins == 0:
-                slot_end_mins = 1440
-
-            if slot_end_mins <= evening_mins and not slot.grid_charge:
+            if _slot_covers_boundary(slot) and not slot.grid_charge:
                 if slot.capacity_soc < required_soc:
                     slot.capacity_soc = required_soc
                     modified = True
 
         if modified:
             state.reason_log.append(
-                f"EveningProtect: raised pre-evening SOC to {required_soc}% "
+                f"EveningProtect: raised SOC to {required_soc}% in slot "
+                f"covering {evening_t.strftime('%H:%M')} "
                 f"({evening_demand_kwh:.1f} kWh evening demand)"
             )
         else:
