@@ -7,6 +7,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_USERNAME, CONF_PASSWORD
+from homeassistant.core import callback
 
 from .const import (
     DOMAIN,
@@ -33,6 +34,22 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         self._data: dict = {}
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> "HEO2OptionsFlow":
+        """Expose an OptionsFlow so the integration's Configure button
+        appears in Settings -> Devices & services -> HEO II.
+
+        Without this, post-setup config drift (e.g. HEO-9: wrong
+        saving_session_entity / appliance switch IDs) requires editing
+        `.storage/core.config_entries` directly while HA is stopped,
+        which is fragile and easy to mis-do. The OptionsFlow lets the
+        user fix entity wiring through the normal HA UI.
+        """
+        return HEO2OptionsFlow(config_entry)
 
     async def async_step_user(self, user_input=None):
         if user_input is not None:
@@ -162,4 +179,62 @@ class HEO2ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("savings_to_date", default=DEFAULT_SAVINGS_TO_DATE): vol.Coerce(float),
                 vol.Required("install_date", default=DEFAULT_INSTALL_DATE): str,
             }),
+        )
+
+
+# Fields shown in the OptionsFlow. Limited to entity wiring (HEO-9
+# motivating use case) plus dry_run, which is the other knob users
+# want to flip post-setup. Everything else (battery, tariff, payback)
+# rarely changes and stays in the initial setup wizard.
+_OPTIONS_FIELDS = (
+    "soc_entity",
+    "load_power_entity",
+    "pv_power_entity",
+    "ev_status_entity",
+    "igo_dispatch_entity",
+    "saving_session_entity",
+    "tapo_wash_entity",
+    "tapo_dryer_entity",
+    "tapo_dishwasher_entity",
+    "dry_run",
+)
+
+
+class HEO2OptionsFlow(config_entries.OptionsFlow):
+    """Lets the user adjust entity IDs and dry_run after initial setup.
+
+    Saved options are written to `entry.options`; the coordinator
+    merges `{**entry.data, **entry.options}` into `_config` at startup
+    so options take precedence. Reload happens automatically via HA's
+    config-entries plumbing once the OptionsFlow returns
+    `async_create_entry`.
+    """
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        self.config_entry = config_entry
+
+    async def async_step_init(self, user_input=None):
+        if user_input is not None:
+            # Strip empty strings so they don't shadow data defaults
+            # the user may have set via the wizard.
+            cleaned = {
+                k: v for k, v in user_input.items()
+                if not (isinstance(v, str) and v == "")
+            }
+            return self.async_create_entry(title="", data=cleaned)
+
+        # Pre-fill from existing options first, then data. dry_run
+        # default mirrors the services step (True for safety).
+        merged = {**self.config_entry.data, **self.config_entry.options}
+        schema_dict: dict = {}
+        for key in _OPTIONS_FIELDS:
+            current = merged.get(key, "" if key != "dry_run" else True)
+            if key == "dry_run":
+                schema_dict[vol.Required(key, default=bool(current))] = bool
+            else:
+                schema_dict[vol.Optional(key, default=str(current))] = str
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(schema_dict),
         )
