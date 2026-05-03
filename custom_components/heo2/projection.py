@@ -231,9 +231,24 @@ def project_day(
         if _step_in_planned_dispatch(step_start, inputs.planned_dispatches):
             imp_p = igo_off_peak_p
 
-        # Solar / load at this step. Forecasts are hourly; pro-rate to 30 min.
+        # Solar / load at this step. Forecasts are hourly, local-hour
+        # indexed (index 0 = local midnight). When the projection
+        # horizon crosses local midnight (e.g. an 18:00 daily-plan run
+        # forecasting through to 18:00 tomorrow) we look up tomorrow's
+        # solar in `solar_forecast_kwh_tomorrow` rather than wrapping
+        # today's array. Load forecast uses the same shape both days
+        # (HEO-5 learned profile), so for load we wrap today.
+        if (
+            inputs.local_tz is not None
+            and inputs.now.tzinfo is not None
+            and step_local.date() != inputs.now.astimezone(inputs.local_tz).date()
+            and inputs.solar_forecast_kwh_tomorrow
+        ):
+            solar_24 = inputs.solar_forecast_kwh_tomorrow
+        else:
+            solar_24 = inputs.solar_forecast_kwh
         hour_idx = step_local.hour
-        solar_kwh = inputs.solar_forecast_kwh[hour_idx] * _SLOT_HOURS
+        solar_kwh = solar_24[hour_idx] * _SLOT_HOURS
         load_kwh = inputs.load_forecast_kwh[hour_idx] * _SLOT_HOURS
 
         net_solar = solar_kwh - load_kwh
