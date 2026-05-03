@@ -218,6 +218,7 @@ def validate_plan(
     charge_efficiency: float = 0.95,
     discharge_efficiency: float = 0.95,
     tz: ZoneInfo | None = None,
+    igo_off_peak_p: float = 4.95,
 ) -> ValidationResult:
     """Run all SPEC §6 pre-write checks and a 24-hour projection.
 
@@ -254,6 +255,7 @@ def validate_plan(
         discharge_efficiency=discharge_efficiency,
         peak_threshold_p=peak_threshold_p,
         tz=tz,
+        igo_off_peak_p=igo_off_peak_p,
     )
 
     if projection.peak_import_kwh > 0.001:
