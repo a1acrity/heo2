@@ -21,6 +21,23 @@ from ..rank_pricing import (
 from ..rule_engine import Rule
 
 
+def _slot_covers_rate(slot, rate, tz):
+    """True iff the programme `slot` (local time-of-day) covers the
+    `rate.start` (UTC absolute datetime) in local time. HEO-7 fix:
+    pre-2026-05 ExportWindowRule built `slot_hours = set(range(start.hour,
+    end.hour))` and matched against `rate.start.hour`. That dropped
+    half-hour Agile slots crossing the hour and entirely missed slots
+    like 16:30-17:00 against a programme slot of 17:00-19:00. Working
+    in absolute time (rate.start in local tz, against slot.start_time
+    / slot.end_time) catches the overlap without rounding.
+    """
+    if tz is not None and rate.start.tzinfo is not None:
+        local_t = rate.start.astimezone(tz).time()
+    else:
+        local_t = rate.start.time()
+    return slot.contains_time(local_t)
+
+
 class ExportWindowRule(Rule):
     """Drain the battery during the top-ranked export windows of today.
 
@@ -103,10 +120,12 @@ class ExportWindowRule(Rule):
             )
             return state
 
-        # Local-hour view of which slots overlap a worth-selling window.
-        # SlotConfig stores time-of-day; we render the worth-selling
-        # windows' UTC starts back to local hour using inputs.now's tz.
-        tz = inputs.now.tzinfo
+        # HEO-7: local-tz aware slot matching. Use inputs.local_tz
+        # (set by the coordinator post-PR2) so DST is respected;
+        # fall back to inputs.now.tzinfo for tests that don't set it.
+        tz = inputs.local_tz or inputs.now.tzinfo
+        # Kept for the diagnostic log line below; the actual slot
+        # selection uses _slot_covers_rate which is sub-hour accurate.
         worth_hours = hours_covered_by(worth_windows, tz=tz)
 
         # Per SPEC §5 priority 1 (avoid peak import) DOMINATES priority 3
@@ -130,14 +149,18 @@ class ExportWindowRule(Rule):
 
         modified = False
         for slot in state.slots:
-            start_hour = slot.start_time.hour
-            end_hour = slot.end_time.hour if slot.end_time > slot.start_time else 24
-            slot_hours = set(range(start_hour, end_hour))
-
-            if slot_hours & worth_hours and not slot.grid_charge:
-                if slot.capacity_soc > drain_target:
-                    slot.capacity_soc = drain_target
-                    modified = True
+            if slot.grid_charge:
+                continue
+            # Slot drains only if at least one worth-selling rate slot
+            # falls within its time window. Sub-hour accurate via
+            # `_slot_covers_rate`, unlike the pre-HEO-7 hour-set
+            # intersection.
+            covers_any = any(
+                _slot_covers_rate(slot, r, tz) for r in worth_windows
+            )
+            if covers_any and slot.capacity_soc > drain_target:
+                slot.capacity_soc = drain_target
+                modified = True
 
         sorted_hours = sorted(worth_hours)
         rate_summary = (
