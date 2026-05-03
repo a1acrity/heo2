@@ -123,15 +123,34 @@ A window is "worth selling in" if it's in `top_export_windows` AND
 `export_rate * round_trip_efficiency > replacement_cost` where
 replacement_cost = next available IGO off-peak rate (typically 4.95p).
 
-### Charging from grid (cheap-rate decision)
+### Charging from grid (bridge-to-PV-takeover)
+
+The overnight charge target is sized to bridge from end-of-cheap-window
+through to the first hour where tomorrow's PV forecast covers tomorrow's
+load. After "PV takeover" the battery refills from solar at no cost; we
+don't want to fill it overnight and lose tomorrow's solar to a full
+battery.
 
 ```
-bottom_import_windows = bottom 25% of import_rates_today (or all IGO off-peak)
-charge target = enough to cover (load - solar) until next bottom window
+target_soc = min_soc
+           + morning_bridge_kwh / battery_capacity_kwh * 100
+           + safety_buffer_pct (default 10%)
+
+morning_bridge_kwh = sum max(0, load[h] - solar_tomorrow[h])
+                     for h in [cheap_window_end_hour, pv_takeover_hour)
 ```
 
-For IGO this is straightforward (off-peak windows are explicitly cheap).
-For variable tariffs the same logic generalises.
+Edge cases:
+- No tomorrow PV forecast -> default to filling battery (no signal).
+- PV never overtakes load (deep winter) -> sum the whole day's deficit;
+  target clamps to `max_target_soc`.
+- Tiny bridge (very early PV takeover) -> safety buffer keeps target a
+  comfortable margin above min_soc to absorb forecast misses.
+
+This replaces the legacy SPEC §5a "demand + profitable export - solar"
+formula, which over-charged when Octopus Outgoing peaks looked
+arbitrage-worthy and let the battery sit full while next-day solar was
+exporting at lower live rates.
 
 ### Why rank not absolute
 
