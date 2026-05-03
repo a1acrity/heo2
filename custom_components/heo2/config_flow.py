@@ -208,6 +208,7 @@ _OPTIONS_RULE_KNOBS = (
     ("replan_soc_pct", 10, int),
     ("sell_top_pct_default", 30, int),
     ("cheap_charge_bottom_pct", 25, int),
+    ("cycle_budget", 2.0, float),  # H7 daily soft target
 )
 
 

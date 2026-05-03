@@ -175,6 +175,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             battery_capacity_kwh=self._config.get(
                 "battery_capacity_kwh", 20.0,
             ),
+            daily_budget=float(self._config.get("cycle_budget", 2.0)),
         )
         self.octopus: OctopusBillingFetcher | None = None
 
@@ -338,6 +339,10 @@ class HEO2Coordinator(DataUpdateCoordinator):
         bo_kwh = self._read_entity_float(bo_entity, default=-1.0)
         if bo_kwh >= 0:
             self.cycle_tracker.observe(bo_kwh)
+        # Pick up live edits to daily_budget without restart
+        self.cycle_tracker.daily_budget = float(
+            self._config.get("cycle_budget", 2.0),
+        )
 
     def _cfg_float(self, key: str, default: float) -> float:
         """Read a runtime-tunable knob from `_config` as float. Read
