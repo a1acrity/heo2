@@ -97,3 +97,11 @@ class TestBaselineRule:
         state = ProgrammeState.default(min_soc=20)
         result = rule.apply(state, default_inputs)
         assert result.work_mode == "Zero export to CT"
+
+    def test_sets_default_energy_pattern(self, default_inputs):
+        """SPEC §2: 'Load first' is the right default for a UK house -
+        prioritise covering load before topping the battery."""
+        rule = BaselineRule()
+        state = ProgrammeState.default(min_soc=20)
+        result = rule.apply(state, default_inputs)
+        assert result.energy_pattern == "Load first"

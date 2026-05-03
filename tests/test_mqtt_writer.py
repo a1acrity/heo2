@@ -611,6 +611,32 @@ class TestDiffGlobals:
         writer = MqttWriter(client=MagicMock())
         assert writer.diff_globals(cur, new) == []
 
+    def test_energy_pattern_change_detected(self):
+        cur = _baseline_programme()
+        cur.work_mode = "Zero export to CT"
+        cur.energy_pattern = "Load first"
+        new = _baseline_programme()
+        new.work_mode = "Zero export to CT"
+        new.energy_pattern = "Battery first"
+        writer = MqttWriter(client=MagicMock())
+        out = writer.diff_globals(cur, new)
+        assert len(out) == 1
+        assert out[0].setting == "energy_pattern"
+        assert out[0].value == "Battery first"
+
+    def test_both_globals_change_returns_both_writes_in_order(self):
+        """work_mode comes before energy_pattern (rules may depend on
+        work_mode being applied first)."""
+        cur = _baseline_programme()
+        cur.work_mode = "Zero export to CT"
+        cur.energy_pattern = "Load first"
+        new = _baseline_programme()
+        new.work_mode = "Selling first"
+        new.energy_pattern = "Battery first"
+        writer = MqttWriter(client=MagicMock())
+        out = writer.diff_globals(cur, new)
+        assert [w.setting for w in out] == ["work_mode", "energy_pattern"]
+
 
 class TestWriteGlobals:
     @pytest.mark.asyncio

@@ -26,10 +26,13 @@ logger = logging.getLogger(__name__)
 _CAPACITY_FMT = "sensor.sa_inverter_{inv}_capacity_point_{n}"
 _GRID_CHARGE_FMT = "sensor.sa_inverter_{inv}_grid_charge_point_{n}"
 _TIME_FMT = "sensor.sa_inverter_{inv}_time_point_{n}"
-# SPEC §2 globals. Currently only work_mode is wired (HEO follow-up
-# PRs will extend to energy_pattern / charge_rate / discharge_rate /
-# zero_export_to_CT).
-_WORK_MODE_FMT = "select.sa_inverter_{inv}_work_mode"
+# SPEC §2 globals. SA's discovery publishes work_mode / energy_pattern
+# as `select` platform entries but HA registers the state under the
+# `sensor.sa_inverter_*` namespace (verified via REST at deploy time).
+# `select.sa_inverter_1_work_mode` returns 404; `sensor.sa_inverter_1_work_mode`
+# returns the current value.
+_WORK_MODE_FMT = "sensor.sa_inverter_{inv}_work_mode"
+_ENERGY_PATTERN_FMT = "sensor.sa_inverter_{inv}_energy_pattern"
 
 
 # Fallback defaults when an entity is missing or unparseable. Chosen to
@@ -132,8 +135,15 @@ def read_programme_state(
 
     work_mode_raw = state_lookup(_WORK_MODE_FMT.format(inv=inv))
     work_mode = work_mode_raw.strip() if work_mode_raw else None
+    energy_pattern_raw = state_lookup(_ENERGY_PATTERN_FMT.format(inv=inv))
+    energy_pattern = energy_pattern_raw.strip() if energy_pattern_raw else None
 
-    return ProgrammeState(slots=slots, reason_log=[], work_mode=work_mode)
+    return ProgrammeState(
+        slots=slots,
+        reason_log=[],
+        work_mode=work_mode,
+        energy_pattern=energy_pattern,
+    )
 
 
 def read_from_hass(

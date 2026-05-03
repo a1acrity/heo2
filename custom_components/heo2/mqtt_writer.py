@@ -175,17 +175,31 @@ class MqttWriter:
     ) -> list[GlobalWrite]:
         """Diff the SPEC §2 global settings between two programmes.
 
-        Currently only `work_mode` is wired. `None` on the new side
-        means "don't touch", so older callers that don't set
-        work_mode never trigger a write. Equality check ignores case
-        and trailing whitespace to be defensive about SA renderings.
+        `None` on the new side means "don't touch", so older callers
+        that don't set the field never trigger a write. Equality check
+        ignores case and trailing whitespace to be defensive about SA
+        renderings.
+
+        Currently wired: `work_mode`, `energy_pattern`. Future PRs can
+        extend the same pattern to charge/discharge rate and zero-
+        export-to-CT. Order matters: work_mode is applied first because
+        downstream rules may depend on it (e.g. cannot export under
+        Zero-Export work_mode regardless of energy_pattern).
         """
         out: list[GlobalWrite] = []
-        if new.work_mode is not None:
-            cur = (current.work_mode or "").strip()
-            nw = new.work_mode.strip()
-            if cur.casefold() != nw.casefold():
-                out.append(GlobalWrite(setting="work_mode", value=nw))
+
+        def _check(field_name: str, topic_name: str) -> None:
+            new_val = getattr(new, field_name)
+            if new_val is None:
+                return
+            cur_val = getattr(current, field_name) or ""
+            if str(cur_val).strip().casefold() != new_val.strip().casefold():
+                out.append(GlobalWrite(
+                    setting=topic_name, value=new_val.strip(),
+                ))
+
+        _check("work_mode", "work_mode")
+        _check("energy_pattern", "energy_pattern")
         return out
 
     def diff(self, current: ProgrammeState, new: ProgrammeState) -> list[SlotWrite]:
