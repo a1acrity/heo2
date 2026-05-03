@@ -124,6 +124,30 @@ class TestSavingSessionRule:
         assert result.slots[1].capacity_soc == 10
         assert any("already at floor" in r for r in result.reason_log)
 
+    def test_active_session_sets_work_mode_selling_first(self):
+        """SPEC §2 / §9 row 3: drain via 'Selling first' work mode so
+        the inverter actually exports during the session.
+        """
+        rule = SavingSessionRule()
+        prog = _spec_programme()
+        result = rule.apply(prog, _inputs(
+            now_utc=datetime(2026, 5, 2, 16, 0, tzinfo=timezone.utc),
+            saving=True,
+            tz=ZoneInfo("Europe/London"),
+        ))
+        assert result.work_mode == "Selling first"
+
+    def test_inactive_session_leaves_work_mode_unset(self):
+        rule = SavingSessionRule()
+        prog = _spec_programme()
+        # work_mode is None at construction; the rule shouldn't touch it.
+        prog.work_mode = "Zero export to CT"
+        result = rule.apply(prog, _inputs(
+            now_utc=datetime(2026, 5, 2, 16, 0, tzinfo=timezone.utc),
+            saving=False,
+        ))
+        assert result.work_mode == "Zero export to CT"
+
     def test_overnight_slot_correctly_resolved_through_local_tz(self):
         """A session at 00:30 BST = 23:30 UTC. Without tz, lookup uses
         UTC 23:30 which falls in slot 4 (23:30-23:55). With tz, we

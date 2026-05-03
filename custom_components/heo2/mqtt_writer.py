@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import time
 from typing import Any, Awaitable, Callable, Protocol
 
-from .models import ProgrammeState, SlotConfig, SlotWrite
+from .models import GlobalWrite, ProgrammeState, SlotConfig, SlotWrite
 from .const import MQTT_WRITE_TIMEOUT_SECONDS, MQTT_MAX_RETRIES
 
 logger = logging.getLogger(__name__)
@@ -170,6 +170,24 @@ class MqttWriter:
 
     # --- diff -----------------------------------------------------------
 
+    def diff_globals(
+        self, current: ProgrammeState, new: ProgrammeState,
+    ) -> list[GlobalWrite]:
+        """Diff the SPEC §2 global settings between two programmes.
+
+        Currently only `work_mode` is wired. `None` on the new side
+        means "don't touch", so older callers that don't set
+        work_mode never trigger a write. Equality check ignores case
+        and trailing whitespace to be defensive about SA renderings.
+        """
+        out: list[GlobalWrite] = []
+        if new.work_mode is not None:
+            cur = (current.work_mode or "").strip()
+            nw = new.work_mode.strip()
+            if cur.casefold() != nw.casefold():
+                out.append(GlobalWrite(setting="work_mode", value=nw))
+        return out
+
     def diff(self, current: ProgrammeState, new: ProgrammeState) -> list[SlotWrite]:
         """Compare two programmes and return a list of register writes.
 
@@ -235,6 +253,67 @@ class MqttWriter:
 
 
     # --- the actual write orchestration --------------------------------
+
+    def _global_set_topic(self, setting: str) -> str:
+        return f"{self._base_topic}/{self._inverter}/{setting}/set"
+
+    async def write_globals(
+        self, writes: list[GlobalWrite],
+    ) -> MqttWriteResult:
+        """Sequentially publish each GlobalWrite to its `<setting>/set`
+        topic and wait for SA's bare 'Saved' / 'Error: ...' response.
+        Same FIFO-queue correlation as `write_registers` (HEO-32).
+
+        Sequential by design: SA confirms one set at a time and we
+        want to fail fast on the first error rather than firing all
+        globals and trying to figure out which one SA rejected.
+        """
+        result = MqttWriteResult(writes_attempted=0)
+
+        if self._dry_run:
+            for w in writes:
+                result.writes_attempted += 1
+                result.dry_run_log.append(
+                    f"Would publish {self._global_set_topic(w.setting)} "
+                    f"= {w.value}"
+                )
+                result.writes_confirmed += 1
+            result.success = True
+            return result
+
+        if not writes:
+            result.success = True
+            return result
+
+        self._response_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def _on_response(topic: str, payload: str) -> None:
+            await self._response_queue.put(payload)
+
+        unsubscribe = await self._transport.subscribe(
+            self._response_topic(), _on_response,
+        )
+        try:
+            while not self._response_queue.empty():
+                self._response_queue.get_nowait()
+
+            for w in writes:
+                topic = self._global_set_topic(w.setting)
+                result.writes_attempted += 1
+                ok, reason = await self._publish_and_confirm(
+                    topic, w.value, w.setting,
+                )
+                if ok:
+                    result.writes_confirmed += 1
+                else:
+                    result.success = False
+                    result.failed_param = w.setting
+                    result.failed_reason = reason
+                    return result
+            result.success = True
+            return result
+        finally:
+            unsubscribe()
 
     async def write_registers(self, writes: list[SlotWrite]) -> MqttWriteResult:
         """Publish each setting change and wait for SA to confirm each
@@ -370,13 +449,38 @@ async def apply_programme_diff(
     Pure async, no HA imports. Callable from the coordinator with real
     HAMqttTransport-backed writer, or from tests with FakeTransport.
     """
-    writes = writer.diff(last_known, new_programme)
-    if not writes:
-        # Fabricate a success result for the "no work" case
+    # Globals first so per-slot writes happen under the intended
+    # work_mode (e.g. SavingSession switches to "Selling first"; we
+    # want the inverter in selling mode before its slot caps drop).
+    global_writes = writer.diff_globals(last_known, new_programme)
+    slot_writes = writer.diff(last_known, new_programme)
+
+    if not global_writes and not slot_writes:
         result = MqttWriteResult(success=True, writes_attempted=0, writes_confirmed=0)
         return result, last_known
 
-    result = await writer.write_registers(writes)
-    if result.success:
-        return result, new_programme
-    return result, last_known
+    combined = MqttWriteResult(success=True)
+    if global_writes:
+        g_result = await writer.write_globals(global_writes)
+        combined.writes_attempted += g_result.writes_attempted
+        combined.writes_confirmed += g_result.writes_confirmed
+        combined.dry_run_log.extend(g_result.dry_run_log)
+        if not g_result.success:
+            combined.success = False
+            combined.failed_param = g_result.failed_param
+            combined.failed_reason = g_result.failed_reason
+            return combined, last_known
+
+    if slot_writes:
+        s_result = await writer.write_registers(slot_writes)
+        combined.writes_attempted += s_result.writes_attempted
+        combined.writes_confirmed += s_result.writes_confirmed
+        combined.dry_run_log.extend(s_result.dry_run_log)
+        if not s_result.success:
+            combined.success = False
+            combined.failed_slot = s_result.failed_slot
+            combined.failed_param = s_result.failed_param
+            combined.failed_reason = s_result.failed_reason
+            return combined, last_known
+
+    return combined, new_programme

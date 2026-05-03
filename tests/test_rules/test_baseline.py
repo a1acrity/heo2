@@ -87,3 +87,13 @@ class TestBaselineRule:
         state = ProgrammeState.default(min_soc=20)
         result = rule.apply(state, default_inputs)
         assert result.slots[0].end_time == time(4, 30)
+
+    def test_sets_default_work_mode(self, default_inputs):
+        """SPEC §2: BaselineRule resets work_mode to the safe default
+        every tick. SavingSessionRule overrides to 'Selling first'
+        when active; once the session ends, baseline runs again on
+        the next tick and resets here so the inverter stops exporting."""
+        rule = BaselineRule()
+        state = ProgrammeState.default(min_soc=20)
+        result = rule.apply(state, default_inputs)
+        assert result.work_mode == "Zero export to CT"

@@ -57,16 +57,25 @@ class SavingSessionRule(Rule):
         slot.grid_charge = False
         after = (slot.capacity_soc, slot.grid_charge)
 
+        # SPEC §9 row 3: "Selling first" lets the inverter export to
+        # grid at the published Outgoing Octopus rate. Without this the
+        # current "Zero export to CT" mode would just hold load coverage,
+        # not export, and the £3+/kWh saving-session price wouldn't be
+        # captured. Reset is handled by BaselineRule when the session
+        # ends (saving_session=False).
+        state.work_mode = "Selling first"
+
         if before != after:
             state.reason_log.append(
                 f"SavingSession: drain slot {current_idx + 1} "
                 f"({slot.start_time.strftime('%H:%M')}-"
                 f"{slot.end_time.strftime('%H:%M')}) "
-                f"to {floor}% (was cap={before[0]}% gc={before[1]})"
+                f"to {floor}% (was cap={before[0]}% gc={before[1]}); "
+                f"work_mode -> Selling first"
             )
         else:
             state.reason_log.append(
                 f"SavingSession: active but slot {current_idx + 1} "
-                f"already at floor"
+                f"already at floor; work_mode -> Selling first"
             )
         return state

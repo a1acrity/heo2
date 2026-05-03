@@ -65,9 +65,21 @@ _FILLER_THRESHOLD_MINUTES = 30
 
 @dataclass
 class ProgrammeState:
-    """The 6-slot programme produced by the rule engine."""
+    """The 6-slot programme produced by the rule engine.
+
+    `work_mode` is a SPEC §2 global setting that overrides the
+    inverter's behaviour across slots (e.g. "Selling first" during a
+    saving session, "Zero export to CT" in normal operation). None
+    means "don't touch" so older callers and tests built before the
+    work_mode wiring still produce valid programmes that don't
+    accidentally write the field.
+
+    Valid values per SA discovery:
+      "Selling first" | "Zero export to load" | "Zero export to CT"
+    """
     slots: list[SlotConfig]
     reason_log: list[str] = field(default_factory=list)
+    work_mode: Optional[str] = None
 
     @classmethod
     def default(cls, min_soc: int = 20) -> ProgrammeState:
@@ -284,3 +296,13 @@ class SlotWrite:
     capacity_soc: int | None = None   # write only if changed
     time_point: str | None = None     # write only if changed ("HH:MM")
     grid_charge: bool | None = None   # write only if changed
+
+
+@dataclass
+class GlobalWrite:
+    """A pending MQTT write for a SPEC §2 global setting (work_mode,
+    energy_pattern, etc.). Per-slot writes use `SlotWrite`; this is
+    the equivalent for non-per-slot inverter settings.
+    """
+    setting: str  # e.g. "work_mode"
+    value: str
