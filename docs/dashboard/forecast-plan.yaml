@@ -41,15 +41,19 @@ cards:
 
   # SOC trajectory chart. trajectory[h] is the projected SOC AT
   # clock hour h LOCAL time. Past hours are flat-filled with
-  # current_soc; future hours are simulated. 30 hours of data so the
-  # chart spans today's full day plus tomorrow morning's overnight
-  # recharge - so the user can see the full charge cycle, not just
-  # the drain-to-floor portion.
+  # current_soc; future hours are simulated. 48-hour horizon covers
+  # today + tomorrow.
+  #
+  # Second series overlays grid_charge=True windows from
+  # `sensor.heo_ii_programme_slots` so the user can visually
+  # correlate which times the inverter is pulling from the grid
+  # vs which are drain windows. The slot programme repeats daily, so
+  # the overlay emits each GC slot for BOTH today and tomorrow.
   - type: custom:apexcharts-card
     header:
       title: Battery SOC Trajectory
       show: true
-    graph_span: 30h
+    graph_span: 48h
     span:
       start: day
     yaxis:
@@ -69,6 +73,35 @@ cards:
         type: line
         color: "#14b8a6"
         stroke_width: 3
+      - entity: sensor.heo2_programme_slots
+        data_generator: |
+          const slots = entity.attributes.slots || [];
+          const base = new Date();
+          base.setHours(0, 0, 0, 0);
+          const points = [];
+          // Render the slot programme for BOTH today and tomorrow so
+          // the overlay covers the 48h chart span.
+          for (let day = 0; day < 2; day++) {
+            const dayStart = base.getTime() + day * 86400 * 1000;
+            for (const s of slots) {
+              const [sh, sm] = s.start.split(':').map(Number);
+              const [eh, em] = s.end.split(':').map(Number);
+              const startMs = dayStart + (sh * 60 + sm) * 60 * 1000;
+              let endMs = dayStart + (eh * 60 + em) * 60 * 1000;
+              if (endMs <= startMs) endMs += 86400 * 1000; // wrap midnight
+              const value = s.grid_charge ? 100 : 0;
+              points.push([startMs, value]);
+              points.push([endMs, value]);
+              points.push([endMs, 0]);  // drop edge so step is clean
+            }
+          }
+          return points;
+        name: Grid charge active
+        type: area
+        color: "#a855f7"
+        opacity: 0.15
+        stroke_width: 0
+        curve: stepline
 
   # SPEC §6 projection summary - one-line forecast of today's outcome.
   # Icon turns orange when the projection forecasts > 0.1 kWh of

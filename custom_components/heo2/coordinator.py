@@ -355,7 +355,7 @@ class HEO2Coordinator(DataUpdateCoordinator):
             solar_forecast_kwh_tomorrow=(
                 inputs.solar_forecast_kwh_tomorrow or None
             ),
-            horizon_hours=30,
+            horizon_hours=48,
         )
 
         flat_rate = self._config.get("flat_rate_pence", DEFAULT_FLAT_RATE_PENCE)
