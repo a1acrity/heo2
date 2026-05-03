@@ -64,6 +64,21 @@ cards:
         color: "#14b8a6"
         stroke_width: 3
 
+  # SPEC §6 projection summary - one-line forecast of today's outcome.
+  # Icon turns orange when the projection forecasts > 0.1 kWh of
+  # peak-rate import so the user can spot it on the main view.
+  - type: custom:mushroom-template-card
+    primary: Today projection
+    secondary: "{{ states('sensor.heo_ii_projection_today') }}"
+    icon: mdi:chart-line
+    icon_color: >-
+      {% if state_attr('sensor.heo_ii_projection_today',
+      'peak_import_kwh') | float(0) > 0.1 %}orange{% else %}green{% endif %}
+    fill_container: true
+    multiline_secondary: true
+    tap_action:
+      action: more-info
+
   # Programme slots table
   - type: custom:flex-table-card
     title: Programme Slots

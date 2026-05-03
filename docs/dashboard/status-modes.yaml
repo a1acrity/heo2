@@ -1,0 +1,134 @@
+# Lovelace dashboard view: HEO II Status & Modes
+#
+# Surfaces the entities shipped during the SPEC §2 / §6 / §7 / §8 / §9 /
+# §10 / §12 / H7 work landed in PRs #37-#56 (2026-05-02 / 2026-05-03).
+# Lives alongside the Forecast & Plan / Tariffs / ROI Tracking views.
+#
+# Section guide:
+#   * Top alert chips - red when any of writes_blocked / EPS / cycle
+#     budget / EV deferral are active.
+#   * Projection (today) - one-line summary plus the structured
+#     attributes (sells_kwh, imports_avg_pence, peak_import_kwh).
+#   * EV Deferral (SPEC §12) - the user-facing dashboard switch, the
+#     "currently deferred" status sensor, the live zappi mode, and
+#     the current export rate so the user can sanity-check why
+#     deferral is or isn't firing.
+#   * Battery Cycle Budget (H7) - cycles_today + 3-day history alert.
+#   * EPS / Power Failure - status indicators only; the EPS feature
+#     activates from a configured `eps_entity` or `grid_voltage_entity`
+#     in the integration's OptionsFlow.
+#   * Granularity Snaps - count + per-slot details.
+title: Status & Modes
+path: status-modes
+icon: mdi:tune-vertical
+cards:
+  - type: custom:mushroom-chips-card
+    alignment: center
+    chips:
+      - type: entity
+        entity: binary_sensor.heo_ii_writes_blocked
+        icon: mdi:lock-alert
+        icon_color: red
+        content_info: name
+      - type: entity
+        entity: binary_sensor.heo_ii_eps_active
+        icon: mdi:flash-alert
+        icon_color: red
+        content_info: name
+      - type: entity
+        entity: binary_sensor.heo_ii_cycle_budget_exceeded
+        icon: mdi:battery-alert
+        icon_color: red
+        content_info: name
+      - type: entity
+        entity: binary_sensor.heo_ii_ev_deferral_active
+        icon: mdi:car-clock
+        icon_color: blue
+        content_info: name
+  - type: entities
+    title: Projection (today)
+    entities:
+      - entity: sensor.heo_ii_projection_today
+        name: Summary
+        icon: mdi:chart-line
+      - type: attribute
+        entity: sensor.heo_ii_projection_today
+        attribute: expected_return_pence
+        name: Expected return (pence)
+      - type: attribute
+        entity: sensor.heo_ii_projection_today
+        attribute: sells_kwh
+        name: Sells (kWh)
+        suffix: " kWh"
+      - type: attribute
+        entity: sensor.heo_ii_projection_today
+        attribute: sells_avg_pence
+        name: Sells avg
+        suffix: " p/kWh"
+      - type: attribute
+        entity: sensor.heo_ii_projection_today
+        attribute: imports_kwh
+        name: Imports (kWh)
+        suffix: " kWh"
+      - type: attribute
+        entity: sensor.heo_ii_projection_today
+        attribute: imports_avg_pence
+        name: Imports avg
+        suffix: " p/kWh"
+      - type: attribute
+        entity: sensor.heo_ii_projection_today
+        attribute: peak_import_kwh
+        name: Peak-rate import (kWh)
+        suffix: " kWh"
+  - type: entities
+    title: EV Deferral (SPEC 12)
+    entities:
+      - entity: switch.heo_ii_defer_ev_when_export_high
+        name: Defer EV when export high
+        icon: mdi:car-clock
+      - entity: binary_sensor.heo_ii_ev_deferral_active
+        name: Currently deferred
+        icon: mdi:car-off
+      - entity: select.myenergi_zappi_22752031_charge_mode
+        name: Zappi charge mode
+        icon: mdi:ev-station
+      - entity: sensor.heo_ii_current_export_rate
+        name: Current export rate
+        icon: mdi:transmission-tower-export
+  - type: entities
+    title: Battery Cycle Budget (H7)
+    entities:
+      - entity: sensor.heo_ii_cycles_today
+        name: Cycles today
+        icon: mdi:battery-sync
+      - entity: binary_sensor.heo_ii_cycle_budget_exceeded
+        name: Exceeded 3 days running
+        icon: mdi:battery-alert
+      - type: attribute
+        entity: binary_sensor.heo_ii_cycle_budget_exceeded
+        attribute: history
+        name: Last 3 days
+      - type: attribute
+        entity: binary_sensor.heo_ii_cycle_budget_exceeded
+        attribute: daily_budget
+        name: Daily budget
+        suffix: " cycles"
+  - type: entities
+    title: EPS / Power Failure (SPEC 9.2)
+    entities:
+      - entity: binary_sensor.heo_ii_eps_active
+        name: EPS active
+        icon: mdi:flash-alert
+      - entity: binary_sensor.heo_ii_writes_blocked
+        name: Writes blocked
+        icon: mdi:lock
+  - type: entities
+    title: Granularity Snaps
+    entities:
+      - entity: sensor.heo_ii_granularity_snaps
+        name: Snaps applied
+        icon: mdi:ruler
+      - type: attribute
+        entity: sensor.heo_ii_granularity_snaps
+        attribute: snaps
+        name: Details

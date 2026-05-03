@@ -19,8 +19,9 @@ Install these community cards via HACS:
 
 ## Views
 
-- `forecast-plan.yaml` — 24h energy forecast, SOC trajectory, programme slots
+- `forecast-plan.yaml` — 24h energy forecast, SOC trajectory, projection summary, programme slots
 - `tariffs.yaml` — current rates, 48h rate charts
+- `status-modes.yaml` — alert chips, projection breakdown, EV deferral toggle, cycle budget, EPS, granularity snaps
 - `roi-tracking.yaml` — daily/weekly costs, Octopus bills, payback progress
 
 ## Colour Palette
