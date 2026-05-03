@@ -13,20 +13,20 @@ from .igo_dispatch import IGODispatchRule
 from .ev_charging import EVChargingRule
 from .saving_session import SavingSessionRule
 from .winter_low_pv import WinterLowPVRule
+from .ev_deferral import EVDeferralRule
 from .eps_mode import EPSModeRule
 from .safety import SafetyRule
 
 
 def default_rules() -> list[Rule]:
-    """Return the 11 default rules in priority order.
+    """Return the 12 default rules in priority order.
 
     SafetyRule is always last and cannot be disabled. EPSModeRule sits
     JUST before SafetyRule because it must override every other rule's
     decisions (SPEC H3: drop SOC floor to 0% during grid loss).
-    WinterLowPVRule sits AFTER ExportWindow + EveningProtect so it can
-    raise floors that those rules may have lowered, but BEFORE
-    SavingSession / IGODispatch / EV / EPS so those event-triggered
-    rules can still override the seasonal default.
+    EVDeferralRule sits BEFORE EVChargingRule so the deferral signal
+    can override EVChargingRule's "hold SOC" behaviour (we WANT to
+    drain the battery to grid in deferral mode).
     """
     return [
         BaselineRule(),
@@ -37,6 +37,7 @@ def default_rules() -> list[Rule]:
         WinterLowPVRule(),
         SavingSessionRule(),
         IGODispatchRule(),
+        EVDeferralRule(),
         EVChargingRule(),
         EPSModeRule(),
         SafetyRule(),

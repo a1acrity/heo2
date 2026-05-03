@@ -150,6 +150,12 @@ class HEO2Coordinator(DataUpdateCoordinator):
         # shutoffs once on the False -> True transition rather than
         # spamming switch.turn_off every tick.
         self._eps_active: bool = False
+        # SPEC §12 EV deferral: track previous-tick state so the
+        # zappi `select.select_option` -> Stopped service call fires
+        # ONCE on False->True. On True->False, restore the captured
+        # pre-deferral charge_mode (if any).
+        self._ev_deferral_active: bool = False
+        self._zappi_pre_deferral_mode: str | None = None
 
         # SPEC §10 tunable knobs. Read fresh from `_config` each tick
         # via the `_pcfg`/`_icfg` helpers below so the OptionsFlow
@@ -287,6 +293,15 @@ class HEO2Coordinator(DataUpdateCoordinator):
             await self._apply_programme_to_inverter(effective)
         except Exception:
             logger.exception("HEO-27: apply_programme failed")
+
+        # SPEC §12 EV deferral: dispatch zappi service call on
+        # transition. Done AFTER inverter writes so the inverter is
+        # already in Selling-first mode by the time the EV stops
+        # drawing.
+        try:
+            await self._maybe_dispatch_ev_deferral(effective)
+        except Exception:
+            logger.exception("EVDeferral: maybe_dispatch raised")
 
         self._update_dashboard_secondary(inputs, fresh)
         return fresh
@@ -696,6 +711,11 @@ class HEO2Coordinator(DataUpdateCoordinator):
             # SPEC §9 row 5: implicit winter mode when daily PV
             # forecast is below daily load. Triggers WinterLowPVRule.
             is_winter_low_pv=sum(solar) < sum(load_forecast),
+            # SPEC §12 EV deferral signals.
+            defer_ev_eligible=bool(
+                self._config.get("defer_ev_when_export_high", False),
+            ),
+            current_export_rate_p=self._current_export_rate(now, export_rates),
         )
 
     def _read_eps_active(self) -> bool:
@@ -755,6 +775,76 @@ class HEO2Coordinator(DataUpdateCoordinator):
                 logger.exception(
                     "H3 EPS: failed to turn_off %s", entity_id,
                 )
+
+    def _current_export_rate(self, now, export_rates) -> float | None:
+        """Find the export rate covering `now`, or None if no slot covers it.
+        Used by SPEC §12 EV deferral to compare against the
+        `deferral_min_export_p` floor without walking the full list.
+        """
+        for r in export_rates:
+            if r.start <= now < r.end:
+                return float(r.rate_pence)
+        return None
+
+    async def _maybe_dispatch_ev_deferral(
+        self, programme: ProgrammeState,
+    ) -> None:
+        """SPEC §12: when the rule engine decides EV deferral is active,
+        ask the zappi to halt charging. On clear, restore the previous
+        charge_mode. Fires on transitions only - we don't spam the
+        select.select_option service every tick."""
+        new_active = bool(programme.ev_deferral_active)
+        if new_active == self._ev_deferral_active:
+            return  # no transition
+
+        zappi_entity = self._config.get(
+            "zappi_charge_mode_entity",
+            "select.myenergi_zappi_22752031_charge_mode",
+        )
+        if not zappi_entity:
+            self._ev_deferral_active = new_active
+            return
+
+        if new_active:
+            # Capture the current mode so we can restore on clear
+            current = self.hass.states.get(zappi_entity) if self.hass else None
+            self._zappi_pre_deferral_mode = (
+                current.state if current is not None else None
+            )
+            try:
+                await self.hass.services.async_call(
+                    "select", "select_option",
+                    {"entity_id": zappi_entity, "option": "Stopped"},
+                    blocking=False,
+                )
+                logger.warning(
+                    "EVDeferral: zappi -> Stopped (was %s); "
+                    "battery exporting at peak",
+                    self._zappi_pre_deferral_mode,
+                )
+            except Exception:
+                logger.exception(
+                    "EVDeferral: zappi Stopped service-call failed",
+                )
+        else:
+            # Restore the captured mode (or fall back to Eco+)
+            restore_to = self._zappi_pre_deferral_mode or "Eco+"
+            try:
+                await self.hass.services.async_call(
+                    "select", "select_option",
+                    {"entity_id": zappi_entity, "option": restore_to},
+                    blocking=False,
+                )
+                logger.warning(
+                    "EVDeferral: cleared; zappi restored to %s", restore_to,
+                )
+            except Exception:
+                logger.exception(
+                    "EVDeferral: zappi restore service-call failed",
+                )
+            self._zappi_pre_deferral_mode = None
+
+        self._ev_deferral_active = new_active
 
     def _read_planned_dispatches(self, entity_id: str) -> list:
         """HEO-8: read `planned_dispatches` from the BottlecapDave IGO
@@ -1145,6 +1235,12 @@ class HEO2Coordinator(DataUpdateCoordinator):
             eps_active=self._eps_active,
         )
         return reason
+
+    @property
+    def ev_deferral_active(self) -> bool:
+        """SPEC §12: True when the EV charge is currently being held
+        off so the battery can export at peak."""
+        return self._ev_deferral_active
 
     @property
     def eps_active(self) -> bool:
