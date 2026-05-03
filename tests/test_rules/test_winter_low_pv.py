@@ -56,35 +56,36 @@ class TestWinterLowPVRule:
         assert result.slots[0].capacity_soc == 100  # overnight
         assert result.slots[4].capacity_soc == 100  # late-night
 
-    def test_active_raises_non_gc_floor_to_day_load(self, default_inputs):
-        """Non-GC slots get a floor sized for the day's load demand."""
-        default_inputs.solar_forecast_kwh = [0.5] * 24  # 12 kWh
-        default_inputs.load_forecast_kwh = [1.0] * 24   # 24 kWh, full day
+    def test_active_does_not_touch_non_gc_slots(self, default_inputs):
+        """Regression for 2026-05-03: pre-fix the rule raised every
+        non-GC slot's cap to a day-load-sized floor (often 100). That
+        pinned the battery at 100% through the evening and the grid
+        carried all load. Now the rule deliberately skips non-GC slots
+        - EveningProtectRule handles the evening reserve floor."""
+        default_inputs.solar_forecast_kwh = [0.5] * 24
+        default_inputs.load_forecast_kwh = [1.0] * 24
         default_inputs.is_winter_low_pv = True
-        default_inputs.battery_capacity_kwh = 20.0
-        # Day floor = min_soc(20) + (24 / 20 * 100) = 20 + 120 = clamped to 100
         prog = _spec_programme()
+        evening_drain_cap_before = prog.slots[2].capacity_soc  # 18:30-23:30 cap=10
         result = WinterLowPVRule().apply(prog, default_inputs)
-        for i, slot in enumerate(result.slots):
-            if not slot.grid_charge:
-                assert slot.capacity_soc >= 20, (
-                    f"slot {i + 1} non-GC floor not raised: "
-                    f"{slot.capacity_soc}"
-                )
+        # Evening drain slot stays at 10 - WinterLowPV no longer
+        # raises it. The battery is free to discharge through evening.
+        assert result.slots[2].capacity_soc == evening_drain_cap_before
 
-    def test_active_does_not_lower_existing_high_soc(self, default_inputs):
-        """The rule only raises floors, never lowers them."""
-        # Pick light load so day_floor is low, then verify a slot
-        # already above that floor stays put.
-        default_inputs.solar_forecast_kwh = [0.5] * 24  # 12 kWh
-        default_inputs.load_forecast_kwh = [0.1] * 24   # 2.4 kWh
+    def test_active_does_not_change_already_complete_overnight(
+        self, default_inputs,
+    ):
+        """If overnight slots are already at 100, rule logs no-change."""
+        default_inputs.solar_forecast_kwh = [0.5] * 24
+        default_inputs.load_forecast_kwh = [1.0] * 24
         default_inputs.is_winter_low_pv = True
-        default_inputs.battery_capacity_kwh = 20.0
-        # day_floor = 20 + (2.4/20*100) = 32
         prog = _spec_programme()
-        prog.slots[2].capacity_soc = 75  # already above day_floor=32
+        for s in prog.slots:
+            if s.grid_charge:
+                s.capacity_soc = 100
         result = WinterLowPVRule().apply(prog, default_inputs)
-        assert result.slots[2].capacity_soc == 75
+        assert all(s.capacity_soc == 100 for s in result.slots if s.grid_charge)
+        assert any("already at 100%" in r for r in result.reason_log)
 
     def test_reason_log_records_changes(self, default_inputs):
         default_inputs.solar_forecast_kwh = [0.5] * 24
