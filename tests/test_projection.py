@@ -179,6 +179,69 @@ class TestProjectDay:
         assert p.peak_import_kwh == pytest.approx(p.imports_kwh, abs=0.5)
         assert p.peak_import_kwh > 20.0
 
+    def test_horizon_crossing_midnight_uses_tomorrow_solar_array(self):
+        """Daily plan at 18:00 projects 24h forward, ending 18:00
+        tomorrow. The morning portion (00:00-18:00 tomorrow) must
+        read from `solar_forecast_kwh_tomorrow`. Pre-fix the projection
+        wrapped today's array (so today's overnight-zero solar was
+        attributed to tomorrow morning), making the projection too
+        pessimistic about tomorrow's potential."""
+        from zoneinfo import ZoneInfo
+        # Plan with cap=10 (drain) all day so the battery hits floor
+        # and tomorrow's solar matters - it's the only thing that
+        # can keep SOC off the floor and avoid grid imports.
+        prog = ProgrammeState(slots=[
+            _slot(0, 0, 5, 30, 10, False),
+            _slot(5, 30, 18, 30, 10, False),
+            _slot(18, 30, 23, 30, 10, False),
+            _slot(23, 30, 23, 55, 10, False),
+            _slot(23, 55, 23, 55, 10, False),
+            _slot(23, 55, 0, 0, 10, False),
+        ])
+        london = ZoneInfo("Europe/London")
+        # 18:00 BST = 17:00 UTC daily-plan run
+        now = datetime(2026, 5, 1, 17, 0, tzinfo=timezone.utc)
+        tomorrow_solar = [0.0] * 24
+        # Heavy morning generation: 8 kWh/h for 6 hours = 48 kWh
+        for h in range(8, 14):
+            tomorrow_solar[h] = 8.0
+        inputs = ProgrammeInputs(
+            now=now,
+            current_soc=10.0,  # start at floor so any deficit imports
+            battery_capacity_kwh=20.0,
+            min_soc=10.0,
+            import_rates=[],
+            export_rates=[],
+            solar_forecast_kwh=[0.0] * 24,
+            load_forecast_kwh=[1.0] * 24,
+            igo_dispatching=False,
+            saving_session=False,
+            saving_session_start=None,
+            saving_session_end=None,
+            ev_charging=False,
+            grid_connected=True,
+            active_appliances=[],
+            appliance_expected_kwh=0.0,
+            solar_forecast_kwh_tomorrow=tomorrow_solar,
+            local_tz=london,
+        )
+        p_with = project_day(
+            prog, inputs, battery_capacity_kwh=20.0, tz=london,
+        )
+        # Re-run without tomorrow's forecast - projection should wrap
+        # today's zero-solar array and import every load step.
+        inputs2 = ProgrammeInputs(
+            **{**inputs.__dict__, "solar_forecast_kwh_tomorrow": []}
+        )
+        p_without = project_day(
+            prog, inputs2, battery_capacity_kwh=20.0, tz=london,
+        )
+        # Tomorrow's PV should reduce imports vs. no-tomorrow forecast.
+        assert p_with.imports_kwh < p_without.imports_kwh, (
+            f"with tomorrow PV: {p_with.imports_kwh:.2f}; "
+            f"without: {p_without.imports_kwh:.2f}"
+        )
+
     def test_planned_dispatch_overrides_published_rate_to_off_peak(self):
         """Octopus retroactively bills any import inside a smart-charge
         dispatch at the IGO off-peak rate, regardless of what the
