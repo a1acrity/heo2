@@ -102,26 +102,47 @@ When trade-offs arise, decisions follow this order:
 4. **Recover PV investment as fast as possible** - within 1-3 above
 5. **Saving Sessions** - drain to min_soc as quickly as inverter allows. £3+/kWh windows.
 
-## 5a. Rank-based pricing (replaces fixed thresholds)
+## 5a. Pricing model
 
-Both selling and cheap-rate charging use **rank within today's published rates** rather than fixed pence thresholds. This adapts automatically to:
-- Day-to-day variation in Agile prices
-- Seasonal differences (winter vs summer rate distributions)
-- Tariff changes without code edits
+### Two complementary tests for "should we sell?"
 
-### Selling (export decision)
+A window is "worth selling in" if BOTH of these are true:
+
+**Test 1 -- absolute break-even** (principled, derived from physics):
+
+```
+export_rate * round_trip_efficiency > replacement_cost
+```
+
+`round_trip_efficiency` = `charge_efficiency * discharge_efficiency`
+≈ 0.95 × 0.95 = 0.9025 (Sunsynk-grade hybrid inverter, AC->DC->battery
+->DC->AC). `replacement_cost` is the cheapest rate at which we can
+re-fill the battery, typically the IGO off-peak rate (4.95p).
+
+So the break-even export rate is **`replacement_cost / round_trip_efficiency`**:
+4.95p / 0.9025 ≈ **5.49p**. Below that, every kWh exported costs more
+to put back than we get for it. The original 6-7p figure tracked this
+maths plus a small degradation premium for cycle wear. This threshold
+is principled, not arbitrary.
+
+**Test 2 -- rank within today's prices** (selectivity):
 
 ```
 top_export_windows = top N% of export_rates_today by p/kWh
-where N is calibrated by available battery surplus:
-  - High SOC + high tomorrow forecast: N = 50% (sell aggressively)
-  - Medium SOC: N = 30%
-  - Low SOC OR low tomorrow forecast: N = 15% (only the very best)
+where N is calibrated by SOC + tomorrow's PV forecast:
+  - High SOC + high tomorrow forecast: N = 50% (we have surplus, sell aggressively)
+  - Medium SOC:                          N = 30%
+  - Low SOC OR low tomorrow forecast:    N = 15% (only the very best)
 ```
 
-A window is "worth selling in" if it's in `top_export_windows` AND
-`export_rate * round_trip_efficiency > replacement_cost` where
-replacement_cost = next available IGO off-peak rate (typically 4.95p).
+This second test stops us from selling at every "above break-even"
+window when better windows exist later in the day. Without it, a
+9p slot at 13:00 would trigger a sell even though a 19p slot at
+17:00 is hours away.
+
+A window must clear BOTH tests to actually drain. The break-even test
+keeps us from ever selling at a loss; the rank test keeps us from
+selling early-day when better afternoon windows are coming.
 
 ### Charging from grid (bridge-to-PV-takeover)
 
@@ -141,23 +162,17 @@ morning_bridge_kwh = sum max(0, load[h] - solar_tomorrow[h])
 ```
 
 Edge cases:
-- No tomorrow PV forecast -> default to filling battery (no signal).
-- PV never overtakes load (deep winter) -> sum the whole day's deficit;
+- No tomorrow PV forecast -> default to filling battery (no signal of
+  when PV would take over).
+- PV never overtakes load (overcast day) -> sum the whole day's deficit;
   target clamps to `max_target_soc`.
 - Tiny bridge (very early PV takeover) -> safety buffer keeps target a
   comfortable margin above min_soc to absorb forecast misses.
 
-This replaces the legacy SPEC §5a "demand + profitable export - solar"
+This replaces the previous "demand + profitable export - solar"
 formula, which over-charged when Octopus Outgoing peaks looked
 arbitrage-worthy and let the battery sit full while next-day solar was
 exporting at lower live rates.
-
-### Why rank not absolute
-
-A fixed 6p threshold is meaningless when winter Agile prices range 0.03p-17p
-(median ~5p, so 6p triggers half the time and you'd trade away your reserve)
-versus summer when 6p is the bottom of the distribution. Rank adapts
-without code changes.
 
 ## 6. Pre-write validation (H5 detail)
 
