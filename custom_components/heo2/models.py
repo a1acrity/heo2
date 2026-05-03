@@ -77,6 +77,13 @@ class ProgrammeState:
       energy_pattern: "Battery first" | "Load first"
       max_charge_a / max_discharge_a: 0..350 A (Sunsynk 5kW limit ~100A
         at 51.2V battery nominal)
+
+    `ev_deferral_active`: SPEC §12. True when the EVDeferralRule has
+    decided this tick that conditions are right to stop the EV charge
+    so battery exports can capture top export rates instead.
+    Coordinator translates the False -> True transition into a one-shot
+    `select.select_option` for the zappi charge_mode (Stopped),
+    capturing the previous mode for restore on True -> False.
     """
     slots: list[SlotConfig]
     reason_log: list[str] = field(default_factory=list)
@@ -84,6 +91,7 @@ class ProgrammeState:
     energy_pattern: Optional[str] = None
     max_charge_a: Optional[float] = None
     max_discharge_a: Optional[float] = None
+    ev_deferral_active: bool = False
 
     @classmethod
     def default(cls, min_soc: int = 20) -> ProgrammeState:
@@ -259,6 +267,17 @@ class ProgrammeInputs:
     # WinterLowPVRule raises overnight charge target and tightens the
     # export-window selectivity (preserve cycles for own use).
     is_winter_low_pv: bool = False
+    # SPEC §12 EV deferral: True when the user has flagged
+    # `switch.heo_ii_defer_ev_when_export_high` ON, indicating the car
+    # doesn't need to be charged for tomorrow and HEO II is free to
+    # halt the EV charge during top-export windows. When the rule
+    # fires it switches the inverter to Selling first and signals the
+    # coordinator to set the zappi charge_mode = Stopped.
+    defer_ev_eligible: bool = False
+    # Current export rate (p/kWh) at the moment of evaluation. The EV
+    # deferral rule uses this directly rather than walking export_rates,
+    # so the "ridiculous low export" fallback is one comparison.
+    current_export_rate_p: Optional[float] = None
 
     def now_local(self) -> datetime:
         """Return `now` projected into the local timezone if known.

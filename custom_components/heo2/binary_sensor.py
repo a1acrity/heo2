@@ -27,6 +27,7 @@ async def async_setup_entry(
         WritesBlockedSensor(coordinator, entry),
         EPSActiveSensor(coordinator, entry),
         CycleBudgetExceededSensor(coordinator, entry),
+        EVDeferralActiveSensor(coordinator, entry),
     ])
 
 
@@ -85,6 +86,24 @@ class EPSActiveSensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         return self.coordinator.eps_active
+
+
+class EVDeferralActiveSensor(CoordinatorEntity, BinarySensorEntity):
+    """SPEC §12 dashboard indicator. ON while HEO II has the zappi
+    charge halted so the battery can export at peak. Pairs with the
+    `switch.heo_ii_defer_ev_when_export_high` user toggle - the switch
+    is the user intent, this sensor is "is it actually happening right
+    now"."""
+    _attr_device_class = BinarySensorDeviceClass.RUNNING
+
+    def __init__(self, coordinator: HEO2Coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_ev_deferral_active"
+        self._attr_name = "HEO II EV Deferral Active"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.ev_deferral_active
 
 
 class CycleBudgetExceededSensor(CoordinatorEntity, BinarySensorEntity):
