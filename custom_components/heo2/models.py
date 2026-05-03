@@ -234,6 +234,10 @@ class ProgrammeInputs:
     # such and stays a no-op. Defaults preserve backward compatibility
     # with tests built before HEO-8.
     planned_dispatches: list["PlannedDispatch"] = field(default_factory=list)
+    # SPEC §9 / H3 EPS mode: True when grid is down and the inverter
+    # is supplying via EPS. Drives EPSModeRule (cap=0% / no GC) and
+    # writes_blocked H3. Defaults False so existing tests pre-EPS pass.
+    eps_active: bool = False
 
     def now_local(self) -> datetime:
         """Return `now` projected into the local timezone if known.

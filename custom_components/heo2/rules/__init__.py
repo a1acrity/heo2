@@ -12,17 +12,18 @@ from .evening_protect import EveningProtectRule
 from .igo_dispatch import IGODispatchRule
 from .ev_charging import EVChargingRule
 from .saving_session import SavingSessionRule
+from .eps_mode import EPSModeRule
 from .safety import SafetyRule
 
 
 def default_rules() -> list[Rule]:
-    """Return the 9 default rules in priority order.
+    """Return the 10 default rules in priority order.
 
-    SafetyRule is always last and cannot be disabled. SavingSessionRule
-    sits AFTER ExportWindowRule + EveningProtectRule so an active
-    session always wins over a normal export window or evening floor:
-    SPEC §9 says drain to min_soc regardless of the standard Agile
-    threshold or evening reserve.
+    SafetyRule is always last and cannot be disabled. EPSModeRule sits
+    JUST before SafetyRule because it must override every other rule's
+    decisions (SPEC H3: drop SOC floor to 0% during grid loss). It
+    can't go after SafetyRule because SafetyRule would re-clamp SOC
+    back to min_soc.
     """
     return [
         BaselineRule(),
@@ -33,5 +34,6 @@ def default_rules() -> list[Rule]:
         SavingSessionRule(),
         IGODispatchRule(),
         EVChargingRule(),
+        EPSModeRule(),
         SafetyRule(),
     ]

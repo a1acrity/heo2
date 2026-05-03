@@ -155,6 +155,46 @@ class TestComputeWritesBlocked:
         assert blocked is True
         assert "H6" in reason
 
+    def test_eps_active_blocks_with_h3_prefix(self):
+        """SPEC H3: writes suppressed when EPS / power failure active."""
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            eps_active=True,
+        )
+        assert blocked is True
+        assert "H3" in reason and "EPS" in reason
+
+    def test_dry_run_takes_precedence_over_eps(self):
+        blocked, reason = _compute_writes_blocked(
+            dry_run=True,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            eps_active=True,
+        )
+        assert blocked is True
+        assert "dry_run" in reason
+        assert "H3" not in reason
+
+    def test_eps_takes_precedence_over_h4(self):
+        blocked, reason = _compute_writes_blocked(
+            dry_run=False,
+            writer_constructed=True,
+            transport_exists=True,
+            transport_connected=True,
+            host="192.168.4.7",
+            live_rates_present=False,
+            eps_active=True,
+        )
+        assert blocked is True
+        assert "H3" in reason
+        assert "H4" not in reason
+
     def test_h4_takes_precedence_over_h5(self):
         """If we never had live rates we can't have a valid plan; the
         H4 reason is the more useful one to report."""

@@ -54,7 +54,12 @@ class SafetyRule(Rule):
         pass  # cannot be disabled
 
     def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
-        min_soc = int(inputs.min_soc)
+        # SPEC H3: under EPS, the configured min_soc floor is overridden
+        # to 0 - the user wants the inverter to discharge the battery
+        # all the way to keep the house running. Use 0 as the effective
+        # floor so the SOC clamp below doesn't undo EPSModeRule's
+        # cap=0% setting.
+        min_soc = 0 if inputs.eps_active else int(inputs.min_soc)
         fixes: list[str] = []
         snaps: list[str] = []  # 5-min granularity snaps surfaced separately
 

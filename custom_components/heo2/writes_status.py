@@ -20,6 +20,7 @@ def _compute_writes_blocked(
     live_rates_present: bool = True,
     plan_rejected_reason: str | None = None,
     verify_mismatch_reason: str | None = None,
+    eps_active: bool = False,
 ) -> tuple[bool, str]:
     """Determine if writes are currently blocked and why.
 
@@ -31,12 +32,15 @@ def _compute_writes_blocked(
       1. dry_run takes precedence over everything else - it's an
          intentional user choice; reporting any other reason would be
          misleading.
-      2. Transport readiness comes next so early-startup state is
+      2. EPS / power failure (SPEC H3) - the inverter is busy supplying
+         the house from EPS, MQTT writes go nowhere or worse, mess up
+         the recovery sequence. Suppress writes hard.
+      3. Transport readiness comes next so early-startup state is
          described accurately.
-      3. SPEC H4 (live-prices-only writes) is checked before plan-level
+      4. SPEC H4 (live-prices-only writes) is checked before plan-level
          issues: if rates aren't live the plan content is moot.
-      4. Plan rejection from the H5 pre-write validator.
-      5. Post-write verification mismatch from H6.
+      5. Plan rejection from the H5 pre-write validator.
+      6. Post-write verification mismatch from H6.
 
     Plan rejection / verify mismatch reasons are passed in by the
     coordinator; they default to None so existing callers stay
@@ -44,6 +48,8 @@ def _compute_writes_blocked(
     """
     if dry_run:
         return True, "dry_run enabled"
+    if eps_active:
+        return True, "H3: EPS active (grid down) - writes suppressed"
     if not writer_constructed or not transport_exists:
         return True, "MQTT writer not yet initialised"
     if not transport_connected:

@@ -25,6 +25,7 @@ async def async_setup_entry(
     async_add_entities([
         HealthySensor(coordinator, entry),
         WritesBlockedSensor(coordinator, entry),
+        EPSActiveSensor(coordinator, entry),
     ])
 
 
@@ -65,3 +66,21 @@ class WritesBlockedSensor(CoordinatorEntity, BinarySensorEntity):
         return {
             "reason": self.coordinator.writes_blocked_reason or "writes enabled",
         }
+
+
+class EPSActiveSensor(CoordinatorEntity, BinarySensorEntity):
+    """SPEC §9 / H3 dashboard banner: ON when the grid is down and the
+    inverter is supplying the house from EPS / battery. While active:
+    SOC floor relaxes to 0%, EV/washer/dryer/dishwasher get
+    switch.turn_off, MQTT writes are suppressed.
+    """
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coordinator: HEO2Coordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_eps_active"
+        self._attr_name = "HEO II EPS Active"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.eps_active
