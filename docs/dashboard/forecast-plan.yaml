@@ -38,6 +38,18 @@ cards:
         color: "#ef4444"
         stroke_width: 2
         stroke_dash: 4
+      # Live actuals overlaid on the forecast for visual comparison
+      # of "did the day go as predicted?"
+      - entity: sensor.sa_inverter_1_pv_power
+        name: Actual PV (W)
+        type: line
+        color: "#f59e0b"
+        stroke_width: 2
+      - entity: sensor.deye_sunsynk_sol_ark_load_power
+        name: Actual load (W)
+        type: line
+        color: "#ef4444"
+        stroke_width: 2
 
   # SOC trajectory chart. trajectory[h] is the projected SOC AT
   # clock hour h LOCAL time. Past hours are flat-filled with
@@ -74,10 +86,17 @@ cards:
             const d = new Date(base.getTime() + i * 3600 * 1000);
             return [d.getTime(), val];
           });
-        name: SOC (%)
+        name: Planned SOC (%)
         type: line
         color: "#14b8a6"
         stroke_width: 3
+      # Live battery SOC overlaid against the plan. Drift between the
+      # cyan and teal lines is "we are off-plan".
+      - entity: sensor.sa_total_battery_state_of_charge
+        name: Actual SOC (%)
+        type: line
+        color: "#0ea5e9"
+        stroke_width: 2
       - entity: sensor.heo2_programme_slots
         data_generator: |
           const slots = entity.attributes.slots || [];
@@ -144,6 +163,39 @@ cards:
       - name: Grid Charge
         data: slots
         modify: "x.grid_charge ? '✅' : '❌'"
+
+  # Today vs Plan summary - actual vs forecast at a glance.
+  # Battery drift colour: green<5%, amber<15%, red beyond.
+  - type: entities
+    title: Today vs Plan
+    entities:
+      - type: custom:mushroom-template-card
+        primary: Plan vs reality
+        secondary: >-
+          Battery {{ states('sensor.sa_total_battery_state_of_charge') }}%
+          vs plan
+          {% set traj = state_attr('sensor.heo_ii_soc_trajectory', 'trajectory') %}
+          {% if traj %}{{ traj[now().hour] | round(0) }}%
+          (drift {{ (states('sensor.sa_total_battery_state_of_charge') | int
+          - traj[now().hour]) | round(0) }}%){% else %}-{% endif %}
+        icon: mdi:battery-sync
+        icon_color: >-
+          {% set traj = state_attr('sensor.heo_ii_soc_trajectory', 'trajectory') %}
+          {% if traj %}
+          {% set drift = ((states('sensor.sa_total_battery_state_of_charge') | int)
+          - (traj[now().hour] | int)) | abs %}
+          {% if drift < 5 %}green{% elif drift < 15 %}orange{% else %}red{% endif %}
+          {% else %}grey{% endif %}
+        fill_container: true
+        multiline_secondary: true
+      - entity: sensor.heo_ii_projection_today
+        name: Forecast result
+      - entity: sensor.heo_ii_daily_import_cost
+        name: "Actual import £"
+      - entity: sensor.heo_ii_daily_export_revenue
+        name: "Actual export £"
+      - entity: sensor.heo_ii_daily_solar_value
+        name: "Actual solar value £"
 
   # Info chips
   - type: horizontal-stack
