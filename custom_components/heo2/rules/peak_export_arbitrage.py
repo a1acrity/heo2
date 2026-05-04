@@ -43,6 +43,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from ..models import ProgrammeInputs, ProgrammeState, RateSlot
+from ..rank_pricing import next_cheap_window_start_local
 from ..rule_engine import Rule
 
 
@@ -64,33 +65,44 @@ class PeakExportArbitrageRule(Rule):
     def __init__(
         self,
         *,
-        cheap_window_start: time = time(23, 30),
+        cheap_window_start_fallback: time = time(23, 30),
         max_discharge_kw: float = 5.0,
         battery_voltage_nominal: float = 51.2,
         max_discharge_a_default: float = 100.0,
     ):
-        self.cheap_window_start = cheap_window_start
+        self.cheap_window_start_fallback = cheap_window_start_fallback
         self.max_discharge_kw = max_discharge_kw
         self.battery_voltage_nominal = battery_voltage_nominal
         self.max_discharge_a_default = max_discharge_a_default
 
     # --- helpers ---------------------------------------------------
 
-    def _hours_until_cheap(
-        self, now_local: datetime,
-    ) -> tuple[datetime, float]:
-        """Return the (datetime, hours) of the next cheap-window
-        start. Wraps to tomorrow if today's cheap window already
-        started before `now`."""
+    def _resolve_cheap_window_start(
+        self,
+        now_local: datetime,
+        import_rates: list[RateSlot],
+        tz: ZoneInfo | None,
+    ) -> datetime:
+        """Pick the start of the next cheap import window.
+
+        Prefer rate-derived (bottom-25% of upcoming import rates) so
+        Saving Sessions, non-standard IGO blocks, or any tariff change
+        flows through automatically. Fall back to the hardcoded time
+        only when no import rates are loaded.
+        """
+        from_rates = next_cheap_window_start_local(
+            import_rates, now_local, tz,
+        )
+        if from_rates is not None:
+            return from_rates
         cheap_start = now_local.replace(
-            hour=self.cheap_window_start.hour,
-            minute=self.cheap_window_start.minute,
+            hour=self.cheap_window_start_fallback.hour,
+            minute=self.cheap_window_start_fallback.minute,
             second=0, microsecond=0,
         )
         if cheap_start <= now_local:
             cheap_start += timedelta(days=1)
-        hours = (cheap_start - now_local).total_seconds() / 3600.0
-        return cheap_start, hours
+        return cheap_start
 
     def _sum_forecast_until(
         self,
@@ -157,7 +169,9 @@ class PeakExportArbitrageRule(Rule):
 
         tz = inputs.local_tz
         now_local = inputs.now_local()
-        cheap_start, hours_to_cheap = self._hours_until_cheap(now_local)
+        cheap_start = self._resolve_cheap_window_start(
+            now_local, inputs.import_rates, tz,
+        )
 
         future_slots = self._today_remaining_export_slots(
             inputs.export_rates, now_local, cheap_start, tz,
@@ -179,10 +193,11 @@ class PeakExportArbitrageRule(Rule):
         )
 
         spare_kwh = usable_kwh - load_to_cheap + pv_remaining
+        cheap_str = cheap_start.strftime("%H:%M")
         if spare_kwh <= 0.05:
             state.reason_log.append(
                 f"PeakArbitrage: no spare to sell "
-                f"(usable {usable_kwh:.2f} kWh - load_to_2330 "
+                f"(usable {usable_kwh:.2f} kWh - load_to_{cheap_str} "
                 f"{load_to_cheap:.2f} + pv_remaining "
                 f"{pv_remaining:.2f} = {spare_kwh:.2f} kWh)"
             )

@@ -212,3 +212,100 @@ def select_cheap_charge_windows(
     it generalises naturally.
     """
     return bottom_n_pct(import_rates_today, n_pct)
+
+
+def next_cheap_window_start_local(
+    import_rates: list[RateSlot],
+    now_local: datetime,
+    tz=None,
+    n_pct: int | float = 25,
+) -> datetime | None:
+    """Return the LOCAL datetime at which the next cheap import window
+    starts, or None if no upcoming rates are loaded.
+
+    "Cheap" = bottom-N% of upcoming import rates. The earliest start
+    among that cohort is the answer. Picking the earliest (rather than
+    the lowest-priced) handles the IGO case where 23:30-05:30 is one
+    contiguous off-peak run: any 30-min slot in that block belongs to
+    the cheap cohort, and we want the FIRST one as the bridge horizon.
+
+    Used to replace hardcoded 23:30 cheap-window assumptions across
+    rules. Adapts to Saving Sessions, IGO bonus dispatches, and any
+    non-standard cheap slot Octopus publishes.
+    """
+    if not import_rates:
+        return None
+    future: list[tuple[datetime, RateSlot]] = []
+    for r in import_rates:
+        start_local = (
+            r.start.astimezone(tz)
+            if tz is not None and r.start.tzinfo is not None
+            else r.start
+        )
+        if start_local > now_local:
+            future.append((start_local, r))
+    if not future:
+        return None
+    cohort = bottom_n_pct([r for _, r in future], n_pct)
+    if not cohort:
+        return None
+    cohort_ids = {id(r) for r in cohort}
+    return min(s for s, r in future if id(r) in cohort_ids)
+
+
+def next_cheap_window_end_local(
+    import_rates: list[RateSlot],
+    now_local: datetime,
+    tz=None,
+    n_pct: int | float = 25,
+) -> datetime | None:
+    """Return the LOCAL datetime at which the next cheap import window
+    ENDS, or None if no upcoming rates are loaded.
+
+    Walks the bottom-N% cohort starting from the earliest cheap slot
+    (per `next_cheap_window_start_local`) and extends as long as
+    consecutive slots in that cohort abut. The end of the last
+    contiguous cheap slot is returned.
+
+    Used by CheapRateChargeRule to anchor the morning-bridge calc:
+    SOC must reach `target_soc` by this time; from here forward the
+    battery deplets until PV takeover.
+    """
+    if not import_rates:
+        return None
+    future: list[tuple[datetime, datetime, RateSlot]] = []
+    for r in import_rates:
+        start_local = (
+            r.start.astimezone(tz)
+            if tz is not None and r.start.tzinfo is not None
+            else r.start
+        )
+        end_local = (
+            r.end.astimezone(tz)
+            if tz is not None and r.end.tzinfo is not None
+            else r.end
+        )
+        if start_local > now_local:
+            future.append((start_local, end_local, r))
+    if not future:
+        return None
+    cohort = bottom_n_pct([t[2] for t in future], n_pct)
+    if not cohort:
+        return None
+    cohort_ids = {id(r) for r in cohort}
+    future.sort(key=lambda t: t[0])
+    first_idx = next(
+        (i for i, (_, _, r) in enumerate(future) if id(r) in cohort_ids),
+        None,
+    )
+    if first_idx is None:
+        return None
+    end_local = future[first_idx][1]
+    for i in range(first_idx + 1, len(future)):
+        s, e, r = future[i]
+        if id(r) not in cohort_ids:
+            break
+        if s != end_local:
+            break
+        end_local = e
+    return end_local

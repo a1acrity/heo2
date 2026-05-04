@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..models import ProgrammeInputs, ProgrammeState
+from ..rank_pricing import next_cheap_window_end_local
 from ..rule_engine import Rule
 
 
@@ -52,11 +53,11 @@ class CheapRateChargeRule(Rule):
         self,
         max_target_soc: int = 100,
         *,
-        cheap_window_end_hour: int = 5,  # IGO off-peak ends 05:30; we use whole hour 5
+        cheap_window_end_hour_fallback: int = 5,  # IGO off-peak ends 05:30; we use whole hour 5
         safety_buffer_pct: int = 10,
     ):
         self.max_target_soc = max_target_soc
-        self.cheap_window_end_hour = cheap_window_end_hour
+        self.cheap_window_end_hour_fallback = cheap_window_end_hour_fallback
         self.safety_buffer_pct = safety_buffer_pct
 
     def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
@@ -65,6 +66,17 @@ class CheapRateChargeRule(Rule):
         # battery completely.
         tomorrow_solar = inputs.solar_forecast_kwh_tomorrow
         load = inputs.load_forecast_kwh
+
+        # Prefer rate-derived cheap-window end (the contiguous bottom-25%
+        # block from import_rates). Falls back to the hardcoded hour
+        # only when no rates are loaded (early boot, BD outage).
+        end_dt = next_cheap_window_end_local(
+            inputs.import_rates, inputs.now_local(), inputs.local_tz,
+        )
+        cheap_end_hour = (
+            end_dt.hour if end_dt is not None
+            else self.cheap_window_end_hour_fallback
+        )
 
         if not tomorrow_solar or len(tomorrow_solar) < 24:
             target_soc = self.max_target_soc
@@ -78,14 +90,14 @@ class CheapRateChargeRule(Rule):
             # overtakes load at the "PV takeover" hour.
             bridge_kwh = 0.0
             takeover_hour: int | None = None
-            for h in range(self.cheap_window_end_hour, 24):
+            for h in range(cheap_end_hour, 24):
                 solar = tomorrow_solar[h]
                 load_h = load[h]
-                if solar >= load_h and h > self.cheap_window_end_hour:
+                if solar >= load_h and h > cheap_end_hour:
                     # First hour where PV covers load - we're done
-                    # bridging. The `h > cheap_window_end_hour` guard
-                    # avoids declaring takeover at the literal start
-                    # hour when both happen to be ~0 (pre-dawn).
+                    # bridging. The `h > cheap_end_hour` guard avoids
+                    # declaring takeover at the literal start hour when
+                    # both happen to be ~0 (pre-dawn).
                     takeover_hour = h
                     break
                 bridge_kwh += max(0.0, load_h - solar)
@@ -109,7 +121,7 @@ class CheapRateChargeRule(Rule):
                 reason = (
                     f"target {target_soc}% bridges "
                     f"{bridge_kwh:.1f} kWh from "
-                    f"{self.cheap_window_end_hour:02d}:00 to PV takeover "
+                    f"{cheap_end_hour:02d}:00 to PV takeover "
                     f"at {takeover_hour:02d}:00 "
                     f"(+{self.safety_buffer_pct}% safety buffer)"
                 )

@@ -52,6 +52,7 @@ def _inputs(
     capacity: float = 20.0,
     min_soc: float = 10.0,
     export_rates: list[RateSlot] | None = None,
+    import_rates: list[RateSlot] | None = None,
     load_24: list[float] | None = None,
     solar_24: list[float] | None = None,
 ):
@@ -62,7 +63,7 @@ def _inputs(
         current_soc=current_soc,
         battery_capacity_kwh=capacity,
         min_soc=min_soc,
-        import_rates=[],
+        import_rates=import_rates or [],
         export_rates=export_rates or [],
         solar_forecast_kwh=solar_24 or [0.0] * 24,
         load_forecast_kwh=load_24 or [0.5] * 24,
@@ -199,3 +200,52 @@ class TestPeakExportArbitrageRule:
         )
         # With PV the throttle amp should be higher (more to sell)
         assert (r_yes.max_discharge_a or 0) > (r_no.max_discharge_a or 0)
+
+    def test_cheap_window_horizon_uses_import_rates(self):
+        """When import_rates show a cheap block starting at 22:00 (e.g.
+        a Saving Session shifts the cheap window earlier), spare maths
+        should use 22:00 - not the hardcoded 23:30 - as the horizon.
+
+        Setup chosen so both spare values fall under the per-slot cap
+        (2.5 kWh = max_discharge_kw * 0.5h), so the difference in
+        horizon is visible in the throttle amps. capacity=10 kWh,
+        current 40%, min_soc 10%, usable=3 kWh; load=0.4 kWh/h.
+          - cheap=22:00: load_to_cheap = 4h * 0.4 = 1.6, spare = 1.4
+          - cheap=23:30: load_to_cheap = 5.5h * 0.4 = 2.2, spare = 0.8
+        Both fire; amps differ (cheap-22 is higher).
+        """
+        today = datetime(2026, 5, 4, 18, 0, tzinfo=_LON)
+        export_rates = [_half_hour_rate(today, 18, 0, 25.0)]
+        # Import rates: peak 16-22 expensive, 22-04 cheap (shifted from
+        # standard IGO 23:30-05:30 by say a Saving Session arrangement).
+        cheap_p, peak_p = 5.0, 30.0
+        import_rates = []
+        for h in [16, 17, 18, 19, 20, 21]:
+            import_rates.append(_half_hour_rate(today, h, 0, peak_p))
+            import_rates.append(_half_hour_rate(today, h, 30, peak_p))
+        for h in [22, 23]:
+            import_rates.append(_half_hour_rate(today, h, 0, cheap_p))
+            import_rates.append(_half_hour_rate(today, h, 30, cheap_p))
+
+        with_imports = _inputs(
+            now_local=today, current_soc=40.0, capacity=10.0, min_soc=10.0,
+            export_rates=export_rates, import_rates=import_rates,
+            load_24=[0.4] * 24,
+        )
+        without_imports = _inputs(
+            now_local=today, current_soc=40.0, capacity=10.0, min_soc=10.0,
+            export_rates=export_rates, load_24=[0.4] * 24,
+        )
+        r_with = PeakExportArbitrageRule().apply(
+            _empty_programme(), with_imports,
+        )
+        r_without = PeakExportArbitrageRule().apply(
+            _empty_programme(), without_imports,
+        )
+        # Both should fire (active in 18:00 slot, spare available)
+        assert r_with.work_mode == "Selling first"
+        assert r_without.work_mode == "Selling first"
+        # With import_rates the cheap horizon is 22:00 (4h away) not
+        # 23:30 (5.5h away), so less load to cover, more spare, higher
+        # discharge rate.
+        assert r_with.max_discharge_a > r_without.max_discharge_a
