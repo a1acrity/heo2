@@ -164,6 +164,63 @@ cards:
         data: slots
         modify: "x.grid_charge ? '✅' : '❌'"
 
+  # Slot timeline: Gantt-style ribbon showing the 6 programme slots
+  # spanning 00:00-24:00. Each segment shows the SOC target and GC
+  # marker so you can see at a glance which slots charge from grid.
+  - type: custom:apexcharts-card
+    header:
+      title: Slot Timeline (today)
+      show: true
+    graph_span: 24h
+    span:
+      start: day
+    apex_config:
+      chart:
+        type: rangeBar
+        height: 200
+      plotOptions:
+        bar:
+          horizontal: true
+          barHeight: 80%
+      xaxis:
+        type: datetime
+        labels:
+          datetimeFormatter:
+            hour: HH:mm
+      yaxis:
+        show: false
+      legend:
+        show: false
+    series:
+      - entity: sensor.heo_ii_programme_slots
+        name: Slot
+        type: rangeBar
+        data_generator: |
+          const slots = entity.attributes.slots || [];
+          const base = new Date();
+          base.setHours(0, 0, 0, 0);
+          return slots.map((s) => {
+            const [sh, sm] = s.start.split(':').map(Number);
+            const [eh, em] = s.end.split(':').map(Number);
+            let startMs = base.getTime() + (sh * 60 + sm) * 60000;
+            let endMs = base.getTime() + (eh * 60 + em) * 60000;
+            if (endMs <= startMs) endMs += 86400000;
+            return [startMs, endMs];
+          });
+        color: "#14b8a6"
+
+  # Plan justification: dump the rule engine's reason_log so the user
+  # can see WHY each slot's settings were chosen. Refreshed each tick
+  # via templating - no extra sensor required.
+  - type: markdown
+    title: Plan justification (latest tick)
+    content: |
+      {% set reasons = state_attr('sensor.heo_ii_last_run', 'reason_log') or [] %}
+      {% if not reasons %}_No reasoning yet._{% endif %}
+      {% for r in reasons %}
+      - {{ r }}
+      {% endfor %}
+
   # Today vs Plan summary - actual vs forecast at a glance.
   # Battery drift colour: green<5%, amber<15%, red beyond.
   - type: entities
