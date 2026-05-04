@@ -162,6 +162,31 @@ class ExportWindowRule(Rule):
                 slot.capacity_soc = drain_target
                 modified = True
 
+        # Critical: setting slot.capacity_soc=10 alone doesn't make
+        # the inverter EXPORT - it just authorises the battery to
+        # drain. With BaselineRule's default work_mode="Zero export to
+        # CT", the inverter only discharges to cover house load and
+        # never sells surplus to the grid. To actually capture peak
+        # export rates, flip work_mode to "Selling first" while we're
+        # currently INSIDE a worth-selling window. Outside the window
+        # we leave the default (BaselineRule sets it back next tick).
+        local_now = inputs.now_local().time()
+        currently_in_export_window = any(
+            (
+                (r.start.astimezone(tz).time()
+                 if tz is not None and r.start.tzinfo is not None
+                 else r.start.time())
+                <= local_now
+                <
+                (r.end.astimezone(tz).time()
+                 if tz is not None and r.end.tzinfo is not None
+                 else r.end.time())
+            )
+            for r in worth_windows
+        )
+        if currently_in_export_window:
+            state.work_mode = "Selling first"
+
         sorted_hours = sorted(worth_hours)
         rate_summary = (
             f"{worth_windows[0].rate_pence:.2f}-"
@@ -176,6 +201,10 @@ class ExportWindowRule(Rule):
                 f"{len(worth_windows)} slots @ {rate_summary} "
                 f"covering hours {sorted_hours} "
                 f"(evening floor from {evening_demand_kwh:.1f} kWh demand)"
+                + (
+                    "; work_mode -> Selling first (in export window now)"
+                    if currently_in_export_window else ""
+                )
             )
         else:
             state.reason_log.append(
