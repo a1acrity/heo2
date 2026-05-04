@@ -164,50 +164,18 @@ cards:
         data: slots
         modify: "x.grid_charge ? '✅' : '❌'"
 
-  # Slot timeline: Gantt-style ribbon showing the 6 programme slots
-  # spanning 00:00-24:00. Each segment shows the SOC target and GC
-  # marker so you can see at a glance which slots charge from grid.
-  - type: custom:apexcharts-card
-    header:
-      title: Slot Timeline (today)
-      show: true
-    graph_span: 24h
-    span:
-      start: day
-    apex_config:
-      chart:
-        type: rangeBar
-        height: 200
-      plotOptions:
-        bar:
-          horizontal: true
-          barHeight: 80%
-      xaxis:
-        type: datetime
-        labels:
-          datetimeFormatter:
-            hour: HH:mm
-      yaxis:
-        show: false
-      legend:
-        show: false
-    series:
-      - entity: sensor.heo_ii_programme_slots
-        name: Slot
-        type: rangeBar
-        data_generator: |
-          const slots = entity.attributes.slots || [];
-          const base = new Date();
-          base.setHours(0, 0, 0, 0);
-          return slots.map((s) => {
-            const [sh, sm] = s.start.split(':').map(Number);
-            const [eh, em] = s.end.split(':').map(Number);
-            let startMs = base.getTime() + (sh * 60 + sm) * 60000;
-            let endMs = base.getTime() + (eh * 60 + em) * 60000;
-            if (endMs <= startMs) endMs += 86400000;
-            return [startMs, endMs];
-          });
-        color: "#14b8a6"
+  # Slot timeline: HTML ribbon showing the 6 programme slots laid
+  # out proportionally across 00:00-24:00. Built with markdown +
+  # inline CSS rather than apex rangeBar because apexcharts-card
+  # only accepts line/column/area at series.type and a misuse there
+  # blanks the whole card with a config error.
+  - type: markdown
+    title: Slot Timeline (today)
+    content: |
+      {% set slots = state_attr('sensor.heo_ii_programme_slots', 'slots') or [] %}
+      <div style="display:flex;width:100%;height:64px;border:1px solid #444;border-radius:6px;overflow:hidden;font-size:11px;font-family:sans-serif;">{% for s in slots %}{% set ss = s.start.split(':') %}{% set ee = s.end.split(':') %}{% set start_m = (ss[0] | int) * 60 + (ss[1] | int) %}{% set end_m = (ee[0] | int) * 60 + (ee[1] | int) %}{% if end_m <= start_m %}{% set end_m = end_m + 1440 %}{% endif %}{% set dur = end_m - start_m %}{% set bg = '#a855f7' if s.grid_charge else '#14b8a6' %}<div style="flex:{{ dur }} 0 0;background:{{ bg }};color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;border-right:1px solid #222;text-align:center;line-height:1.2;padding:2px;"><div><strong>{{ s.start }}-{{ s.end }}</strong></div><div>{{ s.soc }}%{% if s.grid_charge %} ⚡{% endif %}</div></div>{% endfor %}</div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#888;margin-top:2px;"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+      <div style="font-size:10px;color:#888;margin-top:4px;">Purple = grid charge slot, teal = no grid charge.</div>
 
   # Plan justification: dump the rule engine's reason_log so the user
   # can see WHY each slot's settings were chosen. Refreshed each tick
