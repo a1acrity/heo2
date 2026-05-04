@@ -129,16 +129,16 @@ class TestExportWindowRule:
         result = rule.apply(state, default_inputs)
         assert any("ExportWindow" in r for r in result.reason_log)
 
-    def test_work_mode_flips_to_selling_first_when_inside_export_window(
+    def test_export_window_does_not_set_work_mode(
         self, default_inputs,
     ):
-        """When current local time falls inside a worth-selling rate
-        window, the rule MUST set work_mode='Selling first' so the
-        inverter actually exports to grid - not just drains to cover
-        house load. Without this the slot.capacity_soc=10 drain target
-        is ineffectual under the default 'Zero export to CT' mode."""
-        # Build a single high-export rate slot covering noon (now=12:00 UTC
-        # in the default fixture)
+        """ExportWindowRule no longer touches work_mode. That
+        responsibility moved to PeakExportArbitrageRule, which sizes
+        the work_mode flip to actual spare and only fires in the
+        TOP-priced slot rather than every worth-selling slot. This
+        test pins that ExportWindow's job is now JUST slot-cap
+        drain authorisation - work_mode stays at whatever Baseline
+        / earlier rules set."""
         from heo2.models import RateSlot
         default_inputs.export_rates = [
             RateSlot(
@@ -150,32 +150,9 @@ class TestExportWindowRule:
         default_inputs.current_soc = 90.0
         default_inputs.solar_forecast_kwh_tomorrow = [3.0] * 24
         state = _make_baseline(default_inputs)
+        state.work_mode = "Zero export to CT"  # pre-set
         result = ExportWindowRule().apply(state, default_inputs)
-        assert result.work_mode == "Selling first"
-        assert any(
-            "Selling first" in r for r in result.reason_log
-        ), f"reason_log missing work_mode flip: {result.reason_log}"
-
-    def test_work_mode_left_default_outside_export_window(
-        self, default_inputs,
-    ):
-        """At a time when no worth-selling rate covers `now`, the rule
-        leaves work_mode unchanged (None or whatever Baseline set)."""
-        from heo2.models import RateSlot
-        # High export rate at 17:00 UTC; default_inputs.now is 12:00.
-        default_inputs.export_rates = [
-            RateSlot(
-                start=datetime(2026, 4, 13, 17, 0, tzinfo=timezone.utc),
-                end=datetime(2026, 4, 13, 18, 0, tzinfo=timezone.utc),
-                rate_pence=25.0,
-            ),
-        ]
-        default_inputs.current_soc = 90.0
-        default_inputs.solar_forecast_kwh_tomorrow = [3.0] * 24
-        state = _make_baseline(default_inputs)
-        # Force a known starting work_mode so we can detect non-change
-        state.work_mode = "Zero export to CT"
-        result = ExportWindowRule().apply(state, default_inputs)
+        # Unchanged - PeakExportArbitrage will handle the flip later
         assert result.work_mode == "Zero export to CT"
 
     def test_heo7_half_hour_slot_within_programme_slot_drains(

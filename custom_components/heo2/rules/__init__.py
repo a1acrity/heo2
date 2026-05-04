@@ -14,11 +14,12 @@ from .ev_charging import EVChargingRule
 from .saving_session import SavingSessionRule
 from .ev_deferral import EVDeferralRule
 from .eps_mode import EPSModeRule
+from .peak_export_arbitrage import PeakExportArbitrageRule
 from .safety import SafetyRule
 
 
 def default_rules() -> list[Rule]:
-    """Return the 11 default rules in priority order.
+    """Return the 12 default rules in priority order.
 
     SafetyRule is always last and cannot be disabled. EPSModeRule sits
     JUST before SafetyRule because it must override every other rule's
@@ -42,6 +43,7 @@ def default_rules() -> list[Rule]:
         SolarSurplusRule(),
         ExportWindowRule(),
         EveningProtectRule(),
+        PeakExportArbitrageRule(),
         SavingSessionRule(),
         IGODispatchRule(),
         EVDeferralRule(),
