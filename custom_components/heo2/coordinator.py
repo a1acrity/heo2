@@ -41,6 +41,7 @@ from .bottlecapdave_client import (
     read_bottlecapdave_rates,
 )
 from .appliance_timing import ApplianceTimingCalculator, ApplianceSuggestion
+from .ev_state import is_ev_charging_state
 from .const import DEFAULT_APPLIANCES
 from .soc_trajectory import calculate_soc_trajectory
 from .cost_tracker import CostAccumulator
@@ -671,8 +672,8 @@ class HEO2Coordinator(DataUpdateCoordinator):
         saving_session = self._read_entity_bool(
             self._config.get("saving_session_entity", ""), default=False
         )
-        ev_charging = self._read_entity_bool(
-            self._config.get("ev_status_entity", ""), default=False
+        ev_charging = self._read_ev_charging(
+            self._config.get("ev_status_entity", "")
         )
 
         solar = self._read_solar_forecast(now)
@@ -968,6 +969,21 @@ class HEO2Coordinator(DataUpdateCoordinator):
         if state is None or state.state in ("unknown", "unavailable"):
             return default
         return state.state.lower() in ("on", "true", "1")
+
+    def _read_ev_charging(self, entity_id: str) -> bool:
+        """Return True iff the configured EV-status entity reports the
+        charger is actively drawing power.
+
+        Handles binary_sensor (on/off) and enum sensor (charging /
+        starting / boosting / etc) shapes. See `heo2.ev_state` for the
+        full truthy-state set.
+        """
+        if not entity_id:
+            return False
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return False
+        return is_ev_charging_state(state.state)
 
     def _read_solar_forecast(
         self,
