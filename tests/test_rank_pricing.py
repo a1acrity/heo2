@@ -15,6 +15,8 @@ from heo2.rank_pricing import (
     filter_today,
     hours_covered_by,
     is_worth_selling,
+    next_cheap_window_end_local,
+    next_cheap_window_start_local,
     select_cheap_charge_windows,
     select_export_top_pct,
     select_worth_selling_windows,
@@ -263,3 +265,118 @@ class TestSelectCheapChargeWindows:
         result = select_cheap_charge_windows(rates, n_pct=25)
         assert len(result) == 12
         assert all(r.rate_pence == 5.0 for r in result)
+
+
+# ---------------------------------------------------------------------------
+# next_cheap_window_*_local
+#
+# Captured 2026-05-06: live IGO horizon had 13 cheap (6.9p) + 41 day
+# (28.58p) future slots = 54 total. ceil(54 * 0.25) = 14, so the cohort
+# pulled in 1 day-rate slot as padding to reach the 14-count. Sort
+# stability put the EARLIEST day-rate slot at the front of the cohort,
+# so `next_cheap_window_start_local` returned tonight 20:00 (day rate)
+# instead of 23:30 (cheap), and `_end_local` returned 20:30 because the
+# walk found no cohort neighbour. CheapRateChargeRule's bridge maths
+# anchored on hour 21, hit the no-PV-takeover branch, and set the
+# overnight target to a useless 47%.
+#
+# These tests pin the band-tolerance filter so the regression can't
+# return.
+# ---------------------------------------------------------------------------
+
+
+def _half_hour(start_dt: datetime, pence: float) -> RateSlot:
+    """30-min RateSlot at an explicit start datetime."""
+    from datetime import timedelta
+    return RateSlot(
+        start=start_dt,
+        end=start_dt + timedelta(minutes=30),
+        rate_pence=pence,
+    )
+
+
+class TestNextCheapWindowBimodalPadding:
+    """Reproduces the 2026-05-06 IGO incident.
+
+    13 cheap + 41 day slots; ceil rounding pulls one day-rate slot into
+    cohort. With the band filter the day-rate padding is dropped and
+    the helpers correctly return the night-rate block boundaries.
+    """
+
+    def _build_horizon(self) -> tuple[datetime, list[RateSlot]]:
+        """Future-only horizon mirroring the live incident shape.
+
+        From now=20:00 UTC tonight, 54 half-hour slots covering 27h:
+        - 20:00 -> 23:30 today: 7 day slots (28.58p)
+        - 23:30 today -> 05:30 tomorrow: 12 cheap slots (6.9p)
+        - 05:30 -> 23:00 tomorrow: 35 day slots (28.58p) - exhausts the
+          27h window, leaving the night cohort as 12, plus 2 day slots
+          that ceil() rounds in as padding (54 * 0.25 = 13.5, ceil=14).
+        Wait we want exactly 13 cheap + 41 day. Adjust:
+        - 7 day + 13 cheap + 34 day = 54. cheap: 6.5h block
+          (i.e. 23:00 today -> 05:30 tomorrow). 13 contiguous cheap.
+        """
+        from datetime import timedelta
+        now = datetime(2026, 5, 6, 20, 0, tzinfo=UTC)
+        rates: list[RateSlot] = []
+        # 7 day slots: 20:00 -> 23:30 today (3.5h)
+        cur = now
+        for _ in range(6):
+            rates.append(_half_hour(cur, 28.58))
+            cur += timedelta(minutes=30)
+        # 1 more day slot to reach 23:00 (the boundary right before cheap)
+        rates.append(_half_hour(cur, 28.58))  # 23:00 -> 23:30
+        cur += timedelta(minutes=30)
+        # 13 cheap slots: 23:30 today -> 06:00 tomorrow (6.5h)
+        for _ in range(13):
+            rates.append(_half_hour(cur, 6.9))
+            cur += timedelta(minutes=30)
+        # 34 day slots after to fill 54 total
+        for _ in range(34):
+            rates.append(_half_hour(cur, 28.58))
+            cur += timedelta(minutes=30)
+        assert len(rates) == 54
+        return now, rates
+
+    def test_start_returns_cheap_block_not_day_padding(self):
+        now, rates = self._build_horizon()
+        from datetime import timedelta
+        result = next_cheap_window_start_local(rates, now, tz=UTC)
+        # Cheap block starts at 23:30 today, NOT 20:00 (day-rate padding)
+        assert result == now + timedelta(hours=3, minutes=30), (
+            f"expected cheap start at 23:30, got {result}"
+        )
+
+    def test_end_returns_cheap_block_end(self):
+        now, rates = self._build_horizon()
+        from datetime import timedelta
+        result = next_cheap_window_end_local(rates, now, tz=UTC)
+        # 13 cheap slots starting 23:30 today -> end 06:00 tomorrow
+        # (3.5h to 23:30 + 6.5h cheap = 10h total)
+        assert result == now + timedelta(hours=10), (
+            f"expected cheap end at 06:00 tomorrow, got {result}"
+        )
+
+    def test_band_tolerance_keeps_continuous_agile_intact(self):
+        """Continuous Agile cohorts (intra-band variation 1-2p) should
+        still walk through neighbours of slightly different rates - the
+        5p tolerance is generous enough to preserve that behaviour."""
+        from datetime import timedelta
+        now = datetime(2026, 5, 6, 20, 0, tzinfo=UTC)
+        rates = [
+            _half_hour(now + timedelta(hours=h), p)
+            for h, p in [
+                (0.5, 9.0),
+                (1.0, 8.0),
+                (1.5, 7.0),  # cheapest
+                (2.0, 7.5),
+                (2.5, 8.5),
+                (3.0, 9.5),
+            ]
+        ]
+        # Bottom 25% of 6 = 2 slots: 7.0 + 7.5. Both within 5p of 7.0.
+        # Contiguous 1.5h-2.5h block. Start = 21:30, end = 22:30.
+        start = next_cheap_window_start_local(rates, now, tz=UTC)
+        end = next_cheap_window_end_local(rates, now, tz=UTC)
+        assert start == now + timedelta(hours=1, minutes=30)
+        assert end == now + timedelta(hours=2, minutes=30)

@@ -214,6 +214,42 @@ def select_cheap_charge_windows(
     return bottom_n_pct(import_rates_today, n_pct)
 
 
+# Maximum p/kWh spread within a "cheap band". A cohort member whose
+# rate is more than this above the cohort minimum is treated as
+# padding from `bottom_n_pct`'s ceil() rounding rather than a genuine
+# cheap slot. Calibrated for bimodal tariffs (IGO 7p/28p, Octopus
+# Cosy 7.5p/22p): the gap between cheap and standard is much larger
+# than 5p, so the filter cleanly drops the padding. For continuous
+# Agile (intra-band variation typically 1-2p) it's permissive.
+#
+# Captured 2026-05-06: ceil(54 * 0.25) = 14 selected 13 cheap slots
+# (6.9p) PLUS one day-rate slot (28.58p) as padding to reach 14. Sort
+# stability put the earliest day-rate slot (20:00 UTC tonight) at the
+# front of the cohort. `next_cheap_window_end_local` then walked from
+# 20:00, found no contiguous neighbour in cohort, returned 20:30 UTC.
+# CheapRateChargeRule walked the bridge from hour 21 (BST), saw zero
+# PV, hit "deep winter" branch, set overnight target to 47% instead
+# of the correct ~25-30% bridge-to-PV-takeover at hour 8.
+_CHEAP_BAND_TOLERANCE_P = 5.0
+
+
+def _cheap_band_filter(cohort: list[RateSlot]) -> list[RateSlot]:
+    """Drop cohort members whose rate sits a tier above the cheapest.
+
+    Rationale: `bottom_n_pct` uses `ceil()` to size the cohort, which
+    can pull in one cross-tier "padding" slot when the count rounds up
+    across a rate-band boundary. The padding slot is sort-stable so it
+    ends up at the EARLIEST position among same-rate ties - which then
+    misleads `next_cheap_window_*_local` into pointing at the wrong
+    time-of-day. Filtering by `<= min + tolerance` removes that padding
+    cleanly without affecting continuous-Agile cohorts.
+    """
+    if not cohort:
+        return []
+    min_rate = min(r.rate_pence for r in cohort)
+    return [r for r in cohort if r.rate_pence <= min_rate + _CHEAP_BAND_TOLERANCE_P]
+
+
 def next_cheap_window_start_local(
     import_rates: list[RateSlot],
     now_local: datetime,
@@ -223,11 +259,13 @@ def next_cheap_window_start_local(
     """Return the LOCAL datetime at which the next cheap import window
     starts, or None if no upcoming rates are loaded.
 
-    "Cheap" = bottom-N% of upcoming import rates. The earliest start
-    among that cohort is the answer. Picking the earliest (rather than
-    the lowest-priced) handles the IGO case where 23:30-05:30 is one
-    contiguous off-peak run: any 30-min slot in that block belongs to
-    the cheap cohort, and we want the FIRST one as the bridge horizon.
+    "Cheap" = bottom-N% of upcoming import rates filtered to the
+    cheapest band (within `_CHEAP_BAND_TOLERANCE_P` of the cohort
+    minimum). The earliest start among that filtered cohort is
+    returned. Picking the earliest (rather than the lowest-priced)
+    handles the IGO case where 23:30-05:30 is one contiguous off-peak
+    run: any 30-min slot in that block belongs to the cheap cohort, and
+    we want the FIRST one as the bridge horizon.
 
     Used to replace hardcoded 23:30 cheap-window assumptions across
     rules. Adapts to Saving Sessions, IGO bonus dispatches, and any
@@ -246,7 +284,7 @@ def next_cheap_window_start_local(
             future.append((start_local, r))
     if not future:
         return None
-    cohort = bottom_n_pct([r for _, r in future], n_pct)
+    cohort = _cheap_band_filter(bottom_n_pct([r for _, r in future], n_pct))
     if not cohort:
         return None
     cohort_ids = {id(r) for r in cohort}
@@ -262,14 +300,14 @@ def next_cheap_window_end_local(
     """Return the LOCAL datetime at which the next cheap import window
     ENDS, or None if no upcoming rates are loaded.
 
-    Walks the bottom-N% cohort starting from the earliest cheap slot
-    (per `next_cheap_window_start_local`) and extends as long as
-    consecutive slots in that cohort abut. The end of the last
-    contiguous cheap slot is returned.
+    Walks the cohort (bottom-N%, filtered to the cheapest band) starting
+    from the earliest cheap slot and extends while consecutive slots in
+    that cohort abut. The end of the last contiguous cheap slot is
+    returned.
 
     Used by CheapRateChargeRule to anchor the morning-bridge calc:
     SOC must reach `target_soc` by this time; from here forward the
-    battery deplets until PV takeover.
+    battery depletes until PV takeover.
     """
     if not import_rates:
         return None
@@ -289,7 +327,7 @@ def next_cheap_window_end_local(
             future.append((start_local, end_local, r))
     if not future:
         return None
-    cohort = bottom_n_pct([t[2] for t in future], n_pct)
+    cohort = _cheap_band_filter(bottom_n_pct([t[2] for t in future], n_pct))
     if not cohort:
         return None
     cohort_ids = {id(r) for r in cohort}
