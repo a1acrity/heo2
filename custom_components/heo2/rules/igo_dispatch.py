@@ -19,12 +19,14 @@ the planned-dispatch path has already pre-positioned the slot.
 
 from __future__ import annotations
 
-from ..models import PlannedDispatch, ProgrammeInputs, ProgrammeState
-from ..rule_engine import Rule
+from datetime import timedelta
+
+from ..models import PlannedDispatch, ProgrammeInputs
+from ..rule_engine import PRIO_IGO_DISPATCH, Rule
 
 
 def _slot_indices_covering_dispatch(
-    state: ProgrammeState,
+    view,
     dispatch: PlannedDispatch,
     inputs: ProgrammeInputs,
 ) -> list[int]:
@@ -50,16 +52,14 @@ def _slot_indices_covering_dispatch(
         start_local = dispatch.start
         end_local = dispatch.end
 
-    # Sample every 15 min between start and end, mark each slot that
-    # contains the sample. 15 min granularity is finer than any inverter
-    # boundary HEO II writes (5-min). Avoids hand-rolling overlap maths
-    # for the wrap-midnight case.
-    from datetime import timedelta
+    # 15-min sample sweep is finer than any inverter boundary HEO II
+    # writes (5-min). Avoids hand-rolling overlap maths for the wrap-
+    # midnight case.
     indices: set[int] = set()
     cursor = start_local
     while cursor < end_local:
         try:
-            idx = state.find_slot_at(cursor.time())
+            idx = view.find_slot_at(cursor.time())
             indices.add(idx)
         except ValueError:
             pass
@@ -72,8 +72,9 @@ class IGODispatchRule(Rule):
 
     name = "igo_dispatch"
     description = "Enable grid charge during IGO dispatch"
+    priority_class = PRIO_IGO_DISPATCH
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         modified_log: list[str] = []
 
         # SavingSessionRule (runs earlier in the registry) drains the
@@ -86,20 +87,19 @@ class IGODispatchRule(Rule):
         if inputs.saving_session:
             try:
                 local_now = inputs.now_local()
-                saving_session_slot_idx = state.find_slot_at(local_now.time())
+                saving_session_slot_idx = view.find_slot_at(local_now.time())
             except ValueError:
                 saving_session_slot_idx = None
 
         # Path 1: planned dispatches (HEO-8). Pre-position covering slots.
         if inputs.planned_dispatches:
             now = inputs.now
-            from datetime import timedelta
             horizon_end = now + timedelta(hours=24)
             covered_slot_idxs: set[int] = set()
             for d in inputs.planned_dispatches:
                 if d.end <= now or d.start >= horizon_end:
                     continue
-                for idx in _slot_indices_covering_dispatch(state, d, inputs):
+                for idx in _slot_indices_covering_dispatch(view, d, inputs):
                     covered_slot_idxs.add(idx)
 
             for idx in sorted(covered_slot_idxs):
@@ -108,10 +108,10 @@ class IGODispatchRule(Rule):
                         f"slot {idx + 1} held by saving session, skip pre-position"
                     )
                     continue
-                slot = state.slots[idx]
+                slot = view.slots[idx]
                 if not slot.grid_charge or slot.capacity_soc < 100:
-                    slot.grid_charge = True
-                    slot.capacity_soc = 100
+                    view.claim_slot(idx, "grid_charge", True, reason="planned dispatch")
+                    view.claim_slot(idx, "capacity_soc", 100, reason="planned dispatch")
                     modified_log.append(
                         f"slot {idx + 1} pre-positioned for planned dispatch"
                     )
@@ -122,15 +122,16 @@ class IGODispatchRule(Rule):
         if inputs.igo_dispatching:
             try:
                 local_now = inputs.now_local()
-                idx = state.find_slot_at(local_now.time())
+                idx = view.find_slot_at(local_now.time())
             except ValueError:
                 idx = None
             if idx is not None and idx != saving_session_slot_idx:
-                slot = state.slots[idx]
-                slot.grid_charge = True
-                slot.capacity_soc = max(slot.capacity_soc, 100)
+                current_cap = view.get_slot(idx, "capacity_soc")
+                new_cap = max(current_cap, 100)
+                view.claim_slot(idx, "grid_charge", True, reason="active dispatch")
+                view.claim_slot(idx, "capacity_soc", new_cap, reason="active dispatch")
                 modified_log.append(
-                    f"slot {idx + 1} active dispatch (cap={slot.capacity_soc}%)"
+                    f"slot {idx + 1} active dispatch (cap={new_cap}%)"
                 )
             elif idx is not None and idx == saving_session_slot_idx:
                 modified_log.append(
@@ -138,7 +139,6 @@ class IGODispatchRule(Rule):
                 )
 
         if modified_log:
-            state.reason_log.append(
+            view.log(
                 f"IGODispatch: {'; '.join(modified_log)}"
             )
-        return state
