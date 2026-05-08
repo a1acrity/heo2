@@ -76,6 +76,20 @@ class IGODispatchRule(Rule):
     def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
         modified_log: list[str] = []
 
+        # SavingSessionRule (runs earlier in the registry) drains the
+        # slot containing local-now to floor + gc=False during a saving
+        # session. An IGO dispatch covering the same slot would refill
+        # the battery from grid mid-session and lose the £3+/kWh export
+        # revenue. See docs/rule_field_overlap.md F2. Skip the session
+        # slot in both paths.
+        saving_session_slot_idx: int | None = None
+        if inputs.saving_session:
+            try:
+                local_now = inputs.now_local()
+                saving_session_slot_idx = state.find_slot_at(local_now.time())
+            except ValueError:
+                saving_session_slot_idx = None
+
         # Path 1: planned dispatches (HEO-8). Pre-position covering slots.
         if inputs.planned_dispatches:
             now = inputs.now
@@ -89,6 +103,11 @@ class IGODispatchRule(Rule):
                     covered_slot_idxs.add(idx)
 
             for idx in sorted(covered_slot_idxs):
+                if idx == saving_session_slot_idx:
+                    modified_log.append(
+                        f"slot {idx + 1} held by saving session, skip pre-position"
+                    )
+                    continue
                 slot = state.slots[idx]
                 if not slot.grid_charge or slot.capacity_soc < 100:
                     slot.grid_charge = True
@@ -106,12 +125,16 @@ class IGODispatchRule(Rule):
                 idx = state.find_slot_at(local_now.time())
             except ValueError:
                 idx = None
-            if idx is not None:
+            if idx is not None and idx != saving_session_slot_idx:
                 slot = state.slots[idx]
                 slot.grid_charge = True
                 slot.capacity_soc = max(slot.capacity_soc, 100)
                 modified_log.append(
                     f"slot {idx + 1} active dispatch (cap={slot.capacity_soc}%)"
+                )
+            elif idx is not None and idx == saving_session_slot_idx:
+                modified_log.append(
+                    f"slot {idx + 1} active dispatch held by saving session"
                 )
 
         if modified_log:
