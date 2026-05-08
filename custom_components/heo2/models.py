@@ -92,6 +92,13 @@ class ProgrammeState:
     max_charge_a: Optional[float] = None
     max_discharge_a: Optional[float] = None
     ev_deferral_active: bool = False
+    # HEO-31 Phase 3: structured per-claim trace, parallel to
+    # `reason_log`. Each rule's claims (writes) are captured here with
+    # priority/reason/value/winning-status, so the dashboard can answer
+    # "why is slot 3 at 60%?" by walking the per-field claim list.
+    # `reason_log` keeps its original flat-string shape for back-compat
+    # with sensors and existing tests that grep its contents.
+    claims_log: list = field(default_factory=list)
 
     @classmethod
     def default(cls, min_soc: int = 20) -> ProgrammeState:
