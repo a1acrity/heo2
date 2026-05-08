@@ -135,10 +135,23 @@ class PeakExportArbitrageRule(Rule):
         cheap_start: datetime,
         tz: ZoneInfo | None,
     ) -> list[RateSlot]:
+        """Slots that are still allocatable: end time in the future
+        (so we have at least some of the slot left to sell into) AND
+        starting before the cheap window.
+
+        Pre-2026-05-08 this filtered on `start_local < now_local` -
+        which excluded any slot whose start had passed, even if the
+        slot was still in progress. Active-slot detection downstream
+        then never matched because the in-progress slot wasn't in the
+        allocation list. Tick at 19:12 inside a 19:00-19:30 slot ->
+        rule logs 'scheduled' and never flips work_mode. Real
+        production miss documented in PR #74.
+        """
         out = []
         for r in export_rates:
             start_local = _local(r.start, tz)
-            if start_local < now_local or start_local >= cheap_start:
+            end_local = _local(r.end, tz)
+            if end_local <= now_local or start_local >= cheap_start:
                 continue
             out.append(r)
         return out

@@ -121,6 +121,70 @@ class TestPeakExportArbitrageRule:
         assert result.max_discharge_a > 0
         assert any("ACTIVE" in r for r in result.reason_log)
 
+    def test_active_mid_slot_when_tick_fires_after_slot_start(self):
+        """Real production miss 2026-05-08: tick fires at 19:12 BST,
+        inside an in-progress 19:00-19:30 export slot. Pre-fix the
+        `_today_remaining_export_slots` filter excluded any slot whose
+        start was already past, so 19:00 wasn't even in allocations
+        and the active-slot detection failed. Rule must fire ACTIVE
+        for in-progress slots, not just slots whose start instant
+        coincides with `now_local`.
+        """
+        today = datetime(2026, 5, 8, 19, 12, tzinfo=_LON)  # 12 min into the slot
+        rates = [
+            _half_hour_rate(today, 19, 0, 13.10),   # active mid-slot
+            _half_hour_rate(today, 19, 30, 13.28),  # next, slightly higher
+            _half_hour_rate(today, 20, 0, 13.06),
+            _half_hour_rate(today, 18, 30, 12.50),  # in past - should be ignored
+        ]
+        # IGO off-peak start at 23:30 - 6:30 forward = end of cheap window day
+        # before. Set import rates with a clear cheap-window boundary so
+        # `_resolve_cheap_window_start` lands at 23:30 BST tonight.
+        cheap_start_local = today.replace(hour=23, minute=30)
+        import_rates = [
+            RateSlot(
+                start=cheap_start_local.astimezone(timezone.utc),
+                end=(cheap_start_local + timedelta(hours=6)).astimezone(timezone.utc),
+                rate_pence=7.0,
+            ),
+            RateSlot(
+                start=(cheap_start_local - timedelta(hours=18)).astimezone(timezone.utc),
+                end=cheap_start_local.astimezone(timezone.utc),
+                rate_pence=27.88,
+            ),
+        ]
+        inputs = _inputs(
+            now_local=today, current_soc=80.0, capacity=20.0, min_soc=10.0,
+            export_rates=rates, import_rates=import_rates,
+            load_24=[0.3] * 24,
+        )
+        result = PeakExportArbitrageRule().apply(_empty_programme(), inputs)
+        assert result.work_mode == "Selling first", \
+            f"Mid-slot activation failed: reason_log={result.reason_log}"
+        assert result.max_discharge_a is not None
+        assert any("ACTIVE" in r for r in result.reason_log), \
+            f"Expected ACTIVE log, got: {result.reason_log}"
+
+    def test_past_slots_excluded_from_allocation(self):
+        """Slots whose end is in the past should not appear in
+        allocations - we can't sell into yesterday."""
+        today = datetime(2026, 5, 8, 20, 0, tzinfo=_LON)
+        rates = [
+            _half_hour_rate(today, 18, 0, 25.0),   # ended at 18:30, in past
+            _half_hour_rate(today, 20, 0, 13.0),   # active now
+        ]
+        inputs = _inputs(
+            now_local=today, current_soc=100.0, capacity=20.0, min_soc=10.0,
+            export_rates=rates, load_24=[0.3] * 24,
+        )
+        result = PeakExportArbitrageRule().apply(_empty_programme(), inputs)
+        # Active should be the 20:00 slot; the past 18:00 slot should
+        # not be in allocations or accidentally chosen as active.
+        if result.work_mode == "Selling first":
+            assert any("20:00" in r for r in result.reason_log)
+            assert not any("ACTIVE - selling" in r and "18:00" in r
+                           for r in result.reason_log)
+
     def test_inactive_outside_allocated_slot(self):
         """Battery full, top-priced slot is 18:00-18:30, but we're at
         17:00 (between rates with no allocation) -> work_mode left
