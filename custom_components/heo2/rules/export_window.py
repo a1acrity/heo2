@@ -11,31 +11,24 @@ from ..const import (
     DEFAULT_SELL_TOP_PCT_LOW_SOC,
     ROUND_TRIP_EFFICIENCY,
 )
-from ..models import ProgrammeInputs, ProgrammeState
+from ..models import ProgrammeInputs
 from ..rank_pricing import (
     filter_today,
     hours_covered_by,
     select_export_top_pct,
     select_worth_selling_windows,
 )
-from ..rule_engine import Rule
+from ..rule_engine import PRIO_EXPORT_WINDOW, Rule
 
 
-def _slot_covers_rate(slot, rate, tz):
-    """True iff the programme `slot` (local time-of-day) covers the
-    `rate.start` (UTC absolute datetime) in local time. HEO-7 fix:
-    pre-2026-05 ExportWindowRule built `slot_hours = set(range(start.hour,
-    end.hour))` and matched against `rate.start.hour`. That dropped
-    half-hour Agile slots crossing the hour and entirely missed slots
-    like 16:30-17:00 against a programme slot of 17:00-19:00. Working
-    in absolute time (rate.start in local tz, against slot.start_time
-    / slot.end_time) catches the overlap without rounding.
-    """
+def _slot_view_covers_rate(slot_view, rate, tz):
+    """True iff the programme `slot_view` (local time-of-day) covers
+    the `rate.start` (UTC absolute datetime) in local time."""
     if tz is not None and rate.start.tzinfo is not None:
         local_t = rate.start.astimezone(tz).time()
     else:
         local_t = rate.start.time()
-    return slot.contains_time(local_t)
+    return slot_view.contains_time(local_t)
 
 
 class ExportWindowRule(Rule):
@@ -56,6 +49,7 @@ class ExportWindowRule(Rule):
 
     name = "export_window"
     description = "Drain battery during top-ranked Agile Outgoing windows"
+    priority_class = PRIO_EXPORT_WINDOW
 
     def __init__(
         self,
@@ -76,21 +70,15 @@ class ExportWindowRule(Rule):
         self.n_med = n_med
         self.n_high = n_high
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         if not inputs.export_rates:
-            return state
+            return
 
-        # Today only. Tomorrow's rates are out of scope for the drain
-        # decision in the current programme.
         today_rates = filter_today(inputs.export_rates, inputs.now)
         if not today_rates:
-            return state
+            return
 
         daily_load_kwh = sum(inputs.load_forecast_kwh) or 1.0
-        # Tomorrow's solar feeds the rank decision (high-SOC + high-solar
-        # -> sell aggressively; low-solar -> conservative). Falls back to
-        # today's forecast when tomorrow isn't available so the rule
-        # still produces a reasonable answer.
         tomorrow_solar_kwh = sum(inputs.solar_forecast_kwh_tomorrow) if (
             inputs.solar_forecast_kwh_tomorrow
         ) else sum(inputs.solar_forecast_kwh)
@@ -114,28 +102,20 @@ class ExportWindowRule(Rule):
         )
 
         if not worth_windows:
-            state.reason_log.append(
+            view.log(
                 f"ExportWindow: nothing worth selling in {n_reason} "
                 f"(replacement cost {self.replacement_cost_pence:.2f}p)"
             )
-            return state
+            return
 
-        # HEO-7: local-tz aware slot matching. Use inputs.local_tz
-        # (set by the coordinator post-PR2) so DST is respected;
-        # fall back to inputs.now.tzinfo for tests that don't set it.
         tz = inputs.local_tz or inputs.now.tzinfo
-        # Kept for the diagnostic log line below; the actual slot
-        # selection uses _slot_covers_rate which is sub-hour accurate.
         worth_hours = hours_covered_by(worth_windows, tz=tz)
 
         # Per SPEC §5 priority 1 (avoid peak import) DOMINATES priority 3
         # (sell during top windows). A naive drain-to-min_soc could leave
         # the battery empty going into the 18:30-23:30 evening window
-        # and force grid imports at peak rates. So the drain target is
-        # floored at min_soc + (evening_demand / capacity), matching the
-        # legacy rule's behaviour. EveningProtectRule (next in the chain)
-        # only protects pre-evening slots; this floor handles overlap
-        # cases like a 12:00-18:30 day slot that EveningProtect skips.
+        # and force grid imports at peak rates. Floor the drain target
+        # at min_soc + (evening_demand / capacity).
         evening_demand_kwh = inputs.load_kwh_between(18, 24)
         if inputs.battery_capacity_kwh > 0:
             evening_floor_soc = int(
@@ -148,18 +128,17 @@ class ExportWindowRule(Rule):
         drain_target = max(evening_floor_soc, int(inputs.min_soc))
 
         modified = False
-        for slot in state.slots:
+        for slot in view.slots:
             if slot.grid_charge:
                 continue
-            # Slot drains only if at least one worth-selling rate slot
-            # falls within its time window. Sub-hour accurate via
-            # `_slot_covers_rate`, unlike the pre-HEO-7 hour-set
-            # intersection.
             covers_any = any(
-                _slot_covers_rate(slot, r, tz) for r in worth_windows
+                _slot_view_covers_rate(slot, r, tz) for r in worth_windows
             )
             if covers_any and slot.capacity_soc > drain_target:
-                slot.capacity_soc = drain_target
+                view.claim_slot(
+                    slot.index, "capacity_soc", drain_target,
+                    reason=f"drain during worth-selling slot",
+                )
                 modified = True
 
         # NOTE: setting slot.capacity_soc=N alone authorises the
@@ -167,9 +146,6 @@ class ExportWindowRule(Rule):
         # work_mode + max_discharge_a are managed by
         # `PeakExportArbitrageRule` further down the chain, sized to
         # actual spare and only during the day's TOP-priced window(s).
-        # An earlier version flipped work_mode here for *any*
-        # worth-selling window, but that sold during second-best slots
-        # too rather than concentrating on the genuine peak.
 
         sorted_hours = sorted(worth_hours)
         rate_summary = (
@@ -180,15 +156,14 @@ class ExportWindowRule(Rule):
         )
 
         if modified:
-            state.reason_log.append(
+            view.log(
                 f"ExportWindow: drain to {drain_target}% in {n_reason}, "
                 f"{len(worth_windows)} slots @ {rate_summary} "
                 f"covering hours {sorted_hours} "
                 f"(evening floor from {evening_demand_kwh:.1f} kWh demand)"
             )
         else:
-            state.reason_log.append(
+            view.log(
                 f"ExportWindow: {n_reason}, {len(worth_windows)} worth-selling "
                 f"slots @ {rate_summary} but no slot SOC needed lowering"
             )
-        return state
