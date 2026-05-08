@@ -188,6 +188,22 @@ def should_commit_replan(
             f"({baseline.soc_at_capture:.0f} -> {inputs.current_soc:.0f}%)"
         )
 
+    # SPEC §2 globals (work_mode / energy_pattern / max_*_a): a runtime
+    # rule activation - PeakArbitrageRule entering an allocated top-
+    # priced export slot, EVDeferralRule crossing its threshold, or
+    # SavingSession ending and reverting work_mode to the Baseline
+    # default - changes the new programme's globals without firing any
+    # of the input-deviation triggers above. Without this check the
+    # new globals never land on the inverter and the rule's intent is
+    # silently dropped (real production miss 2026-05-08: peak-export
+    # window passed with work_mode stuck at Zero export to CT).
+    globals_diff = _globals_diff(new_programme, baseline.programme)
+    if globals_diff:
+        return ReplanDecision(
+            True,
+            f"trigger: programme globals changed ({globals_diff})",
+        )
+
     return ReplanDecision(
         False,
         f"hold baseline ({baseline.captured_at.strftime('%H:%M')}; "
@@ -195,6 +211,44 @@ def should_commit_replan(
         f"load dev {load_dev:.0f}% < {replan_load_pct:.0f}%, "
         f"SOC dev {soc_dev:.1f}% < {replan_soc_pct:.0f}%)"
     )
+
+
+def _globals_diff(new: ProgrammeState, baseline: ProgrammeState) -> str | None:
+    """Return a short diff description if any SPEC §2 global differs
+    between `new` and `baseline`, else None. Comparison rules match
+    `MqttWriter.diff_globals` so this trigger and the writer agree on
+    what counts as a meaningful delta:
+
+      * strings: case-insensitive, whitespace-trimmed equality
+      * floats: tol=0.5 to suppress noisy round-trip flicker
+      * None on either side is a "don't touch" signal -> ignored
+    """
+    def _str_equal(a, b) -> bool:
+        if a is None or b is None:
+            return True  # don't fire on "don't touch" sentinel
+        return str(a).strip().casefold() == str(b).strip().casefold()
+
+    def _float_equal(a, b, tol: float = 0.5) -> bool:
+        if a is None or b is None:
+            return True
+        return abs(float(a) - float(b)) <= tol
+
+    diffs: list[str] = []
+    if not _str_equal(new.work_mode, baseline.work_mode):
+        diffs.append(f"work_mode {baseline.work_mode!r}->{new.work_mode!r}")
+    if not _str_equal(new.energy_pattern, baseline.energy_pattern):
+        diffs.append(
+            f"energy_pattern {baseline.energy_pattern!r}->{new.energy_pattern!r}"
+        )
+    if not _float_equal(new.max_charge_a, baseline.max_charge_a):
+        diffs.append(
+            f"max_charge_a {baseline.max_charge_a}->{new.max_charge_a}"
+        )
+    if not _float_equal(new.max_discharge_a, baseline.max_discharge_a):
+        diffs.append(
+            f"max_discharge_a {baseline.max_discharge_a}->{new.max_discharge_a}"
+        )
+    return "; ".join(diffs) if diffs else None
 
 
 def capture_baseline(
