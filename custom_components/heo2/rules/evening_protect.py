@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import time
 
+from ..load_budget import evening_demand_kwh, evening_floor_soc
 from ..models import ProgrammeInputs
 from ..rule_engine import PRIO_EVENING_PROTECT, Rule
 
@@ -25,17 +26,20 @@ class EveningProtectRule(Rule):
         self.evening_end_hour = evening_end_hour
 
     def propose(self, view, inputs: ProgrammeInputs) -> None:
-        evening_demand_kwh = inputs.load_kwh_between(
-            self.evening_start_hour, self.evening_end_hour
+        evening_kwh = evening_demand_kwh(
+            inputs,
+            start_hour=self.evening_start_hour,
+            end_hour=self.evening_end_hour,
         )
 
-        if evening_demand_kwh <= 0:
+        if evening_kwh <= 0:
             return
 
-        required_soc = int(
-            inputs.min_soc + (evening_demand_kwh / inputs.battery_capacity_kwh * 100)
+        required_soc = evening_floor_soc(
+            inputs,
+            start_hour=self.evening_start_hour,
+            end_hour=self.evening_end_hour,
         )
-        required_soc = min(required_soc, 100)
 
         evening_t = time(self.evening_start_hour, 0)
 
@@ -52,7 +56,7 @@ class EveningProtectRule(Rule):
                 if slot.capacity_soc < required_soc:
                     view.claim_slot(
                         slot.index, "capacity_soc", required_soc,
-                        reason=f"evening demand {evening_demand_kwh:.1f} kWh",
+                        reason=f"evening demand {evening_kwh:.1f} kWh",
                     )
                     modified = True
 
@@ -60,11 +64,11 @@ class EveningProtectRule(Rule):
             view.log(
                 f"EveningProtect: raised SOC to {required_soc}% in slot "
                 f"covering {evening_t.strftime('%H:%M')} "
-                f"({evening_demand_kwh:.1f} kWh evening demand)"
+                f"({evening_kwh:.1f} kWh evening demand)"
             )
         else:
             view.log(
                 f"EveningProtect: no change needed "
-                f"({evening_demand_kwh:.1f} kWh evening demand, "
+                f"({evening_kwh:.1f} kWh evening demand, "
                 f"required {required_soc}%)"
             )
