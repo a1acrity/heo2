@@ -11,6 +11,7 @@ from ..const import (
     DEFAULT_SELL_TOP_PCT_LOW_SOC,
     ROUND_TRIP_EFFICIENCY,
 )
+from ..load_budget import evening_demand_kwh, evening_floor_soc
 from ..models import ProgrammeInputs
 from ..rank_pricing import (
     filter_today,
@@ -115,17 +116,9 @@ class ExportWindowRule(Rule):
         # (sell during top windows). A naive drain-to-min_soc could leave
         # the battery empty going into the 18:30-23:30 evening window
         # and force grid imports at peak rates. Floor the drain target
-        # at min_soc + (evening_demand / capacity).
-        evening_demand_kwh = inputs.load_kwh_between(18, 24)
-        if inputs.battery_capacity_kwh > 0:
-            evening_floor_soc = int(
-                inputs.min_soc
-                + (evening_demand_kwh / inputs.battery_capacity_kwh * 100)
-            )
-        else:
-            evening_floor_soc = int(inputs.min_soc)
-        evening_floor_soc = min(evening_floor_soc, 100)
-        drain_target = max(evening_floor_soc, int(inputs.min_soc))
+        # at the shared evening-floor calc (also used by EveningProtect).
+        evening_kwh = evening_demand_kwh(inputs)
+        drain_target = evening_floor_soc(inputs)
 
         modified = False
         for slot in view.slots:
@@ -160,7 +153,7 @@ class ExportWindowRule(Rule):
                 f"ExportWindow: drain to {drain_target}% in {n_reason}, "
                 f"{len(worth_windows)} slots @ {rate_summary} "
                 f"covering hours {sorted_hours} "
-                f"(evening floor from {evening_demand_kwh:.1f} kWh demand)"
+                f"(evening floor from {evening_kwh:.1f} kWh demand)"
             )
         else:
             view.log(
