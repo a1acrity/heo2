@@ -26,8 +26,8 @@ export; the existing work mode handles the rest.
 
 from __future__ import annotations
 
-from ..models import ProgrammeInputs, ProgrammeState
-from ..rule_engine import Rule
+from ..models import ProgrammeInputs
+from ..rule_engine import PRIO_SAVING_SESSION, Rule
 
 
 class SavingSessionRule(Rule):
@@ -36,46 +36,46 @@ class SavingSessionRule(Rule):
 
     name = "saving_session"
     description = "Drain battery to floor during Octoplus saving sessions"
+    priority_class = PRIO_SAVING_SESSION
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         if not inputs.saving_session:
-            return state
+            return
 
         local_now = inputs.now_local()
         try:
-            current_idx = state.find_slot_at(local_now.time())
+            current_idx = view.find_slot_at(local_now.time())
         except ValueError:
             # Programme isn't covering local-now; SafetyRule will fix
             # the contiguity, but this rule has nothing to do.
-            return state
+            return
 
-        slot = state.slots[current_idx]
         floor = int(inputs.min_soc)
+        slot_view = view.slots[current_idx]
+        before = (slot_view.capacity_soc, slot_view.grid_charge)
 
-        before = (slot.capacity_soc, slot.grid_charge)
-        slot.capacity_soc = floor
-        slot.grid_charge = False
-        after = (slot.capacity_soc, slot.grid_charge)
-
+        view.claim_slot(
+            current_idx, "capacity_soc", floor,
+            reason="saving session drain",
+        )
+        view.claim_slot(
+            current_idx, "grid_charge", False,
+            reason="saving session drain",
+        )
         # SPEC §9 row 3: "Selling first" lets the inverter export to
-        # grid at the published Outgoing Octopus rate. Without this the
-        # current "Zero export to CT" mode would just hold load coverage,
-        # not export, and the £3+/kWh saving-session price wouldn't be
-        # captured. Reset is handled by BaselineRule when the session
-        # ends (saving_session=False).
-        state.work_mode = "Selling first"
+        # grid at the published Outgoing Octopus rate.
+        view.claim_global("work_mode", "Selling first", reason="saving session active")
 
-        if before != after:
-            state.reason_log.append(
+        if before != (floor, False):
+            view.log(
                 f"SavingSession: drain slot {current_idx + 1} "
-                f"({slot.start_time.strftime('%H:%M')}-"
-                f"{slot.end_time.strftime('%H:%M')}) "
+                f"({slot_view.start_time.strftime('%H:%M')}-"
+                f"{slot_view.end_time.strftime('%H:%M')}) "
                 f"to {floor}% (was cap={before[0]}% gc={before[1]}); "
                 f"work_mode -> Selling first"
             )
         else:
-            state.reason_log.append(
+            view.log(
                 f"SavingSession: active but slot {current_idx + 1} "
                 f"already at floor; work_mode -> Selling first"
             )
-        return state

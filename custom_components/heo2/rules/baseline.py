@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import time
 
-from ..models import ProgrammeState, ProgrammeInputs, SlotConfig
-from ..rule_engine import Rule
+from ..models import ProgrammeInputs
+from ..rule_engine import PRIO_BASELINE, Rule
 
 
 class BaselineRule(Rule):
@@ -16,6 +16,7 @@ class BaselineRule(Rule):
 
     name = "baseline"
     description = "Default programme: cheap-rate overnight charge, solar day, evening drain"
+    priority_class = PRIO_BASELINE
 
     def __init__(
         self,
@@ -27,24 +28,29 @@ class BaselineRule(Rule):
         self.off_peak_end = off_peak_end
         self.evening_start = evening_start
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         min_soc = int(inputs.min_soc)
 
-        # Build the 6-slot baseline layout:
-        # Slot 1: 00:00 -> off_peak_end       (overnight charge, grid_charge=True)
-        # Slot 2: off_peak_end -> evening_start (day -- let solar charge, SOC=100)
-        # Slot 3: evening_start -> off_peak_start (evening drain, SOC=min_soc)
-        # Slot 4: off_peak_start -> 23:57      (next overnight, grid_charge=True)
-        # Slot 5: 23:57 -> 23:58              (filler)
-        # Slot 6: 23:58 -> 00:00              (filler)
-        state.slots = [
-            SlotConfig(time(0, 0), self.off_peak_end, 100, True),
-            SlotConfig(self.off_peak_end, self.evening_start, 100, False),
-            SlotConfig(self.evening_start, self.off_peak_start, min_soc, False),
-            SlotConfig(self.off_peak_start, time(23, 57), 100, True),
-            SlotConfig(time(23, 57), time(23, 58), min_soc, False),
-            SlotConfig(time(23, 58), time(0, 0), min_soc, False),
+        # 6-slot baseline layout (start, end, capacity_soc, grid_charge):
+        # 1: 00:00 -> off_peak_end       (overnight charge, gc=True)
+        # 2: off_peak_end -> evening_start (day -- let solar charge, SOC=100)
+        # 3: evening_start -> off_peak_start (evening drain, SOC=min_soc)
+        # 4: off_peak_start -> 23:57      (next overnight, gc=True)
+        # 5: 23:57 -> 23:58              (filler)
+        # 6: 23:58 -> 00:00              (filler)
+        layout = [
+            (time(0, 0), self.off_peak_end, 100, True),
+            (self.off_peak_end, self.evening_start, 100, False),
+            (self.evening_start, self.off_peak_start, min_soc, False),
+            (self.off_peak_start, time(23, 57), 100, True),
+            (time(23, 57), time(23, 58), min_soc, False),
+            (time(23, 58), time(0, 0), min_soc, False),
         ]
+        for i, (start, end, cap, gc) in enumerate(layout):
+            view.claim_slot(i, "start_time", start, reason="baseline scaffold")
+            view.claim_slot(i, "end_time", end, reason="baseline scaffold")
+            view.claim_slot(i, "capacity_soc", cap, reason="baseline scaffold")
+            view.claim_slot(i, "grid_charge", gc, reason="baseline scaffold")
 
         # SPEC §2 globals. SavingSessionRule overrides work_mode to
         # "Selling first" while a session is active; BaselineRule re-
@@ -55,16 +61,15 @@ class BaselineRule(Rule):
         # Charge / discharge limits at 100A match the Sunsynk 5kW
         # nominal max (100A * ~51.2V = 5120W) - leaves the inverter
         # free to use its full rate when needed.
-        state.work_mode = "Zero export to CT"
-        state.energy_pattern = "Load first"
-        state.max_charge_a = 100.0
-        state.max_discharge_a = 100.0
+        view.claim_global("work_mode", "Zero export to CT", reason="baseline default")
+        view.claim_global("energy_pattern", "Load first", reason="baseline default")
+        view.claim_global("max_charge_a", 100.0, reason="baseline default")
+        view.claim_global("max_discharge_a", 100.0, reason="baseline default")
 
-        state.reason_log.append(
+        view.log(
             f"Baseline: overnight charge to 100% until {self.off_peak_end}, "
             f"solar day until {self.evening_start}, "
             f"evening drain to {min_soc}%; "
             f"work_mode=Zero export to CT, energy_pattern=Load first, "
             f"max_charge=100A, max_discharge=100A"
         )
-        return state

@@ -1,10 +1,10 @@
 # custom_components/heo2/rules/ev_charging.py
-"""EVChargingRule — hold SOC during non-IGO EV charging."""
+"""EVChargingRule -- hold SOC during non-IGO EV charging."""
 
 from __future__ import annotations
 
-from ..models import ProgrammeState, ProgrammeInputs
-from ..rule_engine import Rule
+from ..models import ProgrammeInputs
+from ..rule_engine import PRIO_EV_CHARGING, Rule
 
 
 class EVChargingRule(Rule):
@@ -16,13 +16,14 @@ class EVChargingRule(Rule):
 
     name = "ev_charging"
     description = "Hold battery SOC during EV charging"
+    priority_class = PRIO_EV_CHARGING
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         if not inputs.ev_charging:
-            return state
+            return
 
         if inputs.igo_dispatching:
-            return state  # IGO dispatch takes precedence
+            return  # IGO dispatch takes precedence
 
         # Use local-tz-aware lookup. inputs.now is UTC; programme slots
         # are local time-of-day. inputs.now.time() (UTC) was aliasing
@@ -31,16 +32,18 @@ class EVChargingRule(Rule):
             second=0, microsecond=0,
         )
         try:
-            idx = state.find_slot_at(now_time)
+            idx = view.find_slot_at(now_time)
         except ValueError:
-            return state
+            return
 
         hold_soc = max(int(inputs.current_soc), int(inputs.min_soc))
-        if state.slots[idx].capacity_soc < hold_soc:
-            state.slots[idx].capacity_soc = hold_soc
+        if view.get_slot(idx, "capacity_soc") < hold_soc:
+            view.claim_slot(
+                idx, "capacity_soc", hold_soc,
+                reason="hold during EV charge",
+            )
 
-        state.reason_log.append(
+        view.log(
             f"EVCharging: slot {idx + 1} SOC held at {hold_soc}% "
             f"(don't drain battery to feed car)"
         )
-        return state

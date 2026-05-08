@@ -31,8 +31,8 @@ coordinator (HA service call out of scope for pure rule logic).
 
 from __future__ import annotations
 
-from ..models import ProgrammeInputs, ProgrammeState
-from ..rule_engine import Rule
+from ..models import ProgrammeInputs
+from ..rule_engine import PRIO_EV_DEFERRAL, Rule
 
 
 class EVDeferralRule(Rule):
@@ -40,6 +40,7 @@ class EVDeferralRule(Rule):
 
     name = "ev_deferral"
     description = "Stop EV charge during high export when car not needed"
+    priority_class = PRIO_EV_DEFERRAL
 
     def __init__(
         self,
@@ -50,40 +51,35 @@ class EVDeferralRule(Rule):
         self.deferral_min_soc = deferral_min_soc
         self.deferral_min_export_p = deferral_min_export_p
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         if not inputs.defer_ev_eligible:
-            return state
+            return
 
         if inputs.current_soc < self.deferral_min_soc:
-            state.reason_log.append(
+            view.log(
                 f"EVDeferral: eligible but SOC {inputs.current_soc:.0f}% "
                 f"below {self.deferral_min_soc:.0f}% threshold; not deferring"
             )
-            return state
+            return
 
         export_p = inputs.current_export_rate_p
         if export_p is None:
-            state.reason_log.append(
+            view.log(
                 "EVDeferral: eligible but no live export rate; not deferring"
             )
-            return state
+            return
 
         if export_p < self.deferral_min_export_p:
-            # SPEC §12 "ridiculous low export" fallback - let the car
-            # charge as normal, the export wouldn't be worth it.
-            state.reason_log.append(
+            view.log(
                 f"EVDeferral: eligible but export {export_p:.2f}p below "
                 f"{self.deferral_min_export_p:.2f}p threshold; not deferring"
             )
-            return state
+            return
 
-        # All triggers met. Flip work_mode to Selling first and signal
-        # the coordinator to halt the zappi.
-        state.work_mode = "Selling first"
-        state.ev_deferral_active = True
-        state.reason_log.append(
+        view.claim_global("work_mode", "Selling first", reason="EV deferral active")
+        view.claim_global("ev_deferral_active", True, reason="EV deferral triggers met")
+        view.log(
             f"EVDeferral: ACTIVE (SOC {inputs.current_soc:.0f}%, "
             f"export {export_p:.2f}p >= {self.deferral_min_export_p:.2f}p); "
             f"work_mode -> Selling first, zappi -> Stopped"
         )
-        return state

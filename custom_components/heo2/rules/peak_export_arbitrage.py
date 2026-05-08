@@ -38,13 +38,12 @@ sure not to use peak rate electric").
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from ..models import ProgrammeInputs, ProgrammeState, RateSlot
+from ..models import ProgrammeInputs, RateSlot
 from ..rank_pricing import next_cheap_window_start_local
-from ..rule_engine import Rule
+from ..rule_engine import PRIO_PEAK_EXPORT_ARBITRAGE, Rule
 
 
 def _local(dt: datetime, tz: ZoneInfo | None) -> datetime:
@@ -61,6 +60,7 @@ class PeakExportArbitrageRule(Rule):
         "Sell battery surplus at top-priced export slots, sized to "
         "available spare, throttled via discharge rate"
     )
+    priority_class = PRIO_PEAK_EXPORT_ARBITRAGE
 
     def __init__(
         self,
@@ -75,21 +75,12 @@ class PeakExportArbitrageRule(Rule):
         self.battery_voltage_nominal = battery_voltage_nominal
         self.max_discharge_a_default = max_discharge_a_default
 
-    # --- helpers ---------------------------------------------------
-
     def _resolve_cheap_window_start(
         self,
         now_local: datetime,
         import_rates: list[RateSlot],
         tz: ZoneInfo | None,
     ) -> datetime:
-        """Pick the start of the next cheap import window.
-
-        Prefer rate-derived (bottom-25% of upcoming import rates) so
-        Saving Sessions, non-standard IGO blocks, or any tariff change
-        flows through automatically. Fall back to the hardcoded time
-        only when no import rates are loaded.
-        """
         from_rates = next_cheap_window_start_local(
             import_rates, now_local, tz,
         )
@@ -110,13 +101,10 @@ class PeakExportArbitrageRule(Rule):
         now_local: datetime,
         until_local: datetime,
     ) -> float:
-        """Pro-rate hourly forecast values from `now_local` to
-        `until_local`. First and last hours partial-summed."""
         if not forecast_hourly or len(forecast_hourly) < 24:
             return 0.0
         total = 0.0
         cursor = now_local
-        # First partial hour from cursor to next-hour boundary
         while cursor < until_local:
             hour_idx = cursor.hour
             next_boundary = (cursor + timedelta(hours=1)).replace(
@@ -133,8 +121,6 @@ class PeakExportArbitrageRule(Rule):
         forecast_hourly: list[float],
         now_local: datetime,
     ) -> float:
-        """PV forecast from `now` until end of today's local day
-        (23:59)."""
         end_of_day = now_local.replace(
             hour=23, minute=59, second=59, microsecond=0,
         )
@@ -149,10 +135,6 @@ class PeakExportArbitrageRule(Rule):
         cheap_start: datetime,
         tz: ZoneInfo | None,
     ) -> list[RateSlot]:
-        """Filter to export slots that haven't started yet AND start
-        before the cheap window. Selling at 23:00 still counts; selling
-        post-23:30 is moot because we'd be drawing from a battery
-        we're then refilling."""
         out = []
         for r in export_rates:
             start_local = _local(r.start, tz)
@@ -161,11 +143,9 @@ class PeakExportArbitrageRule(Rule):
             out.append(r)
         return out
 
-    # --- main ------------------------------------------------------
-
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         if not inputs.export_rates:
-            return state
+            return
 
         tz = inputs.local_tz
         now_local = inputs.now_local()
@@ -177,10 +157,8 @@ class PeakExportArbitrageRule(Rule):
             inputs.export_rates, now_local, cheap_start, tz,
         )
         if not future_slots:
-            return state
+            return
 
-        # Spare = (current SOC above floor) - load_to_cheap + pv_remaining.
-        # Above-floor because we never sell into the min_soc reserve.
         floor_kwh = inputs.min_soc / 100.0 * inputs.battery_capacity_kwh
         current_kwh = inputs.current_soc / 100.0 * inputs.battery_capacity_kwh
         usable_kwh = max(0.0, current_kwh - floor_kwh)
@@ -195,21 +173,19 @@ class PeakExportArbitrageRule(Rule):
         spare_kwh = usable_kwh - load_to_cheap + pv_remaining
         cheap_str = cheap_start.strftime("%H:%M")
         if spare_kwh <= 0.05:
-            state.reason_log.append(
+            view.log(
                 f"PeakArbitrage: no spare to sell "
                 f"(usable {usable_kwh:.2f} kWh - load_to_{cheap_str} "
                 f"{load_to_cheap:.2f} + pv_remaining "
                 f"{pv_remaining:.2f} = {spare_kwh:.2f} kWh)"
             )
-            return state
+            return
 
-        # Rank slots by rate desc, ties by sooner-is-better
         sorted_slots = sorted(
             future_slots,
             key=lambda r: (-r.rate_pence, _local(r.start, tz)),
         )
 
-        # Allocate spare to top slots, max 2.5 kWh per 30-min slot
         per_slot_max = self.max_discharge_kw * 0.5
         allocations: list[tuple[RateSlot, float]] = []
         remaining = spare_kwh
@@ -222,7 +198,6 @@ class PeakExportArbitrageRule(Rule):
             allocations.append((slot, kwh))
             remaining -= kwh
 
-        # Find the allocated slot covering NOW (if any)
         active_slot: RateSlot | None = None
         active_kwh: float = 0.0
         for slot, kwh in allocations:
@@ -239,32 +214,27 @@ class PeakExportArbitrageRule(Rule):
                 f"({k:.2f} kWh)"
                 for s, k in allocations[:3]
             )
-            state.reason_log.append(
+            view.log(
                 f"PeakArbitrage: spare {spare_kwh:.2f} kWh; "
                 f"sell scheduled in {future_str or 'no future slots'}"
             )
-            return state
+            return
 
-        # We are INSIDE an allocated slot - sell now.
         slot_duration_h = (
             active_slot.end - active_slot.start
         ).total_seconds() / 3600.0
-        # Throttle amp rate so we deliver exactly active_kwh over the
-        # slot's duration. Defensive minimum 1A so the inverter keeps
-        # selling at SOMETHING rather than silently halting.
         kw_for_slot = active_kwh / slot_duration_h
         amps_target = kw_for_slot * 1000.0 / self.battery_voltage_nominal
         amps = max(1.0, min(amps_target, self.max_discharge_a_default))
 
-        state.work_mode = "Selling first"
-        state.max_discharge_a = round(amps, 1)
+        view.claim_global("work_mode", "Selling first", reason="active arbitrage slot")
+        view.claim_global("max_discharge_a", round(amps, 1), reason="throttle to spare amount")
 
         slot_local_start = _local(active_slot.start, tz).strftime("%H:%M")
-        state.reason_log.append(
+        view.log(
             f"PeakArbitrage: ACTIVE - selling {active_kwh:.2f} kWh "
             f"in slot {slot_local_start} "
             f"@ {active_slot.rate_pence:.2f}p "
             f"(spare {spare_kwh:.2f} kWh, throttle {amps:.0f}A); "
             f"work_mode -> Selling first"
         )
-        return state

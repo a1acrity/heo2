@@ -23,8 +23,8 @@ fresh baseline.
 
 from __future__ import annotations
 
-from ..models import ProgrammeInputs, ProgrammeState
-from ..rule_engine import Rule
+from ..models import ProgrammeInputs
+from ..rule_engine import PRIO_EPS, Rule
 
 
 class EPSModeRule(Rule):
@@ -32,17 +32,17 @@ class EPSModeRule(Rule):
 
     name = "eps_mode"
     description = "Override SOC floor + disable grid charge during EPS"
+    priority_class = PRIO_EPS
 
-    def apply(self, state: ProgrammeState, inputs: ProgrammeInputs) -> ProgrammeState:
+    def propose(self, view, inputs: ProgrammeInputs) -> None:
         if not inputs.eps_active:
-            return state
+            return
 
-        for slot in state.slots:
-            slot.capacity_soc = 0
-            slot.grid_charge = False
+        for slot in view.slots:
+            view.claim_slot(slot.index, "capacity_soc", 0, reason="EPS override")
+            view.claim_slot(slot.index, "grid_charge", False, reason="EPS override")
 
-        state.reason_log.append(
+        view.log(
             "EPSMode: grid down, all slots cap=0% gc=False "
             "(H3: allow battery drain to 0%)"
         )
-        return state
