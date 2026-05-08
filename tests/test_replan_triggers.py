@@ -261,3 +261,144 @@ class TestEventTriggers:
             replan_solar_pct=25, replan_load_pct=25, replan_soc_pct=10,
         )
         assert not decision.commit
+
+
+class TestGlobalsChangedCommits:
+    """Real production bug 2026-05-08: PeakArbitrageRule flips
+    `state.work_mode` from "Zero export to CT" to "Selling first" when
+    a tick lands inside an allocated top-priced export slot.
+    EVDeferralRule does the same when its triggers cross threshold.
+    SavingSession on session-end resets work_mode back to baseline
+    (transition False->False is silent).
+
+    None of these transitions are caught by the input-deviation
+    triggers above (forecast / SOC / IGO / saving session / grid).
+    Without a globals-changed trigger, the new programme is computed
+    every tick but never committed - the inverter holds the stale
+    baseline `Zero export to CT` and never exports during the day's
+    top-priced window. Direct revenue loss.
+
+    Each test below: baseline programme has globals A, new programme
+    has globals B, NO input-deviation trigger fires. The trigger MUST
+    fire purely on the globals delta.
+    """
+
+    def _baseline_with_globals(
+        self,
+        *,
+        work_mode="Zero export to CT",
+        energy_pattern="Load first",
+        max_charge_a=100.0,
+        max_discharge_a=100.0,
+    ) -> BaselineSnapshot:
+        prog = _default_programme()
+        prog.work_mode = work_mode
+        prog.energy_pattern = energy_pattern
+        prog.max_charge_a = max_charge_a
+        prog.max_discharge_a = max_discharge_a
+        inputs = _inputs()
+        return capture_baseline(prog, inputs, tz=_LON, is_daily_plan=True)
+
+    def _new_programme(
+        self,
+        *,
+        work_mode="Zero export to CT",
+        energy_pattern="Load first",
+        max_charge_a=100.0,
+        max_discharge_a=100.0,
+    ) -> ProgrammeState:
+        prog = _default_programme()
+        prog.work_mode = work_mode
+        prog.energy_pattern = energy_pattern
+        prog.max_charge_a = max_charge_a
+        prog.max_discharge_a = max_discharge_a
+        return prog
+
+    def _decide(
+        self, *, baseline: BaselineSnapshot, new: ProgrammeState,
+    ):
+        return should_commit_replan(
+            new_programme=new,
+            inputs=_inputs(),
+            baseline=baseline,
+            tz=_LON,
+            daily_plan_time=time(18, 0),
+            replan_solar_pct=25, replan_load_pct=25, replan_soc_pct=10,
+        )
+
+    def test_work_mode_flip_to_selling_first_commits(self):
+        """The PeakArbitrage / SavingSession / EVDeferral case: rule
+        activated, new programme has work_mode=Selling first, baseline
+        had Zero export to CT, no input deviation."""
+        baseline = self._baseline_with_globals(work_mode="Zero export to CT")
+        new = self._new_programme(work_mode="Selling first")
+        decision = self._decide(baseline=baseline, new=new)
+        assert decision.commit, decision.reason
+        assert "global" in decision.reason.lower() or "work_mode" in decision.reason.lower()
+
+    def test_work_mode_flip_back_to_zero_export_commits(self):
+        """Rule deactivated (e.g. saving session ended, peak window
+        passed). New programme reverts to Baseline's `Zero export to
+        CT`; baseline still carried `Selling first`. Without commit
+        the inverter stays in Selling first forever."""
+        baseline = self._baseline_with_globals(work_mode="Selling first")
+        new = self._new_programme(work_mode="Zero export to CT")
+        decision = self._decide(baseline=baseline, new=new)
+        assert decision.commit, decision.reason
+
+    def test_energy_pattern_change_commits(self):
+        baseline = self._baseline_with_globals(energy_pattern="Load first")
+        new = self._new_programme(energy_pattern="Battery first")
+        decision = self._decide(baseline=baseline, new=new)
+        assert decision.commit, decision.reason
+
+    def test_max_discharge_a_change_commits(self):
+        """PeakArbitrage throttles `max_discharge_a` by spare amount
+        when active. Different from Baseline's 100A default."""
+        baseline = self._baseline_with_globals(max_discharge_a=100.0)
+        new = self._new_programme(max_discharge_a=49.0)
+        decision = self._decide(baseline=baseline, new=new)
+        assert decision.commit, decision.reason
+
+    def test_max_charge_a_change_commits(self):
+        baseline = self._baseline_with_globals(max_charge_a=100.0)
+        new = self._new_programme(max_charge_a=50.0)
+        decision = self._decide(baseline=baseline, new=new)
+        assert decision.commit, decision.reason
+
+    def test_globals_unchanged_no_commit(self):
+        """Same globals between baseline and new: no globals trigger,
+        no other trigger fired - hold the baseline. Existing 15-min
+        no-op behaviour preserved."""
+        baseline = self._baseline_with_globals(
+            work_mode="Zero export to CT",
+            energy_pattern="Load first",
+            max_charge_a=100.0,
+            max_discharge_a=100.0,
+        )
+        new = self._new_programme(
+            work_mode="Zero export to CT",
+            energy_pattern="Load first",
+            max_charge_a=100.0,
+            max_discharge_a=100.0,
+        )
+        decision = self._decide(baseline=baseline, new=new)
+        assert not decision.commit
+
+    def test_max_discharge_a_within_tolerance_no_commit(self):
+        """Float compare uses tol=0.5 to match MqttWriter.diff_globals
+        - 99.7 vs 100.0 is below the write threshold, so no spurious
+        commit on noisy float arithmetic."""
+        baseline = self._baseline_with_globals(max_discharge_a=100.0)
+        new = self._new_programme(max_discharge_a=99.8)
+        decision = self._decide(baseline=baseline, new=new)
+        assert not decision.commit
+
+    def test_work_mode_case_insensitive(self):
+        """SA round-trips work_mode strings with occasional case
+        flicker. Equality check should casefold like
+        MqttWriter.diff_globals does."""
+        baseline = self._baseline_with_globals(work_mode="Zero export to CT")
+        new = self._new_programme(work_mode="zero export to ct")
+        decision = self._decide(baseline=baseline, new=new)
+        assert not decision.commit
