@@ -1,9 +1,9 @@
 # HEO III — Operator Module Design
 
-> Status: **draft for review**. This document defines the operator module
-> only. The planner / rules / optimiser layer is deferred to a separate
-> design doc (`HEO_III_PLANNER_DESIGN.md`, TBD) once the operator is
-> complete and tested.
+> Status: **signed off 2026-05-10**, P1.0 ready to begin. This document
+> defines the operator module only. The planner / rules / optimiser
+> layer is deferred to a separate design doc (`HEO_III_PLANNER_DESIGN.md`,
+> TBD) once the operator is complete and tested.
 >
 > Scope discipline: the operator is the **mechanical layer**. It controls
 > everything HEO III could possibly need to control on the inverter and
@@ -410,7 +410,8 @@ class Snapshot:
     inverter_settings: InverterSettings  # current values of writables
 
     # --- peripherals ---
-    ev: EVState                        # charging?, mode, power
+    ev: EVState                        # zappi: charging?, mode, power
+    tesla: Optional[TeslaState]        # SOC, charging, charge_limit, current, at_home
     appliances: ApplianceState         # washer/dryer/dishwasher running flags
 
     # --- rates ---
@@ -755,7 +756,8 @@ class PlannedAction:
     max_discharge_a: Optional[float]
 
     # --- peripheral actions ---
-    ev_action: Optional[EVAction]      # set mode / restore previous
+    ev_action: Optional[EVAction]              # zappi: set mode / restore previous
+    tesla_action: Optional[TeslaAction]        # stop/start, charge_limit, charge_current
     appliances_action: Optional[ApplianceAction]  # which to turn off / on
 
     # --- audit metadata ---
@@ -907,8 +909,9 @@ flag for the user, not a testing tool.
   ~2 days.
 * **P1.2 — Inverter Adapter reads.** Live state collation. Tests
   feeding mock HA states. ~1 day.
-* **P1.3 — Peripheral Adapter.** EV + appliances + reads. Tests
-  asserting service-call shape. ~1 day.
+* **P1.3 — Peripheral Adapter.** Zappi + Tesla (Teslemetry) + appliances
+  + reads. Tesla writes gated on `<vehicle>_located_at_home`. Tests
+  asserting service-call shape and gating logic. ~1.5 days.
 * **P1.4 — World Gatherer rates.** BD + IGO + AgilePredict reads,
   freshness tracking. ~1-2 days.
 * **P1.5 — World Gatherer forecasts.** Solcast + load model wiring.
@@ -936,8 +939,9 @@ flag for the user, not a testing tool.
   `build.lockdown_eps()` on grid-loss transitions). Validates the
   operator doesn't break the live system. ~1 day.
 
-**Total: ~14-17 working days, ~3-4 weeks.** Compute + Build add ~5
+**Total: ~14.5-17.5 working days, ~3-4 weeks.** Compute + Build add ~5
 days vs the previous estimate but absorb the planner's hardest work.
+Tesla addition to P1.3 adds ~0.5 day.
 
 After P1 lands and runs cleanly for a week, planner design begins —
 and starts from a much better place because the operator already
@@ -982,22 +986,24 @@ exposes `compute.bridge_kwh`, `compute.import_volume_under_plan`,
 
 ## 22. Sign-off checklist
 
-- [ ] Scope (§2) — every hook the planner could need is enumerated, nothing missing
-- [ ] Architectural shape (§3) — Operator + adapters + Compute + Build + apply
-- [ ] Inverter writes (§4) — every Sunsynk control HEO III might need
-- [ ] Inverter reads (§5) — every sensor HEO III might need
-- [ ] Peripheral controls + reads (§6, §7) — EV, appliances, future hooks
-- [ ] World rates + forecasts + flags (§8, §9, §10) — full external state
-- [ ] Snapshot shape (§11) — typed, frozen
-- [ ] Compute library (§12) — every derived calculation a planner might need
-- [ ] Build constructors (§13) — every high-level intent → PlannedAction mapping
-- [ ] PlannedAction shape (§14) — typed, frozen
-- [ ] ApplyResult (§15)
-- [ ] Verification + write/read cycle (§16)
-- [ ] Mechanical safety invariants (§17)
-- [ ] Config + tunables (§18)
-- [ ] Testing strategy (§19) — no dry_run for tests
-- [ ] Build phases (§20) — P1.0 through P1.11, estimated 14-17 days
-- [ ] Open questions (§21) — anything to resolve before P1.0?
+Signed off 2026-05-10.
+
+- [x] Scope (§2) — in/out/non-goals enumerated; resolutions confirm scope is right.
+- [x] Architectural shape (§3) — Operator + adapters + Compute + Build + apply.
+- [x] Inverter writes (§4) — slots × 3 + 4 globals; SOC ceiling resolved as `max_charge_current` primitive.
+- [x] Inverter reads (§5) — live telemetry + writable read-backs; EPS detection covered.
+- [x] Peripheral controls + reads (§6, §7) — zappi, Tesla (Teslemetry, gated by located_at_home), appliances.
+- [x] World rates + forecasts + flags (§8, §9, §10) — BD + IGO + AgilePredict + Solcast + HEO-5 + IGO-dispatch + saving-session + EPS.
+- [x] Snapshot shape (§11) — typed, frozen; ev / tesla / appliances split.
+- [x] Compute library (§12) — five families enumerated; surface will grow as planner is built.
+- [x] Build constructors (§13) — energy + mode + peripheral; merge composition.
+- [x] PlannedAction shape (§14) — typed, frozen; ev_action / tesla_action separated.
+- [x] ApplyResult (§15) — typed, frozen; partial-failure surface.
+- [x] Verification + write/read cycle (§16) — PENDING / OK / SET_BUT_UNVERIFIED / FAILED states; write-blocking conditions.
+- [x] Mechanical safety invariants (§17) — 8 invariants covering granularity, contiguity, ranges, vocabularies.
+- [x] Config + tunables (§18) — config_flow + runtime number/select entities.
+- [x] Testing strategy (§19) — unit (mock transport) + integration (live MQTT) + replay; no dry_run for tests.
+- [x] Build phases (§20) — P1.0 through P1.11, estimated 14.5-17.5 days.
+- [x] Open questions (§21) — all five resolved.
 
 After sign-off: open tracking issue, P1.0 begins.
