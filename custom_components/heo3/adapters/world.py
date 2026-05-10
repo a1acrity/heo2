@@ -13,11 +13,15 @@ collates their state into the operator's typed view.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
+from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from ..agilepredict_client import AgilePredictClient
+from ..load_history import learn_days_from_samples
+from ..load_profile import LoadProfile, LoadProfileBuilder
+from ..solar_forecast import solar_forecast_from_hacs
 from ..state_reader import StateReader, parse_float, parse_str
 from ..types import (
     LiveRates,
@@ -93,6 +97,55 @@ class IGOConfig:
     off_peak_end: time = time(5, 30)
 
 
+@dataclass(frozen=True)
+class SolcastConfig:
+    """Solcast HACS entity IDs."""
+
+    forecast_today: str = "sensor.solcast_pv_forecast_forecast_today"
+    forecast_tomorrow: str = "sensor.solcast_pv_forecast_forecast_tomorrow"
+    api_last_polled: str = "sensor.solcast_pv_forecast_api_last_polled"
+
+
+@dataclass(frozen=True)
+class LoadModelConfig:
+    """HEO-5 load model wiring.
+
+    `consumption_entity` is a household energy counter (state_class
+    total_increasing) for the cumulative-kwh aggregator, OR a power-
+    watts entity for the trapezoidal aggregator. Defaults to the SA
+    load_power sensor, treated as power_watts.
+    """
+
+    consumption_entity: str = "sensor.sa_inverter_1_load_power"
+    source_type: str = "power_watts"  # or "cumulative_kwh"
+    learn_days: int = 14
+    baseline_w: float = 1900.0
+
+
+class LoadHistoryReader(Protocol):
+    """Returns (timestamp, watts-or-kwh) samples for the past N days.
+
+    Real implementation in P1.7 wraps hass.history; tests inject a
+    canned list.
+    """
+
+    async def fetch(
+        self, entity_id: str, days_back: int
+    ) -> list[tuple[datetime, float]]: ...
+
+
+class MockLoadHistoryReader:
+    """Returns a pre-supplied sample list. For tests."""
+
+    def __init__(self, samples: list[tuple[datetime, float]] | None = None) -> None:
+        self._samples = list(samples or [])
+
+    async def fetch(
+        self, entity_id: str, days_back: int
+    ) -> list[tuple[datetime, float]]:
+        return list(self._samples)
+
+
 # ── WorldGatherer ─────────────────────────────────────────────────
 
 
@@ -106,12 +159,20 @@ class WorldGatherer:
         bd_config: BDConfig | None = None,
         igo_config: IGOConfig | None = None,
         agilepredict_client: AgilePredictClient | None = None,
+        solcast_config: SolcastConfig | None = None,
+        load_model_config: LoadModelConfig | None = None,
+        load_history_reader: LoadHistoryReader | None = None,
+        local_tz: str = "Europe/London",
         hass=None,  # type: ignore[no-untyped-def]
     ) -> None:
         self._state_reader = state_reader
         self._bd = bd_config
         self._igo = igo_config or IGOConfig()
         self._agilepredict = agilepredict_client
+        self._solcast = solcast_config or SolcastConfig()
+        self._load_model = load_model_config or LoadModelConfig()
+        self._load_history = load_history_reader
+        self._local_tz = ZoneInfo(local_tz)
         self._hass = hass
 
     # ── Rates (P1.4) ──────────────────────────────────────────────
@@ -201,10 +262,97 @@ class WorldGatherer:
     # ── Forecasts (P1.5) ──────────────────────────────────────────
 
     async def read_solar_forecast(self) -> SolarForecast:
-        raise NotImplementedError("P1.5 — World Gatherer forecasts")
+        """Pull P10 / P50 / P90 hourly forecasts from Solcast HACS.
+
+        Returns empty tuples when Solcast attributes are missing —
+        callers should treat empty as "no forecast" not "zero solar".
+        """
+        if self._state_reader is None:
+            return SolarForecast()
+        r = self._state_reader
+
+        today_attrs = r.get_attributes(self._solcast.forecast_today)
+        tomorrow_attrs = r.get_attributes(self._solcast.forecast_tomorrow)
+
+        today_hourly = today_attrs.get("detailedHourly", []) or []
+        tomorrow_hourly = tomorrow_attrs.get("detailedHourly", []) or []
+
+        today_local = datetime.now(self._local_tz).date()
+        tomorrow_local = today_local + timedelta(days=1)
+
+        last_polled = _try_parse_iso(r.get_state(self._solcast.api_last_polled))
+
+        return SolarForecast(
+            today_p50_kwh=tuple(
+                solar_forecast_from_hacs(today_hourly, today_local, "pv_estimate")
+            ),
+            tomorrow_p50_kwh=tuple(
+                solar_forecast_from_hacs(
+                    tomorrow_hourly, tomorrow_local, "pv_estimate"
+                )
+            ),
+            today_p10_kwh=tuple(
+                solar_forecast_from_hacs(today_hourly, today_local, "pv_estimate10")
+            ),
+            today_p90_kwh=tuple(
+                solar_forecast_from_hacs(today_hourly, today_local, "pv_estimate90")
+            ),
+            tomorrow_p10_kwh=tuple(
+                solar_forecast_from_hacs(
+                    tomorrow_hourly, tomorrow_local, "pv_estimate10"
+                )
+            ),
+            tomorrow_p90_kwh=tuple(
+                solar_forecast_from_hacs(
+                    tomorrow_hourly, tomorrow_local, "pv_estimate90"
+                )
+            ),
+            last_updated=last_polled,
+        )
 
     async def read_load_forecast(self) -> LoadForecast:
-        raise NotImplementedError("P1.5 — World Gatherer forecasts")
+        """Build the HEO-5 14-day median profile and return today/tomorrow.
+
+        Returns an empty LoadForecast if no history reader is wired
+        (e.g. P1.0-P1.6 standalone tests). The planner is expected to
+        treat empty-tuples as "no forecast".
+        """
+        today_local = datetime.now(self._local_tz).date()
+        tomorrow_local = today_local + timedelta(days=1)
+        weekday = today_local.weekday()
+
+        if self._load_history is None:
+            return LoadForecast(
+                day_of_week=weekday, is_weekend=weekday >= 5
+            )
+
+        samples = await self._load_history.fetch(
+            self._load_model.consumption_entity,
+            self._load_model.learn_days,
+        )
+        days = learn_days_from_samples(
+            samples, self._local_tz, source_type=self._load_model.source_type
+        )
+        builder = LoadProfileBuilder(baseline_w=self._load_model.baseline_w)
+        for d, hourly in days.items():
+            builder.add_day(
+                datetime(d.year, d.month, d.day, tzinfo=self._local_tz),
+                hourly,
+            )
+        profile: LoadProfile = builder.build()
+
+        today_dt = datetime(
+            today_local.year, today_local.month, today_local.day,
+            tzinfo=self._local_tz,
+        )
+        tomorrow_dt = today_dt + timedelta(days=1)
+
+        return LoadForecast(
+            today_hourly_kwh=tuple(profile.for_datetime(today_dt)),
+            tomorrow_hourly_kwh=tuple(profile.for_datetime(tomorrow_dt)),
+            day_of_week=weekday,
+            is_weekend=weekday >= 5,
+        )
 
     # ── Flags (P1.6) ──────────────────────────────────────────────
 

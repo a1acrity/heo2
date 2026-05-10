@@ -170,12 +170,34 @@ class PredictedRates:
 
 @dataclass(frozen=True)
 class SolarForecast:
-    """Solcast P10/P50/P90 today + tomorrow. Filled in P1.5."""
+    """Solcast hourly forecast — today + tomorrow, P10/P50/P90.
+
+    Each tuple is 24 floats (kWh per hour). Empty tuples mean the
+    Solcast attribute wasn't available; callers should treat this as
+    "no forecast" rather than "zero solar".
+    """
+
+    today_p50_kwh: tuple[float, ...] = ()
+    tomorrow_p50_kwh: tuple[float, ...] = ()
+    today_p10_kwh: tuple[float, ...] = ()
+    today_p90_kwh: tuple[float, ...] = ()
+    tomorrow_p10_kwh: tuple[float, ...] = ()
+    tomorrow_p90_kwh: tuple[float, ...] = ()
+    last_updated: datetime | None = None
 
 
 @dataclass(frozen=True)
 class LoadForecast:
-    """HEO-5 model output today + tomorrow. Filled in P1.5."""
+    """HEO-5 14-day learning model output.
+
+    24 hourly kWh values for today and tomorrow. Weekday vs weekend
+    profiles are distinct; the planner uses `is_weekend` to select.
+    """
+
+    today_hourly_kwh: tuple[float, ...] = ()
+    tomorrow_hourly_kwh: tuple[float, ...] = ()
+    day_of_week: int = 0  # 0=Monday
+    is_weekend: bool = False
 
 
 @dataclass(frozen=True)

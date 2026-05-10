@@ -28,7 +28,14 @@ from .adapters.peripheral import (
     TeslaConfig,
     ZappiConfig,
 )
-from .adapters.world import BDConfig, IGOConfig, WorldGatherer
+from .adapters.world import (
+    BDConfig,
+    IGOConfig,
+    LoadHistoryReader,
+    LoadModelConfig,
+    SolcastConfig,
+    WorldGatherer,
+)
 from .agilepredict_client import AgilePredictClient
 from .build import ActionBuilder
 from .compute import Compute
@@ -74,6 +81,10 @@ class Operator:
         bd_config: BDConfig | None = None,
         igo_config: IGOConfig | None = None,
         agilepredict_client: AgilePredictClient | None = None,
+        solcast_config: SolcastConfig | None = None,
+        load_model_config: LoadModelConfig | None = None,
+        load_history_reader: LoadHistoryReader | None = None,
+        local_tz: str = "Europe/London",
     ) -> None:
         self._transport = transport
         self._hass = hass
@@ -101,6 +112,10 @@ class Operator:
             bd_config=bd_config,
             igo_config=igo_config,
             agilepredict_client=agilepredict_client,
+            solcast_config=solcast_config,
+            load_model_config=load_model_config,
+            load_history_reader=load_history_reader,
+            local_tz=local_tz,
             hass=hass,
         )
 
