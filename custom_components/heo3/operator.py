@@ -22,7 +22,12 @@ from .adapters.inverter import (
     VERIFY_TIMEOUT,
 )
 from .adapters.inverter_validate import SafetyError
-from .adapters.peripheral import PeripheralAdapter
+from .adapters.peripheral import (
+    NO_OP as PERIPHERAL_NO_OP,
+    PeripheralAdapter,
+    TeslaConfig,
+    ZappiConfig,
+)
 from .adapters.world import WorldGatherer
 from .build import ActionBuilder
 from .compute import Compute
@@ -31,6 +36,7 @@ from .const import (
     TICK_HARD_BUDGET_S,
     TICK_WARNING_S,
 )
+from .service_caller import ServiceCaller
 from .state_reader import StateReader
 from .transport import Transport
 from .types import (
@@ -55,15 +61,20 @@ class Operator:
         transport: Transport,
         hass=None,  # type: ignore[no-untyped-def]
         state_reader: StateReader | None = None,
+        service_caller: ServiceCaller | None = None,
         inverter_name: str = DEFAULT_INVERTER_NAME,
         inverter_sensor_prefix: str | None = None,
+        zappi_config: ZappiConfig | None = None,
         zappi_charge_mode_entity: str = "select.zappi_charge_mode",
+        tesla_config: TeslaConfig | None = None,
         tesla_entity_prefix: str | None = None,
         appliance_switches: dict[str, str] | None = None,
+        appliance_running_sensors: dict[str, str] | None = None,
     ) -> None:
         self._transport = transport
         self._hass = hass
         self._state_reader = state_reader
+        self._service_caller = service_caller
 
         self._inverter = InverterAdapter(
             transport=transport,
@@ -72,9 +83,14 @@ class Operator:
             sensor_prefix=inverter_sensor_prefix,
         )
         self._peripheral = PeripheralAdapter(
+            state_reader=state_reader,
+            service_caller=service_caller,
             zappi_charge_mode_entity=zappi_charge_mode_entity,
+            zappi_config=zappi_config,
+            tesla_config=tesla_config,
             tesla_entity_prefix=tesla_entity_prefix,
-            appliance_switches=appliance_switches or {},
+            appliance_switches=appliance_switches,
+            appliance_running_sensors=appliance_running_sensors,
         )
         self._world = WorldGatherer(hass=hass)
 
@@ -155,10 +171,18 @@ class Operator:
         succeeded: list[Write] = []
         failed: list[FailedWrite] = []
         verify_states: dict[str, str] = {}
+        peripheral_outcomes: dict[str, str] = {}
 
         try:
             await asyncio.wait_for(
-                self._execute_writes(writes, succeeded, failed, verify_states),
+                self._execute_all(
+                    writes,
+                    action,
+                    succeeded,
+                    failed,
+                    verify_states,
+                    peripheral_outcomes,
+                ),
                 timeout=TICK_HARD_BUDGET_S,
             )
         except asyncio.TimeoutError:
@@ -166,7 +190,6 @@ class Operator:
                 "apply() exceeded hard budget %ds — aborting tick",
                 TICK_HARD_BUDGET_S,
             )
-            # Record the writes that hadn't been attempted yet as failed.
             attempted_topics = {w.topic for w in succeeded} | {
                 fw.write.topic for fw in failed
             }
@@ -193,9 +216,24 @@ class Operator:
             verification=VerificationResult(states=verify_states),
             duration_ms=duration_ms,
             captured_at=captured_at,
+            peripheral_outcomes=peripheral_outcomes,
         )
 
-    async def _execute_writes(
+    async def _execute_all(
+        self,
+        writes: tuple[Write, ...],
+        action: PlannedAction,
+        succeeded: list[Write],
+        failed: list[FailedWrite],
+        verify_states: dict[str, str],
+        peripheral_outcomes: dict[str, str],
+    ) -> None:
+        await self._execute_inverter_writes(
+            writes, succeeded, failed, verify_states
+        )
+        await self._execute_peripheral_writes(action, peripheral_outcomes)
+
+    async def _execute_inverter_writes(
         self,
         writes: tuple[Write, ...],
         succeeded: list[Write],
@@ -215,6 +253,26 @@ class Operator:
                 )
             else:  # pragma: no cover — defensive
                 failed.append(FailedWrite(write=write, reason=f"unknown: {state}"))
+
+    async def _execute_peripheral_writes(
+        self,
+        action: PlannedAction,
+        peripheral_outcomes: dict[str, str],
+    ) -> None:
+        if action.ev_action is not None:
+            outcome = await self._peripheral.apply_ev(action.ev_action)
+            if outcome != PERIPHERAL_NO_OP:
+                peripheral_outcomes["ev"] = outcome
+        if action.tesla_action is not None:
+            outcome = await self._peripheral.apply_tesla(action.tesla_action)
+            if outcome != PERIPHERAL_NO_OP:
+                peripheral_outcomes["tesla"] = outcome
+        if action.appliances_action is not None:
+            outcome = await self._peripheral.apply_appliances(
+                action.appliances_action
+            )
+            if outcome != PERIPHERAL_NO_OP:
+                peripheral_outcomes["appliances"] = outcome
 
     async def shutdown(self) -> None:
         """Graceful close: MQTT disconnect, pending verifications cancelled."""

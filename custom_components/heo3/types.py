@@ -79,22 +79,43 @@ class InverterSettings:
 # ── Peripherals ─────────────────────────────────────────────────────
 
 
+ZAPPI_VALID_MODES = ("Stopped", "Eco", "Eco+", "Fast")
+
+
 @dataclass(frozen=True)
 class EVState:
-    """Zappi state. Filled in P1.3."""
+    """Zappi snapshot. All fields nullable — entities may be unavailable."""
+
+    charging: bool | None = None  # True if currently delivering power
+    mode: str | None = None  # one of ZAPPI_VALID_MODES
+    charge_power_w: float | None = None
 
 
 @dataclass(frozen=True)
 class TeslaState:
-    """Tesla state via Teslemetry. Filled in P1.3.
+    """Tesla state via Teslemetry.
 
     Gated by `located_at_home` — operator suppresses commands when off.
+    All fields nullable — Teslemetry returns 'unknown' when the car
+    is asleep (which is most of the time).
     """
+
+    soc_pct: float | None = None
+    is_charging: bool | None = None  # derived from sensor.<vehicle>_charging
+    charge_power_w: float | None = None
+    charge_limit_pct: int | None = None  # car-side SOC ceiling
+    charge_current_a: int | None = None  # car-side AC draw
+    cable_plugged: bool | None = None
+    located_at_home: bool | None = None
 
 
 @dataclass(frozen=True)
 class ApplianceState:
-    """Washer / dryer / dishwasher running flags. Filled in P1.3."""
+    """Running flags for the SPEC H3 EPS load-shedding set."""
+
+    washer_running: bool | None = None
+    dryer_running: bool | None = None
+    dishwasher_running: bool | None = None
 
 
 # ── World ───────────────────────────────────────────────────────────
@@ -178,17 +199,47 @@ class SlotPlan:
 
 @dataclass(frozen=True)
 class EVAction:
-    """Zappi-side intent. Filled in P1.3."""
+    """Zappi-side intent.
+
+    `set_mode`: write a specific mode (one of ZAPPI_VALID_MODES) to
+    `select.zappi_charge_mode`.
+    `restore_previous`: use the previously-captured mode (operator
+    captures whenever the planner sets mode=Stopped).
+    """
+
+    set_mode: str | None = None
+    restore_previous: bool = False
 
 
 @dataclass(frozen=True)
 class TeslaAction:
-    """Tesla-side intent: stop/start, charge_limit, charge_current. P1.3."""
+    """Tesla-side intent.
+
+    All fields optional. `None` = don't touch this dimension.
+    `set_charging`: True flips charge switch on, False flips off.
+    `set_charge_limit_pct`: write the car's SOC ceiling (50-100).
+    `set_charge_current_a`: write AC draw amps.
+
+    All writes are silently no-op'd if `located_at_home` is False at
+    apply time — the operator surfaces this in the outcome.
+    """
+
+    set_charging: bool | None = None
+    set_charge_limit_pct: int | None = None
+    set_charge_current_a: int | None = None
 
 
 @dataclass(frozen=True)
 class ApplianceAction:
-    """Which appliances to turn off/on. Filled in P1.3."""
+    """Per-appliance turn off/on.
+
+    Identifiers in `turn_off` and `turn_on` correspond to keys in
+    PeripheralAdapter's `appliance_switches` config — they're not
+    HA entity IDs themselves.
+    """
+
+    turn_off: tuple[str, ...] = ()
+    turn_on: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,7 +303,13 @@ class VerificationResult:
 
 @dataclass(frozen=True)
 class ApplyResult:
-    """What happened during apply(). §15."""
+    """What happened during apply(). §15.
+
+    `peripheral_outcomes` carries the result of peripheral writes
+    (zappi, Tesla, appliances) by adapter name → outcome code. Codes
+    come from `adapters.peripheral`: APPLIED / NO_OP / SKIPPED_NOT_
+    AT_HOME / SKIPPED_NO_CONFIG / SKIPPED_NO_CAPTURED_MODE / FAILED.
+    """
 
     plan_id: str
     requested: tuple[Write, ...]
@@ -262,3 +319,4 @@ class ApplyResult:
     verification: VerificationResult
     duration_ms: float
     captured_at: datetime
+    peripheral_outcomes: dict[str, str] = field(default_factory=dict)
