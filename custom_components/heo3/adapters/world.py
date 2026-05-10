@@ -1,44 +1,204 @@
-"""World Gatherer — read-only collation of HA entities.
+"""World Gatherer — read-only collation of HA entities + external sources.
 
-Rates (BD + IGO + AgilePredict), forecasts (Solcast + HEO-5),
-flags (IGO dispatch, saving session, EPS, temperature alarms).
+Rates (BD + IGO + AgilePredict): P1.4
+Forecasts (Solcast + HEO-5):     P1.5
+Flags (IGO/saving/EPS/temp):      P1.6
 
-P1.0 stub. Full implementation across P1.4 / P1.5 / P1.6.
+All values are read from HA entities or external HTTP — never from
+the SA broker directly. The integrations (BottlecapDave, Solcast,
+octopus_energy, teslemetry) handle the upstream calls; this layer
+collates their state into the operator's typed view.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, time, timezone
+from typing import Any
 
+from ..agilepredict_client import AgilePredictClient
+from ..state_reader import StateReader, parse_float, parse_str
 from ..types import (
     LiveRates,
     LoadForecast,
     PredictedRates,
+    RatePeriod,
     SolarForecast,
     SystemFlags,
 )
 
+logger = logging.getLogger(__name__)
 
-class WorldGatherer:
-    """One pass over external HA state per snapshot tick.
 
-    All values are read from HA entities — never from the network
-    directly. The integrations (BottlecapDave, Solcast, octopus_energy,
-    teslemetry, etc.) handle the upstream calls; this layer just
-    collates their state into the operator's typed view.
+# Conversion: BottlecapDave publishes rates in GBP/kWh; HEO III uses pence.
+GBP_TO_PENCE = 100.0
+
+
+# ── Config dataclasses ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class BDConfig:
+    """BottlecapDave entity IDs for one electricity meter.
+
+    Use `from_meter_key()` to derive from the {mpan}_{serial} key.
     """
 
-    def __init__(self, hass) -> None:  # type: ignore[no-untyped-def]
+    import_current_rate: str
+    export_current_rate: str
+    import_day_rates: str
+    import_next_day_rates: str
+    export_day_rates: str
+    export_next_day_rates: str
+
+    @classmethod
+    def from_meter_key(cls, key: str) -> "BDConfig":
+        """Derive entity IDs from the BD `{mpan}_{serial}` key.
+
+        Example: from_meter_key('18p5009498_2372761090617') gives
+        sensor.octopus_energy_electricity_18p5009498_2372761090617_current_rate, etc.
+        Export entity IDs use the same key — BD pairs import + export
+        on a single meter pair.
+        """
+        return cls(
+            import_current_rate=(
+                f"sensor.octopus_energy_electricity_{key}_current_rate"
+            ),
+            export_current_rate=(
+                f"sensor.octopus_energy_electricity_{key}_export_current_rate"
+            ),
+            import_day_rates=(
+                f"event.octopus_energy_electricity_{key}_current_day_rates"
+            ),
+            import_next_day_rates=(
+                f"event.octopus_energy_electricity_{key}_next_day_rates"
+            ),
+            export_day_rates=(
+                f"event.octopus_energy_electricity_{key}_export_current_day_rates"
+            ),
+            export_next_day_rates=(
+                f"event.octopus_energy_electricity_{key}_export_next_day_rates"
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class IGOConfig:
+    """IGO fixed-rate fallback constants. Per docs/SPEC.md §1, §10."""
+
+    peak_pence: float = 24.8423
+    off_peak_pence: float = 4.9524
+    off_peak_start: time = time(23, 30)
+    off_peak_end: time = time(5, 30)
+
+
+# ── WorldGatherer ─────────────────────────────────────────────────
+
+
+class WorldGatherer:
+    """One pass over external HA state + external HTTP per snapshot tick."""
+
+    def __init__(
+        self,
+        *,
+        state_reader: StateReader | None = None,
+        bd_config: BDConfig | None = None,
+        igo_config: IGOConfig | None = None,
+        agilepredict_client: AgilePredictClient | None = None,
+        hass=None,  # type: ignore[no-untyped-def]
+    ) -> None:
+        self._state_reader = state_reader
+        self._bd = bd_config
+        self._igo = igo_config or IGOConfig()
+        self._agilepredict = agilepredict_client
         self._hass = hass
 
+    # ── Rates (P1.4) ──────────────────────────────────────────────
+
     async def read_rates_live(self) -> LiveRates:
-        raise NotImplementedError("P1.4 — World Gatherer rates")
+        """Read BD's current rates + today/tomorrow rate slot lists.
+
+        Returns an empty LiveRates if BD isn't configured / entities
+        are missing — the operator surfaces this via SPEC H4 freshness
+        checks, not by faking values.
+        """
+        if self._bd is None or self._state_reader is None:
+            return LiveRates()
+        r = self._state_reader
+
+        import_today = _parse_rates_attr(
+            r.get_attributes(self._bd.import_day_rates).get("rates", [])
+        )
+        import_tomorrow = _parse_rates_attr(
+            r.get_attributes(self._bd.import_next_day_rates).get("rates", [])
+        )
+        export_today = _parse_rates_attr(
+            r.get_attributes(self._bd.export_day_rates).get("rates", [])
+        )
+        export_tomorrow = _parse_rates_attr(
+            r.get_attributes(self._bd.export_next_day_rates).get("rates", [])
+        )
+
+        # Current rate sensors publish GBP/kWh; convert to pence.
+        ic = parse_float(r.get_state(self._bd.import_current_rate))
+        ec = parse_float(r.get_state(self._bd.export_current_rate))
+
+        tariff_code = parse_str(
+            r.get_attributes(self._bd.import_current_rate).get("tariff_code")
+        )
+
+        return LiveRates(
+            import_current_pence=ic * GBP_TO_PENCE if ic is not None else None,
+            export_current_pence=ec * GBP_TO_PENCE if ec is not None else None,
+            import_today=import_today,
+            import_tomorrow=import_tomorrow,
+            export_today=export_today,
+            export_tomorrow=export_tomorrow,
+            tariff_code=tariff_code,
+        )
 
     async def read_rates_predicted(self) -> PredictedRates:
-        raise NotImplementedError("P1.4 — World Gatherer rates")
+        """AgilePredict 7-day forward export rates (visualisation only).
+
+        Returns empty PredictedRates if AgilePredict isn't configured
+        or the network call failed (the client returns [] on errors).
+        """
+        if self._agilepredict is None:
+            return PredictedRates()
+        export = await self._agilepredict.fetch_export_rates()
+        # Import predictions aren't currently sourced; reserved for
+        # a future improvement that gets Agile Import predictions too.
+        return PredictedRates(
+            import_pence=(),
+            export_pence=tuple(export),
+        )
 
     async def read_rates_freshness(self) -> dict[str, datetime]:
-        raise NotImplementedError("P1.4 — World Gatherer rates")
+        """Per-source last-updated timestamp for SPEC H4 enforcement.
+
+        Read from each BD entity's `last_updated` if exposed; otherwise
+        fall back to the entity state datetime if it parses. Missing
+        sources are simply absent from the returned dict.
+        """
+        if self._bd is None or self._state_reader is None:
+            return {}
+        out: dict[str, datetime] = {}
+        for label, eid in (
+            ("import_today", self._bd.import_day_rates),
+            ("import_tomorrow", self._bd.import_next_day_rates),
+            ("export_today", self._bd.export_day_rates),
+            ("export_tomorrow", self._bd.export_next_day_rates),
+        ):
+            # BD event entities publish their state as the ISO timestamp
+            # of the last refresh — convenient for freshness tracking.
+            raw_state = self._state_reader.get_state(eid)
+            ts = _try_parse_iso(raw_state)
+            if ts is not None:
+                out[label] = ts
+        return out
+
+    # ── Forecasts (P1.5) ──────────────────────────────────────────
 
     async def read_solar_forecast(self) -> SolarForecast:
         raise NotImplementedError("P1.5 — World Gatherer forecasts")
@@ -46,5 +206,63 @@ class WorldGatherer:
     async def read_load_forecast(self) -> LoadForecast:
         raise NotImplementedError("P1.5 — World Gatherer forecasts")
 
+    # ── Flags (P1.6) ──────────────────────────────────────────────
+
     async def read_flags(self) -> SystemFlags:
         raise NotImplementedError("P1.6 — World Gatherer flags")
+
+    # ── Convenience accessors for IGO config ──────────────────────
+
+    @property
+    def igo(self) -> IGOConfig:
+        """Public access to IGO constants for the planner / Compute layer."""
+        return self._igo
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+
+def _parse_rates_attr(raw: Any) -> tuple[RatePeriod, ...]:
+    """Convert BD's `attributes.rates` list into RatePeriod tuple.
+
+    BD's rate dict shape:
+      {
+        "start": "2026-04-30T23:30:00+01:00",
+        "end":   "2026-05-01T00:00:00+01:00",
+        "value_inc_vat": 0.04952,        # GBP/kWh
+        "is_capped": False,
+        "is_intelligent_adjusted": False,
+      }
+    """
+    if not isinstance(raw, list):
+        return ()
+    out: list[RatePeriod] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        start = _try_parse_iso(entry.get("start"))
+        end = _try_parse_iso(entry.get("end"))
+        gbp = entry.get("value_inc_vat")
+        if start is None or end is None or gbp is None:
+            continue
+        try:
+            pence = float(gbp) * GBP_TO_PENCE
+        except (TypeError, ValueError):
+            continue
+        out.append(RatePeriod(start=start, end=end, rate_pence=pence))
+    out.sort(key=lambda p: p.start)
+    return tuple(out)
+
+
+def _try_parse_iso(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt

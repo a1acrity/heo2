@@ -28,7 +28,8 @@ from .adapters.peripheral import (
     TeslaConfig,
     ZappiConfig,
 )
-from .adapters.world import WorldGatherer
+from .adapters.world import BDConfig, IGOConfig, WorldGatherer
+from .agilepredict_client import AgilePredictClient
 from .build import ActionBuilder
 from .compute import Compute
 from .const import (
@@ -70,6 +71,9 @@ class Operator:
         tesla_entity_prefix: str | None = None,
         appliance_switches: dict[str, str] | None = None,
         appliance_running_sensors: dict[str, str] | None = None,
+        bd_config: BDConfig | None = None,
+        igo_config: IGOConfig | None = None,
+        agilepredict_client: AgilePredictClient | None = None,
     ) -> None:
         self._transport = transport
         self._hass = hass
@@ -92,7 +96,13 @@ class Operator:
             appliance_switches=appliance_switches,
             appliance_running_sensors=appliance_running_sensors,
         )
-        self._world = WorldGatherer(hass=hass)
+        self._world = WorldGatherer(
+            state_reader=state_reader,
+            bd_config=bd_config,
+            igo_config=igo_config,
+            agilepredict_client=agilepredict_client,
+            hass=hass,
+        )
 
         self._compute = Compute()
         self._build = ActionBuilder()

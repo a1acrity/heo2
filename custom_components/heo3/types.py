@@ -122,13 +122,50 @@ class ApplianceState:
 
 
 @dataclass(frozen=True)
+class RatePeriod:
+    """One half-hour rate period.
+
+    `start` and `end` are timezone-aware datetimes (typically UTC after
+    parsing); `rate_pence` is in pence/kWh (BD publishes GBP/kWh —
+    we convert at the boundary).
+    """
+
+    start: datetime
+    end: datetime
+    rate_pence: float
+
+
+@dataclass(frozen=True)
 class LiveRates:
-    """BD import/export rates today + tomorrow. Filled in P1.4."""
+    """Octopus rates from BottlecapDave, plus IGO fixed-rate fallback.
+
+    Per SPEC H4: live rates only ever feed inverter writes. AgilePredict
+    forecasts (`PredictedRates`) NEVER reach the inverter — they're for
+    daily-plan visualisation only.
+
+    Fields are nullable / empty when the BD entity hasn't been
+    discovered or HA is still warming up.
+    """
+
+    import_current_pence: float | None = None
+    export_current_pence: float | None = None
+    import_today: tuple["RatePeriod", ...] = ()
+    import_tomorrow: tuple["RatePeriod", ...] = ()
+    export_today: tuple["RatePeriod", ...] = ()
+    export_tomorrow: tuple["RatePeriod", ...] = ()
+    tariff_code: str | None = None  # for audit log / tariff change detection
 
 
 @dataclass(frozen=True)
 class PredictedRates:
-    """AgilePredict 7-day forward (visualisation only). Filled in P1.4."""
+    """AgilePredict 7-day forward (visualisation only).
+
+    NEVER reaches the inverter (SPEC H4). Used by Compute for daily-
+    plan rendering.
+    """
+
+    import_pence: tuple["RatePeriod", ...] = ()
+    export_pence: tuple["RatePeriod", ...] = ()
 
 
 @dataclass(frozen=True)
