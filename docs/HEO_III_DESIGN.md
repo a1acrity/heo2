@@ -1,601 +1,607 @@
-# HEO III — System Design
+# HEO III — Operator Module Design
 
-> Status: **draft for review**. This document defines what HEO III is, why
-> it's being built, and how it differs from HEO II. Code follows the doc;
-> the doc is the source of truth. Sign off shape and decisions here BEFORE
-> any implementation.
+> Status: **draft for review**. This document defines the operator module
+> only. The planner / rules / optimiser layer is deferred to a separate
+> design doc (`HEO_III_PLANNER_DESIGN.md`, TBD) once the operator is
+> complete and tested.
 >
-> Tracking issue: TBD. Targets: `custom_components/heo3/` in this repo,
-> running side-by-side with HEO II until cutover. Owner: Paddy. Rebuild
-> rationale: post-Phase-3 actuals (week of 2026-05-02 to 2026-05-09)
-> showed the rules-engine architecture cannot natively price uncertainty;
-> 2026-05-08 sold ~24 kWh at 8.7p assuming 4.95p IGO off-peak replacement
-> and ended up paying 28.58p peak when the refill plan failed.
+> Scope discipline: the operator is the **mechanical layer**. It controls
+> everything HEO III could possibly need to control on the inverter and
+> its peripherals, and reads everything HEO III could possibly need to
+> read from the inverter and the wider system. It has zero economic
+> opinions. The same operator must be sufficient to support whatever
+> planner gets built later, including a planner more sophisticated than
+> the one we end up with v1.
+>
+> Tracking issue: TBD. Owner: Paddy. Targets: `custom_components/heo3/`
+> in this repo, building alongside HEO II until cutover.
 
-## 1. Goals and non-goals
+## 1. Why a separate operator module exists
 
-### Goals
+Two reasons, both rooted in HEO II's pain:
 
-1. **Decisions explainable from a single source.** Every action HEO III
-   takes traces back to one explicit cost objective and one set of
-   constraints. No more "rule X overrode rule Y because of execution
-   order; here's the matrix doc that documents it".
-2. **Uncertainty priced in, not assumed away.** Forecasts are wrong some
-   days. The system must reason about that — the cost of selling a kWh
-   should account for the chance the refill plan fails.
-3. **Mechanical control fully decoupled from planning.** The operator
-   module talks to the inverter; the planning module decides what the
-   operator should do. No economics in the operator, no MQTT in the
-   planner.
-4. **All inputs to a decision are observable.** Live audit trail per
-   tick: inputs, optimisation problem, solver result, written outputs,
-   verification.
+1. **Decoupling from economic decisions.** HEO II's rules wrote directly
+   to inverter slot fields, then a writer diffed and published. The
+   coupling meant rule logic and inverter mechanics were entangled —
+   the F2 bug, the writer-init race, the in-progress-slot exclusion bug
+   were all consequences. A clean mechanical layer the planner talks to
+   over a typed interface is the structural fix.
+2. **Hooks-complete on day one.** HEO II added globals (work_mode,
+   energy_pattern, max_charge_a, max_discharge_a) PR by PR over months.
+   Each addition required coordinator, writer, models, and rules edits.
+   HEO III's operator must expose every meaningful inverter and
+   peripheral surface from the start, even if v1 of the planner doesn't
+   use them all. The planner can adopt new hooks without touching the
+   operator.
+
+## 2. Scope
+
+### In scope (the operator owns these)
+
+* **Inverter writes** — slots + globals. Every controllable Sunsynk
+  setting that matters for planning.
+* **Inverter reads** — live SOC, power flows, voltage, grid state, EPS
+  detection, plus read-backs of every writable setting for verification.
+* **Peripheral controls** — EV (zappi) charge mode, household appliance
+  switches (washer/dryer/dishwasher) used during EPS H3.
+* **Peripheral reads** — EV charging state, charge mode, appliance
+  running flags.
+* **External state gathering** — Octopus rates (BottlecapDave), solar
+  forecasts (Solcast), tariff flags (IGO dispatching, planned
+  dispatches, saving sessions). Read-only collation of HA entities.
+* **Verification** — write a value, await SA's response, retry on
+  failure, surface mismatch.
+* **Mechanical safety invariants** — 5-min granularity, slot
+  contiguity, SA value vocabulary, no garbage values reach the
+  inverter.
+
+### Out of scope (the planner will own these later)
+
+* Cost models, forecast uncertainty, optimisation.
+* SOC targets, work_mode choice, when to charge / sell / drain.
+* Anything that requires reasoning about rates, forecasts, or
+  outcomes.
 
 ### Non-goals
 
-1. **Not a market-grade trading system.** We're optimising one battery
-   against published Octopus rates over a 24–48h horizon. No
-   stochastic-process modelling beyond simple forecast scenarios.
-2. **Not a research vehicle.** We pick a working solver, not the most
-   theoretically pure one. CVXPY or PuLP, both well-supported, both
-   battle-tested.
-3. **Not a full Sunsynk abstraction layer.** The operator covers the
-   subset of Sunsynk controls HEO III actually uses. Anything else stays
-   manual.
-4. **Not a UI rewrite.** HA entities, dashboards, switches — copy
-   wholesale from HEO II in spirit. Rebuilding the UI is out of scope.
+* **Not a generic Sunsynk library.** Only the controls HEO III needs
+  exist. New surfaces added when planner needs them.
+* **Not a generic HA integration framework.** It's the right shape for
+  HEO III; it's not trying to be reusable.
+* **Not a real-time fast path.** 15-min coordinator tick + verification
+  cycle is fast enough; we're not chasing sub-second response.
 
-## 2. World model
-
-The load-bearing design choice: HEO III reasons about the world as a
-**state-trajectory optimisation problem** over a rolling 24–48h horizon,
-with explicit uncertainty handling.
-
-### State variables (per 30-min step over the horizon)
-
-* **`soc[t]`** — battery SOC at start of step t, fraction 0..1.
-* **`p_charge[t]`** — power flowing INTO the battery (kW, ≥0).
-* **`p_discharge[t]`** — power flowing OUT of the battery (kW, ≥0).
-* **`p_grid_import[t]`** — power drawn from grid (kW, ≥0).
-* **`p_grid_export[t]`** — power exported to grid (kW, ≥0).
-* **`mode[t]`** — categorical: {`Zero export to CT`, `Selling first`}. Maps
-  to inverter `work_mode`.
-
-### Inputs (per 30-min step)
-
-* **`r_import[t]`** — import rate p/kWh. From BottlecapDave (live, Octopus-
-  published). Falls back to AgilePredict only for plan visualisation —
-  never for actual writes (SPEC H4).
-* **`r_export[t]`** — export rate p/kWh. Same source.
-* **`pv[t]`** — solar generation forecast (kWh in step). From Solcast,
-  with optional P10/P50/P90 bands for uncertainty.
-* **`load[t]`** — house load forecast (kWh in step). From HEO-5 14-day
-  learning model.
-* **`flags[t]`** — categorical state: `eps_active`, `saving_session`,
-  `ev_charging`, `igo_dispatching`, `igo_planned[]`, `defer_ev_eligible`.
-
-### Power balance constraint (per step)
+## 3. Architectural shape
 
 ```
-pv[t] + p_grid_import[t] + p_discharge[t]
-  = load[t] + p_grid_export[t] + p_charge[t]
+┌─────────────────────────────────────────────────────────────┐
+│                         Operator                             │
+│  (single public class, single point of contact for planner)  │
+│                                                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │  Inverter   │  │ Peripheral  │  │   World     │          │
+│  │   Adapter   │  │   Adapter   │  │  Gatherer   │          │
+│  │             │  │             │  │             │          │
+│  │ MQTT write  │  │ HA service  │  │ HA entity   │          │
+│  │ MQTT read   │  │ calls       │  │ reads       │          │
+│  │ verify      │  │ HA entity   │  │             │          │
+│  │             │  │ reads       │  │             │          │
+│  └─────────────┘  └─────────────┘  └─────────────┘          │
+│         │                │                │                  │
+│         ▼                ▼                ▼                  │
+│  ┌──────────────────────────────────────────────────┐       │
+│  │              Snapshot (frozen state)              │       │
+│  │  Single immutable struct, what the world IS now   │       │
+│  └──────────────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────────────┘
+                            ▲
+                            │  (planner consumes Snapshot,
+                            │   produces PlannedAction,
+                            │   passes back to Operator.apply)
 ```
 
-(Approximation; ignores in-step inverter losses except the round-trip
-efficiency baked into SOC continuity below.)
+Three internal sub-modules. One outward-facing class. The planner sees
+the `Operator` interface only.
 
-### SOC continuity constraint
-
-```
-soc[t+1] = soc[t]
-         + (p_charge[t] * dt * eta_charge) / capacity_kwh
-         - (p_discharge[t] / eta_discharge * dt) / capacity_kwh
-```
-
-With `eta_charge ≈ 0.95`, `eta_discharge ≈ 0.95`, round-trip ≈ 0.9.
-`capacity_kwh = 20.48`. `dt = 0.5` (hours per step).
-
-### Operating limits
-
-* `min_soc ≤ soc[t] ≤ 1.0` for all t. (`min_soc = 0.1`, configurable.)
-* `0 ≤ p_charge[t] ≤ p_max_charge`. `p_max_charge = 5 kW` (Sunsynk
-  nominal at full A).
-* `0 ≤ p_discharge[t] ≤ p_max_discharge`. Same limit.
-* `0 ≤ p_grid_import[t] ≤ p_inverter_max`. `p_inverter_max = 5 kW`.
-* `0 ≤ p_grid_export[t] ≤ p_inverter_max`.
-* **No simultaneous charge + discharge** (linearised via mode binary).
-* **No simultaneous import + export** in `Zero export to CT` mode (mode
-  binary controls).
-
-### Uncertainty representation
-
-Two options, pick one for v1:
-
-**Option U1: Deterministic with safety margin.** Use a single forecast
-(P50). Add a `safety_kwh` reserve to the SOC at the end of horizon —
-forces the optimiser to land at a higher SOC than minimum, buffering
-against forecast misses. Simpler. Tunable via one parameter.
-
-**Option U2: Multi-scenario stochastic.** Solve over N forecast
-scenarios (e.g., low-PV / median / high-PV from Solcast P10/P50/P90),
-weight by probability, optimise expected cost. Naturally prices
-uncertainty. Roughly 3x compute. Standard formulation, well-supported.
-
-**Recommendation:** start with U1 (deterministic + safety margin) for
-v1, upgrade to U2 once the rest is stable. The safety margin is the
-single knob that fixes the 2026-05-08 failure pattern; U2 is a
-refinement.
-
-## 3. Decision model
-
-### Objective function (cost to minimise)
-
-```
-total_cost =
-    SUM over horizon t {
-        r_import[t] * p_grid_import[t] * dt           # buy energy
-      - r_export[t] * p_grid_export[t] * dt           # sell energy
-    }
-  + cycle_cost * total_throughput_kwh
-  + boundary_cost(soc[T] vs target_end_soc)
-```
-
-* **`cycle_cost`**: small per-kWh penalty on battery throughput
-  (`p_charge + p_discharge` summed over horizon) to enforce the SPEC H7
-  soft cap of 2 cycles/day. ~0.5p/kWh; tunes the optimiser away from
-  marginal arbitrage that would burn cycle budget.
-* **`boundary_cost`**: large penalty if `soc[T]` (end of horizon) is
-  below `target_end_soc`. Forces the plan to leave the battery in a
-  reasonable state for the next planning window. This is the
-  **uncertainty-pricing knob**: setting `target_end_soc` higher than
-  strictly necessary buffers against forecast miss. The 2026-05-08
-  failure was effectively `target_end_soc = min_soc` — no buffer.
-
-### Hard constraints (no plan exists if violated)
-
-* SPEC H1 — no `grid_charge=True` covering peak hours (28.58p slots).
-* SPEC H2 — during `ev_charging`, `p_discharge[t] = 0` (battery doesn't
-  feed EV).
-* SPEC H3 — during `eps_active`, `min_soc → 0` (allow drain to floor).
-* SPEC H4 — write only published rates; if any `r_import` or `r_export`
-  for the next 6h is from forecast not BD, refuse to write (planner
-  still runs for diagnostics).
-* SPEC H7 — running cycle count over last 3 days < `cycle_budget * 3`
-  (alert only, doesn't block plans).
-
-### Soft objectives (encoded as cost terms)
-
-* SPEC §5 priority 1 (avoid peak import) — already implicit in
-  objective (peak `r_import` is high, optimiser avoids).
-* SPEC §5 priority 2 (avoid grid use) — implicit (any positive
-  `p_grid_import` adds cost).
-* SPEC §5 priority 3 (sell during top windows) — implicit (high
-  `r_export` slots have higher revenue).
-* SPEC §5 priority 4 (PV ROI) — implicit (every kWh of PV displaces
-  imports, no separate term needed).
-* SPEC §5 priority 5 (Saving Sessions) — when `saving_session = True`
-  in the flags, override `r_export[t]` for the session window with the
-  session price (£3+/kWh) so the optimiser naturally drains.
-
-### Solver
-
-* **CVXPY** for the convex relaxation, **CBC** (via PuLP) or **SCIP**
-  for the MILP when mode binaries are active.
-* For one battery, 24h horizon at 30-min granularity = 48 timesteps.
-  Variables: ~250. Solves in <1s on the HA host.
-* If solver time becomes a bottleneck, drop to deterministic (U1) only
-  and skip mode binaries by selecting work_mode heuristically post-
-  solve.
-
-### Mapping the 48-step trajectory back to 6 inverter slots
-
-The Sunsynk has 6 hard slots; the optimiser produces 48 steps. We need
-to compress.
-
-**Strategy:** the optimiser is run as a 48-step problem to find the
-ideal trajectory. Then a separate **slot-mapping** step finds the 6
-slot boundaries (subject to 5-min granularity and `start[0] = 00:00`,
-`end[5] = 00:00`) that minimise the L2 error between the 6-slot
-piecewise-constant SOC schedule and the 48-step ideal. Tractable as a
-small dynamic-programming search over candidate boundaries.
-
-Result: 6 slots × `{start_time, end_time, capacity_soc, grid_charge}`
-+ globals `{work_mode, energy_pattern, max_charge_a, max_discharge_a}`.
-Same shape the operator already accepts — no disruption to write path.
-
-## 4. Worked example: how HEO III handles 2026-05-08
-
-### Inputs at 18:00 daily-plan time (2026-05-08)
-
-* SOC: 80%
-* Capacity: 20.48 kWh, min_soc = 10% (= 2.05 kWh floor)
-* Load forecast 18:00-23:30: 4.5 kWh (evening peak)
-* Load forecast 23:30-05:30: 1.0 kWh (overnight)
-* Load forecast 05:30-09:00: 2.0 kWh (morning before PV takeover)
-* PV forecast tomorrow: 53.1 kWh (Solcast P50)
-* Tomorrow load total: ~22 kWh
-* Export rates 18:00-23:30: 11-13p, top 3 around 11.66-13.28p
-* Export rates 17:30-19:30 (current peak): around 11-13p
-* Import rates: peak 28.58p (06:00-23:30), off-peak 4.95p (23:30-06:00)
-
-### What HEO II actually did (2026-05-08, ground truth)
-
-PeakArbitrage's `worth_selling` test: `11.66 × 0.9 = 10.5p > 4.95p`
-replacement → sell. Allocated 8 kWh of "spare" to top 3-4 export slots.
-Drained battery from 51% to 10% (floor) by 22:00. Overnight cheap charge
-sized for 0.2 kWh morning bridge — landed at 20% by 05:30. Hit floor
-mid-morning before PV took over. Imported at peak rate ~5p worth.
-
-### What HEO III does
-
-The optimiser gets the same inputs but with `target_end_soc = 50%`
-(safety margin) and the cycle_cost term active.
-
-Setting up the cost function:
-
-* Selling at 11.66p between 21:30-22:00 nets 11.66p × 2.5 kWh × 0.5h =
-  ~14.6p revenue per slot.
-* Replacement at peak (28.58p) if the plan miscalculates: 28.58p × 2.5
-  kWh = 71.5p cost. Asymmetry baked in.
-* `boundary_cost(soc[T] < 50%)`: penalty grows steeply below 50% at
-  end-of-horizon to enforce the safety reserve.
-
-Solver output:
-
-* Drain limited to ~30% SOC by midnight (above the 50% target_end means
-  the optimiser leaves margin even with cycle cost favouring deeper
-  drain).
-* Sells ~6 kWh across top 2 export slots (not 4 — marginal profit on
-  3rd/4th slot is below the implicit cycle + uncertainty cost).
-* Overnight charge target: 75% (not 20%) — bridges next-day morning
-  load with a margin against PV being later than P50.
-* Result: 0 peak imports overnight or morning. ~£2.50 export revenue
-  (vs HEO II's £4.29). Net day position basically equivalent or
-  slightly better, with the catastrophe-tail risk removed.
-
-The crucial difference: in HEO II, `worth_selling` was a per-rule
-local decision against off-peak replacement. In HEO III, every kWh
-sold is weighed against the optimiser's full forecast-aware cost
-function — including the explicit risk of the refill failing.
-
-## 5. Failure-mode tests
-
-The doc must articulate how the design handles plausible failure
-modes beyond 2026-05-08. Each becomes a regression test scenario in
-`tests/heo3/test_scenarios/`.
-
-### S1: Heavy unpredicted evening load (oven, dishwasher, AC)
-
-* Forecast: 4.5 kWh evening load. Actual: 7 kWh.
-* HEO II behaviour: PeakArbitrage allocated assuming 4.5; battery hits
-  floor at ~21:00, peak imports for the rest of the evening.
-* HEO III behaviour: `boundary_cost` keeps the plan at higher
-  end-of-horizon SOC; even with 50% over-run, battery stays well
-  above floor until cheap window. Once cheap charge arrives, replan
-  on Wednesday's tick incorporates the new load reality.
-
-### S2: PV under-delivers (cloudy day, forecast missed)
-
-* Forecast: 53 kWh PV. Actual: 25 kWh.
-* HEO II behaviour: CheapRateCharge sized overnight target tight
-  (53 kWh PV will refill); battery starts day at 20%; PV doesn't
-  refill enough; evening drain hits floor; peak imports.
-* HEO III behaviour: `target_end_soc` keeps overnight charge target
-  at 75% (not 20%). Even with PV miss, evening doesn't strand.
-  Cycle cost may grow but no peak imports.
-
-### S3: Saving session + IGO dispatch overlap
-
-* Saving session 17:00-18:00, IGO dispatch 17:30-18:30.
-* HEO II behaviour: F2 bug pre-2026-05-08 (IGO refilled session
-  battery). Fixed by guard.
-* HEO III behaviour: both contributors emit constraints. Saving
-  session emits "during [17:00,18:00], `mode = Selling first` and
-  `r_export = £3+/kWh`". IGO dispatch emits "during [17:30,18:30],
-  prefer `p_charge` if cheap rate available". The optimiser
-  reconciles natively — sells through the session, charges in the
-  remaining 30 min after.
-
-### S4: Grid loss during a planned export
-
-* `eps_active = True` mid-tick.
-* HEO II behaviour: EPSModeRule overrides all slots cap=0, gc=False.
-* HEO III behaviour: hard constraint `eps_active → min_soc = 0,
-  p_grid_export = p_grid_import = 0`. Optimiser produces the EPS
-  plan; operator writes it; coordinator turns off EV / appliance
-  switches per SPEC H3.
-
-### S5: BD outage (no live rates)
-
-* BottlecapDave returns no rates this tick.
-* HEO II behaviour: `_live_rates_present = False`, writes blocked.
-* HEO III behaviour: same. Operator refuses to apply if SPEC H4
-  guard fails. Planner still runs for visualisation / dashboard.
-
-## 6. Operator module
-
-`custom_components/heo3/operator/`. Owns the inverter — full mechanical
-control, no opinions.
-
-### Public API
+### Public API (single source of truth for the planner)
 
 ```python
 class Operator:
-    async def read_state() -> InverterState
-    async def apply(plan: PlannedState) -> ApplyResult
-    def snapshot() -> InverterState  # cached, last-known
+    async def snapshot(self) -> Snapshot:
+        """Gather a complete frozen state: inverter + peripherals +
+        world. Single call returns everything the planner needs."""
+
+    async def apply(self, action: PlannedAction) -> ApplyResult:
+        """Mechanically execute a planned action: inverter writes,
+        peripheral changes. Verifies and reports per-write outcome."""
+
+    async def shutdown(self) -> None:
+        """Graceful close: MQTT disconnect, pending verifications
+        cancelled."""
 ```
 
-### `InverterState` shape
+Three methods. Everything else is internal organisation.
+
+## 4. Inverter Adapter — Writes
+
+All inverter control. MQTT to Solar Assistant's broker
+(`192.168.4.7:1883`), topics under `solar_assistant/inverter_1/...`. Per
+SPEC §2: writes only ever go to inverter 1; inverter 2 is RS485-mirrored.
+
+### Per-slot writes (×6 slots, slot N ∈ {1..6})
+
+| Field | Topic | Value type | Notes |
+|---|---|---|---|
+| Slot N start time | `set/inverter/inverter_1/time_point_N` | `"HH:MM"` | 5-min granularity. Slot N's START — slot covers [start_N, start_{N+1}). Slot 1 always starts at 00:00; slot 6 always ends at 00:00. |
+| Slot N grid charge | `set/inverter/inverter_1/grid_charge_point_N` | `"true"` / `"false"` | **Lowercase** per SA value vocabulary (HEO-32 incident pinned this). |
+| Slot N capacity SOC | `set/inverter/inverter_1/capacity_point_N` | `"0".."100"` | Integer percent. SA accepts plain number string. |
+
+### Global writes
+
+| Field | Topic | Values | Notes |
+|---|---|---|---|
+| Work mode | `set/inverter/inverter_1/work_mode` | `"Selling first"` / `"Zero export to load"` / `"Zero export to CT"` | Case + whitespace as exposed by SA discovery. |
+| Energy pattern | `set/inverter/inverter_1/energy_pattern` | `"Battery first"` / `"Load first"` | |
+| Max charge current | `set/inverter/inverter_1/max_charge_current` | `"0".."350"` | Amps. Sunsynk 5kW peaks ~100A at 51.2V. |
+| Max discharge current | `set/inverter/inverter_1/max_discharge_current` | `"0".."350"` | Amps. |
+| Zero export to CT enabled | `set/inverter/inverter_1/zero_export_to_ct` | `"true"` / `"false"` | **New for HEO III** — not in HEO II. Per SPEC §2 item 8. Verify SA value vocabulary via mosquitto-probe before relying on it. |
+| Battery max SOC | `set/inverter/inverter_1/battery_max_soc` | `"0".."100"` | **New for HEO III** — gives planner a way to set system-level SOC ceiling without touching all 6 slots. May not exist on all firmwares; probe first. |
+
+### Write semantics
+
+* **Diff-only**: a write is published only when the new value differs
+  from the last-known inverter state (case-insensitive for strings,
+  tolerance 0.5 for floats).
+* **Atomic per-action**: a `PlannedAction` produces a list of writes;
+  the operator publishes them in a defined order (work_mode first
+  because some other settings depend on it; slot writes after; max
+  current limits last).
+* **Sequenced**: writes go out one at a time with await for SA
+  response. Avoid the FIFO-correlation hack from HEO II's writer.
+* **Retry on failure**: 3 retries with 5s backoff. After failure,
+  surface in `ApplyResult.failed`. Coordinator decides whether to retry
+  the whole tick.
+
+## 5. Inverter Adapter — Reads
+
+Live state via SA's MQTT-discovered HA entities (sensor.sa_inverter_1_*).
+The inverter pushes telemetry every few seconds; HA caches; operator
+reads HA's cache.
+
+### Live telemetry
+
+| Field | Entity | Units | Used for |
+|---|---|---|---|
+| Battery SOC | `sensor.sa_inverter_1_battery_soc` | % (0..100) | Planning (current state). |
+| Battery power | `sensor.sa_inverter_1_battery_power` | W (signed: +charge, -discharge) | Verification + dashboard. |
+| Battery current | `sensor.sa_inverter_1_battery_current` | A (signed) | Verification. |
+| Battery voltage | `sensor.sa_inverter_1_battery_voltage` | V | Capacity sanity check. |
+| Grid power | `sensor.sa_inverter_1_grid_power` | W (signed: +import, -export) | Verification + dashboard. |
+| Grid voltage | `sensor.sa_inverter_1_grid_voltage` | V | EPS detection (=0 → grid down). |
+| Grid frequency | `sensor.sa_inverter_1_grid_frequency` | Hz | Grid quality check (optional). |
+| Solar power | `sensor.sa_inverter_1_solar_power` | W (≥0) | PV measurement. |
+| Load power | `sensor.sa_inverter_1_load_power` | W (≥0) | House load measurement. |
+| Inverter temperature | `sensor.sa_inverter_1_inverter_temperature` | °C | Health monitor. |
+| Battery temperature | `sensor.sa_inverter_1_battery_temperature` | °C | Health monitor; clamps charge/discharge. |
+| EPS active | derived from `grid_voltage == 0` for >5s | bool | SPEC H3 trigger. |
+
+### Setting read-backs (for write verification)
+
+Every writable setting has a corresponding read sensor (per SA
+discovery). The operator reads these to verify writes landed:
+
+| Setting | Read entity |
+|---|---|
+| `time_point_N` | `sensor.sa_inverter_1_time_point_N` |
+| `grid_charge_point_N` | `sensor.sa_inverter_1_grid_charge_point_N` |
+| `capacity_point_N` | `sensor.sa_inverter_1_capacity_point_N` |
+| `work_mode` | `sensor.sa_inverter_1_work_mode` |
+| `energy_pattern` | `sensor.sa_inverter_1_energy_pattern` |
+| `max_charge_current` | `sensor.sa_inverter_1_max_charge_current` |
+| `max_discharge_current` | `sensor.sa_inverter_1_max_discharge_current` |
+| `zero_export_to_ct` | `sensor.sa_inverter_1_zero_export_to_ct` (verify exists) |
+| `battery_max_soc` | `sensor.sa_inverter_1_battery_max_soc` (verify exists) |
+
+### Special handling: 5-min granularity for time_point reads
+
+Sunsynk floors written time values to the nearest 5-minute boundary.
+Writing `23:57` results in a read-back of `23:55`. The operator
+**snaps writes to 5-min before publishing**, and verifies against the
+snapped value. Same as HEO II's SafetyRule.
+
+## 6. Peripheral Adapter — Controls
+
+### EV charging (zappi)
+
+| Action | Mechanism | Notes |
+|---|---|---|
+| Stop EV charging | `select.set_option` on `select.zappi_charge_mode` to `"Stopped"` | One-shot. Used by SPEC §12 EV deferral and SPEC H3 EPS. |
+| Restore EV charging | `select.set_option` on same entity to previously-captured mode | Operator captures the mode before stopping; restores on transition out. |
+| Set EV charging mode | `select.set_option` on `select.zappi_charge_mode` to any of {`"Eco+"`, `"Eco"`, `"Fast"`, `"Stopped"`} | General-purpose hook for future planner. |
+
+### Household appliances (SPEC H3 EPS handling)
+
+| Action | Mechanism | Notes |
+|---|---|---|
+| Turn off washer | `switch.turn_off` on `switch.washer` | EPS H3. |
+| Turn off dryer | `switch.turn_off` on `switch.dryer` | EPS H3. |
+| Turn off dishwasher | `switch.turn_off` on `switch.dishwasher` | EPS H3. |
+| Turn on each | `switch.turn_on` on the same entity | When EPS clears or planner decides to defer to off-peak. |
+
+### Tesla (future hook, may not be wired v1)
+
+| Action | Mechanism | Notes |
+|---|---|---|
+| Stop charging | `service: tesla.stop_charge` (or HA-native equivalent) | Currently HEO II uses zappi-only; Tesla support is a future planner feature. |
+
+### Configurability
+
+Every peripheral entity ID is a config option, not hardcoded. Defaults
+match Paddy's house (zappi, named appliances) but the operator can be
+deployed elsewhere with different entities.
+
+## 7. Peripheral Adapter — Reads
+
+| Field | Entity | Used for |
+|---|---|---|
+| EV charging now | `sensor.zappi_charging_state` (or equivalent reading "Charging" / "Connected" / etc.) | SPEC H2 (no battery → EV) trigger. |
+| EV charge mode | `select.zappi_charge_mode` (state) | Restore-after-deferral. |
+| EV power demand | `sensor.zappi_charge_power` | Capacity awareness. |
+| Washer running | `binary_sensor.washer_running` | Active appliance flag. |
+| Dryer running | `binary_sensor.dryer_running` | Active appliance flag. |
+| Dishwasher running | `binary_sensor.dishwasher_running` | Active appliance flag. |
+| Tesla charging now | (TBD entity if/when Tesla integration is added) | Future. |
+
+## 8. World Gatherer — Rates
+
+External state read-only. Planner needs accurate live rates plus
+forecasts.
+
+### Octopus rates (BottlecapDave integration)
+
+| Field | Entity / source | Notes |
+|---|---|---|
+| Live import rate (current) | `sensor.bottlecapdave_octopus_import_current_rate` | Used for live cost, never for forward writes (SPEC H4). |
+| Live import rates (today) | Attribute `import_rates_today` on BD entity | List of `{start, end, rate_pence}`. 30-min slots. |
+| Live import rates (tomorrow) | Attribute `import_rates_tomorrow` | Available after 16:00 BST publish. Empty before. |
+| Live export rate (current) | `sensor.bottlecapdave_octopus_export_current_rate` | |
+| Live export rates (today) | Attribute `export_rates_today` | |
+| Live export rates (tomorrow) | Attribute `export_rates_tomorrow` | After 16:00. |
+| Tariff identifier | Attribute `tariff_code` | Audit log; differentiating tariff changes. |
+| Live-data freshness | Derived: max age of any rate entity | SPEC H4 enforcement: writes blocked if stale. |
+
+### IGO fixed rates (fallback for past-horizon-of-BD)
+
+| Field | Source | Notes |
+|---|---|---|
+| IGO peak rate | Config (24.84p) | Constant. |
+| IGO off-peak rate | Config (4.95p) | Constant. |
+| IGO off-peak window | Config (23:30-05:30 local) | Constant. |
+
+### AgilePredict (forecast — visualisation only, never written)
+
+| Field | Source | Notes |
+|---|---|---|
+| Predicted import rates (next 7 days) | AgilePredict API/integration | NEVER reaches the inverter (SPEC H4). Used for daily-plan visualisation. |
+| Predicted export rates (next 7 days) | AgilePredict API/integration | Same. |
+
+## 9. World Gatherer — Forecasts
+
+### Solar (Solcast)
+
+| Field | Entity / source | Notes |
+|---|---|---|
+| Solar forecast today (hourly) | `sensor.solcast_pv_forecast_today` (attr `detailedForecast`) | 24 hourly buckets in kWh. |
+| Solar forecast tomorrow (hourly) | `sensor.solcast_pv_forecast_tomorrow` | 24 hourly buckets. |
+| Solar forecast P10 / P50 / P90 | Solcast attributes | For uncertainty handling. Available; not all planners use. |
+| Forecast freshness | Last updated timestamp | If stale (>24h), planner is told. |
+
+### Load (HEO-5 14-day learning model)
+
+| Field | Source | Notes |
+|---|---|---|
+| Load forecast today (hourly) | HEO-5 model output | 24 hourly buckets in kWh. Learned from past 14 days, weekday/weekend split. |
+| Load forecast tomorrow (hourly) | Same | |
+| Day-of-week + season tag | Derived from `now` | Helps the planner pick the right learned profile. |
+
+The HEO-5 model itself is currently part of HEO II
+(`load_profile.py` + `load_history.py`). For HEO III: port as-is into
+the operator's world gatherer; the planner reads the forecast like any
+other input. Future improvement (out of scope): replace with a more
+sophisticated model.
+
+## 10. World Gatherer — Flags + Events
+
+### Octopus / tariff events
+
+| Flag | Source | Notes |
+|---|---|---|
+| `igo_dispatching` | `binary_sensor.octopus_energy_..._intelligent_dispatching` | True when Octopus is actively running an IGO smart-charge dispatch right now. |
+| `igo_planned[]` | Attribute `planned_dispatches` on the same binary sensor | List of `{start, end, charge_kwh, source}`. Next 24h. |
+| `saving_session_active` | `binary_sensor.octopus_energy_octoplus_saving_sessions` | True during an Octoplus session. |
+| `saving_session_window` | Attribute on the binary sensor | `{start, end}` of current session. |
+| `saving_session_price` | Attribute | Pence per kWh, typically £3+. |
+
+### Mechanical / safety flags
+
+| Flag | Source | Notes |
+|---|---|---|
+| `eps_active` | Derived: `grid_voltage == 0` for ≥5s | SPEC H3 trigger. |
+| `grid_connected` | Inverse of `eps_active`. | |
+| `inverter_temperature_alarm` | Derived: temperature > config threshold | Future hook. |
+| `battery_temperature_alarm` | Derived: temperature outside (5°C, 50°C) | Limits charge/discharge. |
+
+### Configuration / mode flags
+
+| Flag | Source | Notes |
+|---|---|---|
+| `defer_ev_eligible` | `switch.heo3_defer_ev_when_export_high` | User-set; SPEC §12. |
+| `min_soc` | `number.heo3_min_soc` | User-set; SPEC §1. |
+| `cycle_budget_per_day` | `number.heo3_cycle_budget` | User-set; SPEC H7. |
+| `target_end_soc` | `number.heo3_target_end_soc` | User-set; planner uncertainty knob (only used by planner; operator just exposes the value). |
+
+## 11. Snapshot — the planner's input
+
+Single immutable dataclass. Operator builds it from all three adapters
+in one call. Frozen so the planner can't accidentally mutate.
 
 ```python
 @dataclass(frozen=True)
-class InverterState:
-    soc_pct: float                  # live, 0..100
-    slots: tuple[SlotState, ...]    # 6 slots, current
-    work_mode: str
-    energy_pattern: str
-    max_charge_a: float
-    max_discharge_a: float
-    grid_voltage: float
-    eps_active: bool
-    captured_at: datetime
+class Snapshot:
+    captured_at: datetime              # UTC, when this snapshot was built
+    local_tz: ZoneInfo                 # for time-of-day comparisons
+
+    # --- inverter live state ---
+    inverter: InverterState            # all sensors above
+    inverter_settings: InverterSettings  # current values of writables
+
+    # --- peripherals ---
+    ev: EVState                        # charging?, mode, power
+    appliances: ApplianceState         # washer/dryer/dishwasher running flags
+
+    # --- rates ---
+    rates_live: LiveRates              # BD import/export today + tomorrow
+    rates_predicted: PredictedRates    # AgilePredict (visualisation only)
+    rates_freshness: dict[str, datetime]  # last update per source
+
+    # --- forecasts ---
+    solar_forecast: SolarForecast      # P50 + bands today + tomorrow
+    load_forecast: LoadForecast        # HEO-5 model today + tomorrow
+
+    # --- flags ---
+    flags: SystemFlags                 # eps_active, igo_dispatching, etc.
+
+    # --- config ---
+    config: SystemConfig               # min_soc, cycle_budget, target_end_soc
 ```
 
-### `PlannedState` shape
+Every nested type is a `@dataclass(frozen=True)`. Construction is one
+call; reading is direct attribute access; planners never block on
+operator I/O during a tick.
 
-Same as the rules module produces — 6 slots + globals. Pre-validated.
+## 12. PlannedAction — the planner's output
 
-### `ApplyResult` shape
+Equally typed. Whatever the planner produces, this is the shape:
+
+```python
+@dataclass(frozen=True)
+class PlannedAction:
+    # --- inverter writes ---
+    slots: tuple[SlotPlan, ...]        # exactly 6 (or empty = no slot changes this tick)
+    work_mode: Optional[str]
+    energy_pattern: Optional[str]
+    max_charge_a: Optional[float]
+    max_discharge_a: Optional[float]
+    zero_export_to_ct: Optional[bool]
+    battery_max_soc: Optional[int]
+
+    # --- peripheral actions ---
+    ev_action: Optional[EVAction]      # set mode / restore previous
+    appliances_action: Optional[ApplianceAction]  # which to turn off / on
+
+    # --- audit metadata ---
+    plan_id: str                       # UUID for the audit trail
+    rationale: str                     # human-readable summary
+    source_planner_version: str        # tracks which planner produced this
+
+    # --- safety acks ---
+    spec_h4_live_rates: bool           # planner asserts rates are live
+    spec_h5_validated: bool            # planner asserts pre-validation passed
+```
+
+`Optional[...]` fields = "don't touch this dimension". The operator
+diffs; absent fields produce no writes.
+
+## 13. ApplyResult — what happened
 
 ```python
 @dataclass(frozen=True)
 class ApplyResult:
-    requested_writes: tuple[Write, ...]
-    successful: tuple[Write, ...]
-    failed: tuple[Write, ...]      # with reason
-    verification: VerificationResult
+    plan_id: str
+    requested: tuple[Write, ...]       # what the operator tried to do
+    succeeded: tuple[Write, ...]
+    failed: tuple[FailedWrite, ...]    # with reason
+    skipped: tuple[SkippedWrite, ...]  # diff said no-op
+    verification: VerificationResult   # post-write sensor read-back
+    duration_ms: float
+    captured_at: datetime              # operator timestamp
 ```
 
-### Internal scope
+The planner uses this to detect partial failures and decide whether to
+retry on the next tick or surface to the user.
 
-* MQTT transport (port `direct_mqtt_transport.py` from HEO II).
-* Topic mapping (port from HEO II `mqtt_writer.py`).
-* SA value vocabulary (lowercase true/false, exact mode strings).
-* 5-min granularity enforcement on writes.
-* Slot boundary continuity (00:00 → 00:00 wrap, contiguous, exactly 6).
-* Diff-only writes (don't republish unchanged values).
-* Write verification (publish, await response, retry policy).
-* Live state cache (operator updates on inverter state pushes).
+## 14. Verification + write/read cycle
 
-### Out of scope
+For every write the operator publishes, it expects SA to publish a
+response on `set/response_message/state` (per SA's value vocabulary —
+`Saved` / `Error: <detail>`).
 
-Anything that involves an opinion: SOC targets, when to sell, what
-work_mode means semantically. The operator is told "set slot 3 cap to
-50%, gc to False"; it writes. It doesn't validate "is 50% a sensible
-target".
+### Verification states
 
-## 7. Rules / Contributors module
+* **`OK`** — SA returned `Saved`, the read-back sensor reflects the
+  written value within tolerance.
+* **`PENDING`** — write published, no SA response yet, retry timer
+  running. Will retry up to 3 times with 5s backoff.
+* **`SET_BUT_UNVERIFIED`** — SA returned `Saved` but the read-back
+  sensor doesn't yet reflect it (HA's MQTT cache lag). Operator marks
+  this as success; next tick's verification proves it landed.
+* **`FAILED`** — SA returned `Error: ...`, or 3 retries elapsed without
+  any response.
 
-`custom_components/heo3/contributors/` (renamed from "rules" because
-they don't WRITE; they CONTRIBUTE constraints + cost terms to the
-optimisation).
+### Write-blocking conditions (SPEC enforcement)
 
-### Contributor interface
+The operator REFUSES to apply if any of:
 
-```python
-class Contributor(Protocol):
-    name: str
-    enabled: bool
+* SPEC H4: `rates_freshness` shows BD data older than threshold (e.g.,
+  60 min).
+* SPEC H3: `eps_active` is True (grid down — don't write to MQTT,
+  inverter is busy).
+* `dry_run` is enabled (config flag — for testing the plan path
+  without side effects).
+* MQTT transport not connected.
+* Verification of the previous tick failed and the user has set
+  `pause_on_verification_failure` (config flag).
 
-    def contribute(
-        self, world: WorldState, problem: OptimisationProblem,
-    ) -> ContributionReport:
-        """Append constraints and/or cost terms to `problem`. Return
-        a structured report describing what was added — used by the
-        introspection / audit trail."""
-```
+### Why this is different from HEO II
 
-### Contribution types
+In HEO II, the writer used FIFO queue correlation to match SA responses
+to publishes (after the HEO-32 incident showed SA's response format
+changed). The operator simplifies: one write at a time, await response
+or timeout, retry. The slowdown (a few seconds per global change) is
+acceptable at 15-min cadence; the simplification is large.
 
-* **HardConstraint**: `(time_window, expression)`. E.g.,
-  `("17:00-18:00", "mode == Selling first")`. Cannot be violated; if
-  conflicting hards, problem is infeasible and writes are blocked
-  (with diagnostic).
-* **CostTerm**: `(time_window, weighted_objective)`. E.g.,
-  `("18:00-23:30", "+1.0 * p_grid_import * 28.58")`. Adds to the
-  total objective.
-* **VariableBound**: `(time_window, variable, lo, hi)`. E.g.,
-  `("19:00-21:00", "soc", 0.5, None)` — keeps SOC ≥ 50% during a
-  user-defined "high-load" window.
+## 15. Mechanical safety invariants
 
-### Worked example contributors
+The operator enforces these BEFORE writing. Failures bubble up as
+`PlannedAction` rejections (the planner is told and can replan).
 
-* **EPSContributor**: when `world.flags.eps_active`, adds hard
-  constraints `min_soc = 0`, `p_grid_export = 0`, `p_grid_import = 0`.
-* **SavingSessionContributor**: when `world.flags.saving_session`,
-  overrides `r_export` in the session window with the session price,
-  forces `mode == Selling first` for the duration.
-* **EVDeferralContributor**: when triggers met, adds cost term
-  steering `p_discharge` toward export rather than EV charging.
-* **CycleBudgetContributor**: adds cost term proportional to total
-  charge throughput (the soft H7 cap).
-* **EndOfHorizonContributor**: adds the `boundary_cost` term for
-  `soc[T] < target_end_soc`. THIS IS THE 2026-05-08 FIX.
+* **Slot times on 5-min granularity.** Snap before publish.
+* **Slot times contiguous.** `slot[N+1].start == slot[N].end`. Slot 0
+  starts at 00:00, slot 5 ends at 00:00.
+* **Exactly 6 slots.** No more, no less.
+* **SOC values in [0, 100].** Reject otherwise.
+* **min_soc respected** — slot capacity_soc cannot be below
+  `config.min_soc` unless `eps_active` (per SPEC H3 override).
+* **Mode strings exact.** `"Selling first"` etc. — case + whitespace
+  must match SA's discovery output. Compare via canonicalised strings.
+* **GC values lowercase.** `"true"` / `"false"`. (HEO-32 incident.)
+* **Current values in [0, 350]** (Sunsynk hardware limit).
 
-### Introspection (the bit Paddy specifically asked for)
+## 16. Configuration
 
-```python
-class ContributorRegistry:
-    def all_contributions(world: WorldState) -> list[ContributionReport]
-    def conflict_report(world: WorldState) -> ConflictReport
-    def per_field_provenance(plan: PlannedState) -> dict[str, list[str]]
-```
+Operator config is one HA `config_entry` plus number/select entities
+the user can tune at runtime.
 
-`all_contributions` runs every contributor against `world`, returns
-the structured list of constraints/cost terms each emitted. Pure
-function. Callable for any test scenario.
+### Initial setup (config_flow)
 
-`conflict_report` walks the contributions and detects:
-* Hard-vs-hard conflicts (infeasibility).
-* Hard constraint that the cost terms would otherwise violate
-  (active-binding flag).
-* Time-window overlaps with semantically incompatible directives.
+* SA MQTT broker host + port + credentials.
+* Inverter name (default: `inverter_1`).
+* Entity IDs for each peripheral (zappi, washer, dryer, dishwasher).
+* Path for storage (state cache, replan baseline).
 
-`per_field_provenance` after a solve, maps each output field
-(slot[i].capacity_soc, work_mode, etc.) back to the contributors
-whose constraints/costs were active. Surfaces in the dashboard:
-"why is slot 3 at 50%?" → "EndOfHorizon (target_end_soc) + cycle
-cost + base cost".
+### Runtime tunables (HA number / select entities)
 
-### Per-contributor enable/disable
+* `number.heo3_min_soc` — battery floor.
+* `number.heo3_cycle_budget` — daily cycle soft cap.
+* `number.heo3_target_end_soc` — uncertainty buffer (planner uses).
+* `switch.heo3_dry_run` — operator skip writes (test mode).
+* `switch.heo3_pause_on_verification_failure` — pause writes on
+  any verification miss until user clears.
 
-Each contributor exposes a HA switch entity
-(`switch.heo3_contributor_<name>`) so we can disable individual
-contributors at runtime for debugging.
+## 17. Testing strategy
 
-## 8. Coordinator + lifecycle
+### Unit tests (no MQTT, no HA)
 
-`custom_components/heo3/coordinator.py`. Wires it all together at the
-HA tick cadence.
+* **Mock MQTT transport** that records publishes and lets tests inject
+  responses. Assert the right topics + payloads are produced.
+* Each adapter (Inverter / Peripheral / World) tested in isolation.
+* `Operator.apply()` tested end-to-end with mock transport: build a
+  `PlannedAction`, assert the right `Write` sequence, simulate
+  responses, verify `ApplyResult`.
 
-### Tick flow (15 min)
+### Integration tests (live MQTT, mock HA)
 
-1. Gather `WorldState` from HA entities (rates, SOC, forecasts, flags).
-2. Run all `Contributor.contribute(world, problem)`.
-3. Solve `problem`. Record full audit trail.
-4. If solver succeeds and SPEC H4/H5 pass, hand `PlannedState` to
-   operator; else block writes with diagnostic.
-5. Operator diffs against last-known inverter state, writes deltas,
-   verifies.
-6. Update HA dashboard sensors with audit, plan, projected outcome.
+* **mosquitto-probe fixtures** — capture real SA topic-format snapshots
+  (HEO-32 incident shows these change). Replay against the operator.
+* `tests/integration/test_sa_live.py` — opt-in tests that connect to
+  the live SA broker. Run manually before each release.
 
-### Daily plan (18:00 BST)
+### Replay tests
 
-Same flow but with the full 48-step horizon (covers tomorrow's
-24h). The daily plan re-baselines the 15-min ticks for the day.
+* Capture a day's worth of HA state changes (rates, forecasts, flags)
+  as a fixture.
+* Replay through the operator's world gatherer; assert the snapshot
+  matches an expected schema.
 
-### Replan triggers (between daily plans)
+### NOT testing dry_run
 
-* World state divergence above threshold (forecast / SOC / flag
-  transitions) — same shape as HEO II `replan_triggers.py`.
-* Contributor change (e.g., saving session announced).
-* Solver-output globals changed vs last commit (the bug pattern
-  HEO II PR #73 fixed; here it's natively built into the design).
+Per `feedback_dry_run.md`: dry_run skips MQTT publish and hides writer
+bugs. Tests use **mock transport**, not dry_run. Dry_run is a runtime
+flag for the user, not a testing tool.
 
-## 9. Migration plan
+## 18. Build phases (operator-only)
 
-### Build phases
+* **P1.0 — Skeleton.** Package layout, `Operator` class with stub
+  methods, mock transport, config_flow shell. ~1 day.
+* **P1.1 — Inverter Adapter writes.** Slots + globals + verification
+  cycle. Tests with mock transport assert correct topics + payloads.
+  ~2 days.
+* **P1.2 — Inverter Adapter reads.** Live state collation. Tests
+  feeding mock HA states. ~1 day.
+* **P1.3 — Peripheral Adapter.** EV + appliances + reads. Tests
+  asserting service-call shape. ~1 day.
+* **P1.4 — World Gatherer rates.** BD + IGO + AgilePredict reads,
+  freshness tracking. ~1-2 days.
+* **P1.5 — World Gatherer forecasts.** Solcast + load model wiring.
+  Mostly porting from HEO II. ~1 day.
+* **P1.6 — World Gatherer flags.** IGO dispatch, saving session,
+  EPS detection. ~1 day.
+* **P1.7 — Snapshot integration.** Compose adapters into one
+  `Snapshot`. End-to-end test. ~1 day.
+* **P1.8 — Live SA validation.** Connect to the real SA broker on the
+  prod HA. Mosquitto-probe to verify SA value vocabulary still matches
+  what the operator sends. Confirm verification cycle works
+  end-to-end. ~1 day.
+* **P1.9 — Static baseline plan + cutover.** Apply the static
+  baseline plan to the inverter (a one-shot script), turn off HEO II,
+  let the operator run with no planner attached (it just gathers
+  snapshots and reports them via dashboard). Validates the operator
+  doesn't break the live system. ~1 day.
 
-* **P1 — Operator module + tests.** Pure mechanical layer. Mock
-  MQTT transport for tests; live transport against SA broker for
-  integration. ~2-3 days.
-* **P2 — World state gathering.** Port BD / Solcast / HA entity
-  reading from HEO II's coordinator. ~1 day.
-* **P3 — Optimiser core.** Formulate problem in CVXPY/PuLP; solve;
-  trajectory-to-slot mapping. Standalone tests with synthetic
-  inputs. ~3-5 days.
-* **P4 — Contributors.** Port each economic decision as a
-  Contributor. ~2-3 days.
-* **P5 — Coordinator + dashboard sensors.** ~1-2 days.
-* **P6 — Replay validation.** Replay 2026-05-08 inputs and 5+
-  other historical days; verify outputs are sensible. ~2-3 days.
-* **P7 — Shadow mode.** Run HEO III alongside HEO II (HEO II
-  active, HEO III computes but doesn't write). Compare plans for
-  3-5 days. ~ongoing.
-* **P8 — Cutover.** Disable HEO II, enable HEO III writes. ~1
-  day for the switchover, monitor for a week.
+**Total: ~10-12 working days, ~2-3 weeks.**
 
-**Total estimated effort: 12-19 working days, ~3-4 weeks.**
+After P1 lands and runs cleanly for a week, planner design (the other
+doc) begins.
 
-### Static baseline plan (cutover gap)
+## 19. Open questions
 
-Between "HEO II off" (Paddy's stated intent) and "HEO III ready",
-inverter must run on a known-good static schedule. Suggested:
+* **`zero_export_to_ct` setting** — does SA's MQTT discovery actually
+  expose this on Paddy's firmware? Mosquitto-probe required (P1.0 task).
+* **`battery_max_soc` setting** — same question. May not be present on
+  all firmware; operator should detect at startup and surface a warning
+  if missing rather than fail.
+* **Tesla integration** — out of scope for v1; operator will have a
+  `TeslaAdapter` placeholder that's disabled until the user wires it.
+* **HEO-5 load model** — port as-is or rewrite cleaner? Port as-is for
+  P1; rewriting is a separate piece of work.
+* **Single-tick latency budget** — what's the acceptable tick duration?
+  At 15-min cadence, a few seconds is fine. At 1-min cadence (future),
+  this matters. Decide once we see real timings.
 
-| Slot | Time | Cap | gc |
-|---|---|---|---|
-| 1 | 00:00-05:30 | 80% | True |
-| 2 | 05:30-18:00 | 100% | False |
-| 3 | 18:00-23:30 | 25% | False |
-| 4 | 23:30-23:55 | 80% | True |
-| 5 | 23:55-23:55 | 10% | False |
-| 6 | 23:55-00:00 | 10% | False |
+## 20. Sign-off checklist
 
-Globals: `work_mode = Zero export to CT`, `energy_pattern = Load
-first`, `max_charge_a = max_discharge_a = 100`. No arbitrage; just
-charge cheap, hold for evening, drain to 25% reserve, refill cheap.
+- [ ] Scope (§2) — every hook the planner could need is enumerated, nothing missing
+- [ ] Architectural shape (§3) — operator + 3 sub-adapters + Snapshot
+- [ ] Inverter writes (§4) — every Sunsynk control HEO III might need
+- [ ] Inverter reads (§5) — every sensor HEO III might need
+- [ ] Peripheral controls + reads (§6, §7) — EV, appliances, future hooks
+- [ ] World rates + forecasts + flags (§8, §9, §10) — full external state
+- [ ] Snapshot + PlannedAction shapes (§11, §12) — typed, frozen
+- [ ] Verification + write/read cycle (§14)
+- [ ] Mechanical safety invariants (§15)
+- [ ] Config + tunables (§16)
+- [ ] Testing strategy (§17) — no dry_run for tests
+- [ ] Build phases (§18) — order + estimated effort
+- [ ] Open questions (§19) — anything to resolve before P1.0?
 
-Apply once via a one-shot script (`scripts/apply_static_baseline.py`)
-before disabling HEO II. Inverter runs this until HEO III takes over.
-
-### Cutover criteria (P8 → live)
-
-HEO III is OK to take over when, on replay/shadow data:
-
-* Zero unplanned peak-rate imports across the validation window.
-* Net cost ≤ HEO II's actual net cost (or within 5%).
-* Cycle budget respected.
-* No solver infeasibilities or unhandled exceptions.
-* All SPEC hard rules (H1-H7) verified by tests.
-
-### HEO II retirement
-
-Once HEO III has run cleanly for 2+ weeks, archive HEO II:
-
-* Move `custom_components/heo2/` to `custom_components/heo2.archived/`
-  (keeps git history; signals do-not-deploy).
-* Remove HEO II from `manifest.json` deployment targets.
-* Keep tests for reference; gate them with `@pytest.mark.archived`.
-
-## 10. Open questions
-
-* **Forecast uncertainty: how much margin?** `target_end_soc` value
-  for U1 (deterministic + safety margin) — calibrate against
-  historical forecast errors. 50% is a reasonable starting guess
-  but should be tuned.
-* **Cycle cost weight.** What p/kWh penalty discourages marginal
-  cycling without suppressing useful arbitrage? Empirical;
-  starts at 0.5p/kWh, refine.
-* **Solver choice.** CVXPY (cleaner formulation, may need MILP
-  extension for mode binaries) vs PuLP (handles MILP natively but
-  more verbose). Both run fine on HA hardware. Decide during P3
-  prototyping.
-* **Rolling horizon vs daily plan.** Daily plan at 18:00 with full
-  24-48h horizon, or every-tick re-solve over 24h sliding window?
-  Daily plan + 15-min adjustments is closer to HEO II semantics;
-  pure rolling-horizon is more responsive but more compute.
-  Recommend: full solve daily, fast incremental adjust intra-day
-  (warm-start from prior solution).
-* **Tomorrow's prices.** Octopus publishes after 16:00 BST. Daily
-  plan at 18:00 has them. Mid-day re-solves don't have tomorrow —
-  use AgilePredict for visualisation only (SPEC H4 forbids writing
-  forecast prices). Means mid-day plans have a shorter
-  effective horizon.
-
-## 11. What this doc does NOT yet specify
-
-Deferred until P3+ implementation reveals concrete needs:
-
-* Exact CVXPY/PuLP formulation (variables, constraints in code).
-* HA dashboard entity layout (port from HEO II as starting point).
-* Test scaffolding (fixture shapes, replay format).
-* Specific Sunsynk register mapping for any new globals.
-* Configuration entity layout (`number.heo3_target_end_soc` etc.).
-
-These are implementation details, not design decisions.
-
----
-
-## Sign-off checklist
-
-- [ ] Goals + non-goals (§1) accurate
-- [ ] World model (§2) — uncertainty handling: Option U1 first?
-- [ ] Decision model (§3) — cost function shape + cycle cost
-- [ ] 2026-05-08 walkthrough (§4) — predicted behaviour matches intent
-- [ ] Operator interface (§6) shape signed off
-- [ ] Contributor interface (§7) shape signed off
-- [ ] Migration plan + static baseline (§9) accepted
-- [ ] Open questions (§10) — anything to resolve before P1?
-
-After sign-off: tracking issue in GitHub, P1 begins.
+After sign-off: open tracking issue, P1.0 begins.
