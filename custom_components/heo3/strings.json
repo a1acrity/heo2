@@ -1,0 +1,14 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "HEO III — SA broker",
+                "description": "Solar Assistant MQTT broker host and port.",
+                "data": {
+                    "host": "MQTT host",
+                    "port": "MQTT port"
+                }
+            }
+        }
+    }
+}
