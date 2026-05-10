@@ -31,9 +31,17 @@ from dataclasses import replace
 from typing import Iterable
 
 from ..const import WRITE_RETRY_BACKOFF_S, WRITE_RETRY_LIMIT
+from ..state_reader import (
+    StateReader,
+    parse_bool,
+    parse_float,
+    parse_int,
+    parse_str,
+)
 from ..transport import Transport
 from ..types import (
     InverterSettings,
+    InverterState,
     PlannedAction,
     SlotPlan,
     SlotSettings,
@@ -60,11 +68,30 @@ VERIFY_TIMEOUT = "TIMEOUT"
 
 
 class InverterAdapter:
-    """Writes to and reads from the Sunsynk inverter via SA's MQTT broker."""
+    """Writes to and reads from the Sunsynk inverter via SA's MQTT broker.
 
-    def __init__(self, transport: Transport, inverter_name: str) -> None:
+    Writes go via MQTT directly (Transport).
+    Reads come from HA entity states via the StateReader abstraction
+    (HA's mqtt integration subscribes to SA's discovery topics and
+    publishes them as sensors — we just read those sensors).
+    """
+
+    def __init__(
+        self,
+        transport: Transport,
+        inverter_name: str,
+        state_reader: StateReader | None = None,
+        sensor_prefix: str | None = None,
+    ) -> None:
         self._transport = transport
         self._inverter_name = inverter_name
+        self._state_reader = state_reader
+        # SA discovery names sensors like sensor.sa_inverter_1_battery_soc.
+        self._sensor_prefix = (
+            sensor_prefix
+            if sensor_prefix is not None
+            else f"sensor.sa_{inverter_name}_"
+        )
 
         # Single in-flight response Future. One write at a time means
         # the next response on the topic IS for that write — no FIFO
@@ -79,6 +106,93 @@ class InverterAdapter:
     @property
     def _response_topic(self) -> str:
         return "solar_assistant/set/response_message/state"
+
+    def _entity(self, leaf: str) -> str:
+        return f"{self._sensor_prefix}{leaf}"
+
+    # ── Reads (P1.2) ──────────────────────────────────────────────
+
+    async def read_state(self) -> InverterState:
+        """Pull live telemetry from HA sensors into a frozen InverterState.
+
+        Missing / unknown sensors come through as None — the operator
+        is honest about what it doesn't know, the planner decides
+        what to do about it.
+        """
+        if self._state_reader is None:
+            raise RuntimeError(
+                "InverterAdapter.read_state() requires a state_reader; "
+                "construct with state_reader=... (or use the operator's "
+                "snapshot() once P1.7 wires it)"
+            )
+        r = self._state_reader
+        return InverterState(
+            battery_soc_pct=parse_float(r.get_state(self._entity("battery_soc"))),
+            battery_power_w=parse_float(r.get_state(self._entity("battery_power"))),
+            battery_current_a=parse_float(r.get_state(self._entity("battery_current"))),
+            battery_voltage_v=parse_float(r.get_state(self._entity("battery_voltage"))),
+            grid_power_w=parse_float(r.get_state(self._entity("grid_power"))),
+            grid_voltage_v=parse_float(r.get_state(self._entity("grid_voltage"))),
+            grid_frequency_hz=parse_float(
+                r.get_state(self._entity("grid_frequency"))
+            ),
+            solar_power_w=parse_float(r.get_state(self._entity("solar_power"))),
+            load_power_w=parse_float(r.get_state(self._entity("load_power"))),
+            inverter_temperature_c=parse_float(
+                r.get_state(self._entity("inverter_temperature"))
+            ),
+            battery_temperature_c=parse_float(
+                r.get_state(self._entity("battery_temperature"))
+            ),
+        )
+
+    async def read_settings(self) -> InverterSettings:
+        """Read back the current value of every writable setting.
+
+        Used as the diff baseline by writes_for() and as the verification
+        target for §16's full OK / SET_BUT_UNVERIFIED states.
+
+        Slot reads use the SA discovery names — `time_point_N`,
+        `grid_charge_point_N`, `capacity_point_N` — and floor times to
+        the 5-min boundary (Sunsynk does this on writes; we mirror).
+        """
+        if self._state_reader is None:
+            raise RuntimeError(
+                "InverterAdapter.read_settings() requires a state_reader"
+            )
+        r = self._state_reader
+
+        slots: list[SlotSettings] = []
+        for n in range(1, 7):
+            time_str = parse_str(r.get_state(self._entity(f"time_point_{n}")))
+            gc = parse_bool(r.get_state(self._entity(f"grid_charge_point_{n}")))
+            cap = parse_int(r.get_state(self._entity(f"capacity_point_{n}")))
+            # If any slot field is missing we still build a SlotSettings;
+            # use placeholder defaults so the dataclass invariants hold.
+            # The diff path will then publish whatever the planner
+            # specifies (no false skip).
+            slots.append(
+                SlotSettings(
+                    start_hhmm=time_str if time_str is not None else "00:00",
+                    grid_charge=gc if gc is not None else False,
+                    capacity_pct=cap if cap is not None else 0,
+                )
+            )
+
+        work_mode = parse_str(r.get_state(self._entity("work_mode")))
+        energy_pattern = parse_str(r.get_state(self._entity("energy_pattern")))
+        max_charge = parse_float(r.get_state(self._entity("max_charge_current")))
+        max_discharge = parse_float(
+            r.get_state(self._entity("max_discharge_current"))
+        )
+
+        return InverterSettings(
+            work_mode=work_mode if work_mode is not None else "",
+            energy_pattern=energy_pattern if energy_pattern is not None else "",
+            max_charge_a=max_charge if max_charge is not None else 0.0,
+            max_discharge_a=max_discharge if max_discharge is not None else 0.0,
+            slots=tuple(slots),  # type: ignore[arg-type]
+        )
 
     # ── Subscription ───────────────────────────────────────────────
 

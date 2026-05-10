@@ -18,7 +18,27 @@ from zoneinfo import ZoneInfo
 
 @dataclass(frozen=True)
 class InverterState:
-    """Live telemetry snapshot. Filled in P1.2."""
+    """Live telemetry snapshot — what the inverter is doing right now.
+
+    All fields nullable: HA may return `unknown` / `unavailable`
+    on cold boot or transient comms issues. The planner is
+    expected to handle missing values, not the operator.
+
+    Per design §5. EPS detection (grid_voltage == 0 for ≥5s) lives
+    in `SystemFlags` because it requires temporal state — see P1.6.
+    """
+
+    battery_soc_pct: float | None = None
+    battery_power_w: float | None = None  # signed: + charge, - discharge
+    battery_current_a: float | None = None  # signed
+    battery_voltage_v: float | None = None
+    grid_power_w: float | None = None  # signed: + import, - export
+    grid_voltage_v: float | None = None
+    grid_frequency_hz: float | None = None
+    solar_power_w: float | None = None  # ≥0
+    load_power_w: float | None = None  # ≥0
+    inverter_temperature_c: float | None = None
+    battery_temperature_c: float | None = None
 
 
 @dataclass(frozen=True)

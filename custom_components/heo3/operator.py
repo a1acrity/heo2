@@ -31,6 +31,7 @@ from .const import (
     TICK_HARD_BUDGET_S,
     TICK_WARNING_S,
 )
+from .state_reader import StateReader
 from .transport import Transport
 from .types import (
     ApplyResult,
@@ -53,16 +54,22 @@ class Operator:
         *,
         transport: Transport,
         hass=None,  # type: ignore[no-untyped-def]
+        state_reader: StateReader | None = None,
         inverter_name: str = DEFAULT_INVERTER_NAME,
+        inverter_sensor_prefix: str | None = None,
         zappi_charge_mode_entity: str = "select.zappi_charge_mode",
         tesla_entity_prefix: str | None = None,
         appliance_switches: dict[str, str] | None = None,
     ) -> None:
         self._transport = transport
         self._hass = hass
+        self._state_reader = state_reader
 
         self._inverter = InverterAdapter(
-            transport=transport, inverter_name=inverter_name
+            transport=transport,
+            inverter_name=inverter_name,
+            state_reader=state_reader,
+            sensor_prefix=inverter_sensor_prefix,
         )
         self._peripheral = PeripheralAdapter(
             zappi_charge_mode_entity=zappi_charge_mode_entity,
