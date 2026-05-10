@@ -86,9 +86,13 @@ class TestOperatorWiring:
         assert transport.is_connected is False
 
     @pytest.mark.asyncio
-    async def test_snapshot_stub_raises(self):
+    async def test_snapshot_requires_state_reader(self):
+        # P1.7: snapshot() is wired. Without a state_reader, the
+        # InverterAdapter.read_state() raises — the chained gather
+        # surfaces the same error rather than silently returning
+        # garbage.
         op = Operator(transport=MockTransport())
-        with pytest.raises(NotImplementedError, match="P1.7"):
+        with pytest.raises(RuntimeError, match="state_reader"):
             await op.snapshot()
 
     @pytest.mark.asyncio

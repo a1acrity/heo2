@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as _time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from .adapters.inverter import (
     InverterAdapter,
@@ -48,15 +50,30 @@ from .const import (
 from .service_caller import ServiceCaller
 from .state_reader import StateReader
 from .transport import Transport
+from .state_reader import parse_float, parse_int
 from .types import (
     ApplyResult,
     FailedWrite,
     InverterSettings,
     PlannedAction,
     Snapshot,
+    SystemConfig,
     VerificationResult,
     Write,
 )
+
+
+@dataclass(frozen=True)
+class ConfigEntities:
+    """User-tunable HA entity IDs that feed SystemConfig."""
+
+    min_soc_entity: str = "number.heo3_min_soc"
+    cycle_budget_entity: str = "number.heo3_cycle_budget"
+    target_end_soc_entity: str = "number.heo3_target_end_soc"
+
+
+# SPEC H4: rates older than this trigger a write block.
+RATES_FRESHNESS_THRESHOLD = timedelta(minutes=60)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +103,8 @@ class Operator:
         load_model_config: LoadModelConfig | None = None,
         load_history_reader: LoadHistoryReader | None = None,
         flags_config: FlagsConfig | None = None,
+        config_entities: ConfigEntities | None = None,
+        default_config: SystemConfig | None = None,
         local_tz: str = "Europe/London",
     ) -> None:
         self._transport = transport
@@ -122,14 +141,95 @@ class Operator:
             hass=hass,
         )
 
+        self._config_entities = config_entities or ConfigEntities()
+        self._default_config = default_config or SystemConfig()
+        self._local_tz_name = local_tz
+        self._local_tz = ZoneInfo(local_tz)
+
         self._compute = Compute()
         self._build = ActionBuilder()
 
     # ── State ─────────────────────────────────────────────────────
 
     async def snapshot(self) -> Snapshot:
-        """Gather complete frozen state. P1.7."""
-        raise NotImplementedError("P1.7 — Snapshot integration")
+        """Gather complete frozen state in one call.
+
+        Adapter reads run concurrently — inverter + peripheral + world
+        all happen at once. EPS detection uses captured_at as `now`.
+        """
+        captured_at = datetime.now(timezone.utc)
+
+        inv_state, inv_settings = await asyncio.gather(
+            self._inverter.read_state(),
+            self._inverter.read_settings(),
+        )
+        ev, tesla, appliances = await asyncio.gather(
+            self._peripheral.read_ev(),
+            self._peripheral.read_tesla(),
+            self._peripheral.read_appliances(),
+        )
+        (
+            rates_live,
+            rates_predicted,
+            rates_freshness,
+            solar,
+            load,
+            flags,
+        ) = await asyncio.gather(
+            self._world.read_rates_live(),
+            self._world.read_rates_predicted(),
+            self._world.read_rates_freshness(),
+            self._world.read_solar_forecast(),
+            self._world.read_load_forecast(),
+            self._world.read_flags(now=captured_at),
+        )
+        config = self._read_system_config()
+
+        return Snapshot(
+            captured_at=captured_at,
+            local_tz=self._local_tz,
+            inverter=inv_state,
+            inverter_settings=inv_settings,
+            ev=ev,
+            tesla=tesla,
+            appliances=appliances,
+            rates_live=rates_live,
+            rates_predicted=rates_predicted,
+            rates_freshness=rates_freshness,
+            solar_forecast=solar,
+            load_forecast=load,
+            flags=flags,
+            config=config,
+        )
+
+    def _read_system_config(self) -> SystemConfig:
+        """Read user-set HA number entities into SystemConfig.
+
+        Falls back to `default_config` for missing entities — useful
+        before the user has provisioned the HEO III config flow."""
+        defaults = self._default_config
+        if self._state_reader is None:
+            return defaults
+        r = self._state_reader
+        ce = self._config_entities
+
+        min_soc = parse_int(r.get_state(ce.min_soc_entity))
+        cycle_budget = parse_float(r.get_state(ce.cycle_budget_entity))
+        target_end_soc = parse_int(r.get_state(ce.target_end_soc_entity))
+
+        return SystemConfig(
+            min_soc=min_soc if min_soc is not None else defaults.min_soc,
+            cycle_budget=(
+                cycle_budget
+                if cycle_budget is not None
+                else defaults.cycle_budget
+            ),
+            target_end_soc=(
+                target_end_soc
+                if target_end_soc is not None
+                else defaults.target_end_soc
+            ),
+        )
 
     # ── Derived facts ─────────────────────────────────────────────
 
@@ -149,6 +249,7 @@ class Operator:
         self,
         action: PlannedAction,
         *,
+        snapshot: Snapshot | None = None,
         current_settings: InverterSettings | None = None,
         min_soc: int = 10,
         eps_active: bool = False,
@@ -170,12 +271,43 @@ class Operator:
         captured_at = datetime.now(timezone.utc)
         t_start = _time.monotonic()
 
+        # If a snapshot is supplied, prefer its values for the gates.
+        if snapshot is not None:
+            current_settings = current_settings or snapshot.inverter_settings
+            min_soc = snapshot.config.min_soc
+            eps_active = snapshot.flags.eps_active
+
         # ── Pre-flight ─────────────────────────────────────────
         if not self._transport.is_connected:
             return _empty_failure_result(
                 plan_id=plan_id,
                 captured_at=captured_at,
                 reason="transport not connected",
+                duration_ms=(_time.monotonic() - t_start) * 1000.0,
+            )
+
+        # SPEC H3: don't write while EPS is active. The planner is
+        # expected to send the lockdown_eps action *before* EPS triggers,
+        # not during. Inflight writes during EPS would race the inverter
+        # which is busy switching to backup.
+        if snapshot is not None and snapshot.flags.eps_active:
+            return _empty_failure_result(
+                plan_id=plan_id,
+                captured_at=captured_at,
+                reason="SPEC H3: eps_active",
+                duration_ms=(_time.monotonic() - t_start) * 1000.0,
+            )
+
+        # SPEC H4: rates must be live. Writes blocked if BD data is
+        # stale (e.g. integration broke). Trust the planner's ack only
+        # if no snapshot is supplied; with a snapshot we re-derive.
+        if snapshot is not None and not _rates_are_fresh(
+            snapshot.rates_freshness, captured_at
+        ):
+            return _empty_failure_result(
+                plan_id=plan_id,
+                captured_at=captured_at,
+                reason="SPEC H4: rates stale",
                 duration_ms=(_time.monotonic() - t_start) * 1000.0,
             )
 
@@ -315,6 +447,21 @@ def _generate_plan_id() -> str:
     import uuid
 
     return uuid.uuid4().hex[:12]
+
+
+def _rates_are_fresh(
+    freshness: dict[str, datetime], now: datetime
+) -> bool:
+    """SPEC H4: at least one rate source is fresher than the threshold.
+
+    Empty freshness dict (no BD config / before first read) does NOT
+    block — the operator can't enforce H4 if it has no signal. The
+    coordinator should warn separately.
+    """
+    if not freshness:
+        return True
+    youngest = max(freshness.values())
+    return now - youngest < RATES_FRESHNESS_THRESHOLD
 
 
 def _empty_failure_result(
