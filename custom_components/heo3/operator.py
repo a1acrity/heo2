@@ -147,7 +147,7 @@ class Operator:
         self._local_tz = ZoneInfo(local_tz)
 
         self._compute = Compute()
-        self._build = ActionBuilder()
+        self._build = ActionBuilder(compute=self._compute)
 
     # ── State ─────────────────────────────────────────────────────
 
