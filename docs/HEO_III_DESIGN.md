@@ -188,10 +188,8 @@ SPEC §2: writes only ever go to inverter 1; inverter 2 is RS485-mirrored.
 |---|---|---|---|
 | Work mode | `set/inverter/inverter_1/work_mode` | `"Selling first"` / `"Zero export to load"` / `"Zero export to CT"` | Case + whitespace as exposed by SA discovery. |
 | Energy pattern | `set/inverter/inverter_1/energy_pattern` | `"Battery first"` / `"Load first"` | |
-| Max charge current | `set/inverter/inverter_1/max_charge_current` | `"0".."350"` | Amps. Sunsynk 5kW peaks ~100A at 51.2V. |
+| Max charge current | `set/inverter/inverter_1/max_charge_current` | `"0".."350"` | Amps. Sunsynk 5kW peaks ~100A at 51.2V. **Doubles as the SOC-ceiling primitive**: there is no global `battery_max_soc` setting on the hardware; planner enforces a ceiling by writing `1` (allows PV trickle, blocks meaningful charging) or `0` (hard freeze) when current SOC reaches the desired cap. |
 | Max discharge current | `set/inverter/inverter_1/max_discharge_current` | `"0".."350"` | Amps. |
-| Zero export to CT enabled | `set/inverter/inverter_1/zero_export_to_ct` | `"true"` / `"false"` | **New for HEO III** — not in HEO II. Per SPEC §2 item 8. Verify SA value vocabulary via mosquitto-probe before relying on it. |
-| Battery max SOC | `set/inverter/inverter_1/battery_max_soc` | `"0".."100"` | **New for HEO III** — gives planner a way to set system-level SOC ceiling without touching all 6 slots. May not exist on all firmwares; probe first. |
 
 ### Write semantics
 
@@ -245,8 +243,6 @@ discovery). The operator reads these to verify writes landed:
 | `energy_pattern` | `sensor.sa_inverter_1_energy_pattern` |
 | `max_charge_current` | `sensor.sa_inverter_1_max_charge_current` |
 | `max_discharge_current` | `sensor.sa_inverter_1_max_discharge_current` |
-| `zero_export_to_ct` | `sensor.sa_inverter_1_zero_export_to_ct` (verify exists) |
-| `battery_max_soc` | `sensor.sa_inverter_1_battery_max_soc` (verify exists) |
 
 ### Special handling: 5-min granularity for time_point reads
 
@@ -274,11 +270,17 @@ snapped value. Same as HEO II's SafetyRule.
 | Turn off dishwasher | `switch.turn_off` on `switch.dishwasher` | EPS H3. |
 | Turn on each | `switch.turn_on` on the same entity | When EPS clears or planner decides to defer to off-peak. |
 
-### Tesla (future hook, may not be wired v1)
+### Tesla (via Teslemetry integration)
 
 | Action | Mechanism | Notes |
 |---|---|---|
-| Stop charging | `service: tesla.stop_charge` (or HA-native equivalent) | Currently HEO II uses zappi-only; Tesla support is a future planner feature. |
+| Stop / start charging | `switch.turn_off` / `switch.turn_on` on `switch.<vehicle>_charge` | Direct car command. Independent of zappi — can also stop charge by zappi-side power cut. |
+| Set SOC ceiling | `number.set_value` on `number.<vehicle>_charge_limit` | Car enforces it. Range typically 50-100. Cleaner than throttling current for SOC-cap intent. |
+| Throttle AC charge current | `number.set_value` on `number.<vehicle>_charge_current` | For peak-window slowdowns where stop is too coarse. |
+
+Both the zappi and Tesla paths can stop a Tesla charge. The planner picks based on intent: zappi-stop is clean for "no power available" (EPS); Tesla-stop is the right primitive for SOC-targeted decisions ("you're at 80, that's enough"). For v1, the operator exposes both; the planner decides which lever fits.
+
+Tesla controls only fire if `binary_sensor.<vehicle>_located_at_home` is `on` — operator gates this internally to avoid sending commands while the car is away.
 
 ### Configurability
 
@@ -296,7 +298,13 @@ deployed elsewhere with different entities.
 | Washer running | `binary_sensor.washer_running` | Active appliance flag. |
 | Dryer running | `binary_sensor.dryer_running` | Active appliance flag. |
 | Dishwasher running | `binary_sensor.dishwasher_running` | Active appliance flag. |
-| Tesla charging now | (TBD entity if/when Tesla integration is added) | Future. |
+| Tesla charging state | `sensor.<vehicle>_charging` | "Charging" / "Stopped" / "Disconnected" etc. |
+| Tesla SOC | `sensor.<vehicle>_battery_level` | Percent. Drives planner decisions on charge-limit writes. |
+| Tesla charge power | `sensor.<vehicle>_charger_power` | kW current draw. |
+| Tesla charge limit | `number.<vehicle>_charge_limit` (state) | Read-back for verification of SOC-ceiling writes. |
+| Tesla charge current | `number.<vehicle>_charge_current` (state) | Read-back for verification of current-throttle writes. |
+| Tesla cable plugged | `binary_sensor.<vehicle>_charge_cable` | Plug detection. May be unavailable when car asleep. |
+| Tesla at home | `binary_sensor.<vehicle>_located_at_home` | Gate for all Tesla writes — operator suppresses commands when off. |
 
 ## 8. World Gatherer — Rates
 
@@ -450,7 +458,9 @@ class Compute:
 
     def headroom_kwh(self, snap: Snapshot) -> float:
         """Energy capacity remaining for charging: from current SOC to
-        100% (or `battery_max_soc` if set lower)."""
+        100%. The hardware has no global SOC ceiling — if the planner
+        wants one, it tracks it in policy and throttles charge current
+        when SOC reaches its chosen cap."""
 
     def round_trip_efficiency(self) -> float:
         """Charge × discharge efficiency. ~0.9. Used for
@@ -741,10 +751,8 @@ class PlannedAction:
     slots: tuple[SlotPlan, ...]        # exactly 6 (or empty = no slot changes this tick)
     work_mode: Optional[str]
     energy_pattern: Optional[str]
-    max_charge_a: Optional[float]
+    max_charge_a: Optional[float]      # also the SOC-ceiling primitive (write 1A or 0A)
     max_discharge_a: Optional[float]
-    zero_export_to_ct: Optional[bool]
-    battery_max_soc: Optional[int]
 
     # --- peripheral actions ---
     ev_action: Optional[EVAction]      # set mode / restore previous
@@ -938,18 +946,39 @@ exposes `compute.bridge_kwh`, `compute.import_volume_under_plan`,
 
 ## 21. Open questions
 
-* **`zero_export_to_ct` setting** — does SA's MQTT discovery actually
-  expose this on Paddy's firmware? Mosquitto-probe required (P1.0 task).
-* **`battery_max_soc` setting** — same question. May not be present on
-  all firmware; operator should detect at startup and surface a warning
-  if missing rather than fail.
-* **Tesla integration** — out of scope for v1; operator will have a
-  `TeslaAdapter` placeholder that's disabled until the user wires it.
-* **HEO-5 load model** — port as-is or rewrite cleaner? Port as-is for
-  P1; rewriting is a separate piece of work.
-* **Single-tick latency budget** — what's the acceptable tick duration?
-  At 15-min cadence, a few seconds is fine. At 1-min cadence (future),
-  this matters. Decide once we see real timings.
+*(none currently — all resolved during design review)*
+
+### Resolved
+
+* **`zero_export_to_ct` as a separate setting** (resolved 2026-05-10):
+  doesn't exist. "Zero export to CT" is a value of `work_mode`, not a
+  separate boolean. Removed from §4.
+* **`battery_max_soc` setting** (resolved 2026-05-10): hardware doesn't
+  expose any global SOC ceiling. Confirmed by HA states scrape — no
+  such entity exists on either SA or the Deye-Sunsynk integration. The
+  ceiling primitive is `max_charge_current`: write `1` for soft cap
+  (PV trickle still allowed) or `0` for hard freeze. Planner owns the
+  policy; operator just exposes the existing current-throttle write.
+* **Tesla integration** (resolved 2026-05-10): in scope for v1 via the
+  Teslemetry HA integration, which exposes the full vehicle surface
+  (72 entities for Paddy's car, "Natalia"). Operator's TeslaAdapter
+  uses `switch.<vehicle>_charge` for stop/start, `number.<vehicle>_charge_limit`
+  for SOC ceiling, `number.<vehicle>_charge_current` for AC throttle.
+  All writes gated by `binary_sensor.<vehicle>_located_at_home`. See
+  §6 / §7 for full surface. Both zappi and Tesla paths can stop a
+  Tesla charge — planner picks based on intent.
+* **HEO-5 load model: port or rewrite** (resolved 2026-05-10): port
+  as-is for P1 (~443 lines, ~1 day). Solar forecast (Solcast) is
+  accurate in production per Paddy; load model accuracy will be
+  measured once the planner is running. The operator will expose
+  forecast-vs-actual error sensors so a future rewrite decision is
+  data-driven.
+* **Single-tick latency budget** (resolved 2026-05-10): hard cap of
+  60 seconds on `apply()`, with a 30-second warning threshold. At
+  15-min cadence this is generous (~67x margin). The cap exists to
+  prevent a stuck verification cycle from overlapping the next tick.
+  Revisit if cadence ever drops to 1-min. Acceptance test in P1.10
+  asserts a representative apply() completes well under 30s.
 
 ## 22. Sign-off checklist
 
