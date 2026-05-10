@@ -246,11 +246,23 @@ class SystemFlags:
 
 @dataclass(frozen=True)
 class SystemConfig:
-    """Runtime tunables: min_soc, cycle_budget, target_end_soc."""
+    """Runtime tunables (planner uncertainty knobs) + battery params.
 
+    Defaults match Paddy's install (4 × Sunsynk BP51.2 = 20.48 kWh).
+    The first three are user-set via HA number entities; the last
+    three are hardware constants the planner uses for SOC↔kWh math.
+    """
+
+    # Planner uncertainty knobs (HA number entities)
     min_soc: int = 10
     cycle_budget: float = 1.0
     target_end_soc: int = 25
+
+    # Battery hardware constants (used by Compute)
+    battery_capacity_kwh: float = 20.48
+    nominal_battery_voltage_v: float = 51.2
+    charge_efficiency: float = 0.95
+    discharge_efficiency: float = 0.95
 
 
 # ── Snapshot ────────────────────────────────────────────────────────
