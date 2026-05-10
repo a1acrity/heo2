@@ -19,13 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from .types import PlannedAction, Snapshot
-
-
-@dataclass(frozen=True)
-class TimeRange:
-    start: datetime
-    end: datetime
+from .types import PlannedAction, Snapshot, TimeRange
 
 
 @dataclass(frozen=True)

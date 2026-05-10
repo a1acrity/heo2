@@ -30,6 +30,7 @@ from .adapters.peripheral import (
 )
 from .adapters.world import (
     BDConfig,
+    FlagsConfig,
     IGOConfig,
     LoadHistoryReader,
     LoadModelConfig,
@@ -84,6 +85,7 @@ class Operator:
         solcast_config: SolcastConfig | None = None,
         load_model_config: LoadModelConfig | None = None,
         load_history_reader: LoadHistoryReader | None = None,
+        flags_config: FlagsConfig | None = None,
         local_tz: str = "Europe/London",
     ) -> None:
         self._transport = transport
@@ -115,6 +117,7 @@ class Operator:
             solcast_config=solcast_config,
             load_model_config=load_model_config,
             load_history_reader=load_history_reader,
+            flags_config=flags_config,
             local_tz=local_tz,
             hass=hass,
         )

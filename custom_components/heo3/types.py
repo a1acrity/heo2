@@ -201,8 +201,47 @@ class LoadForecast:
 
 
 @dataclass(frozen=True)
+class TimeRange:
+    """A start-end window. Used for saving sessions, off-peak windows, etc."""
+
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class IGOPlannedDispatch:
+    """One Octopus IGO smart-charge dispatch on the planned schedule."""
+
+    start: datetime
+    end: datetime
+    charge_kwh: float | None = None
+    source: str | None = None
+
+
+@dataclass(frozen=True)
 class SystemFlags:
-    """eps_active, igo_dispatching, saving_session, etc. Filled in P1.6."""
+    """Operational flags derived from external state.
+
+    Per §10. Numeric tunables (min_soc, cycle_budget, target_end_soc)
+    live in `SystemConfig`; this dataclass is for derived booleans
+    and event windows the planner reasons about each tick.
+    """
+
+    # Octopus / tariff events
+    igo_dispatching: bool | None = None
+    igo_planned: tuple[IGOPlannedDispatch, ...] = ()
+    saving_session_active: bool | None = None
+    saving_session_window: TimeRange | None = None
+    saving_session_price_pence: float | None = None
+
+    # Mechanical / safety
+    eps_active: bool = False  # derived: grid_voltage == 0 for ≥5s
+    grid_connected: bool = True  # inverse of eps_active
+    inverter_temperature_alarm: bool | None = None
+    battery_temperature_alarm: bool | None = None
+
+    # User-set behavioural flags
+    defer_ev_eligible: bool = False
 
 
 @dataclass(frozen=True)

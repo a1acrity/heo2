@@ -23,13 +23,16 @@ from ..load_history import learn_days_from_samples
 from ..load_profile import LoadProfile, LoadProfileBuilder
 from ..solar_forecast import solar_forecast_from_hacs
 from ..state_reader import StateReader, parse_float, parse_str
+from ..state_reader import parse_bool
 from ..types import (
+    IGOPlannedDispatch,
     LiveRates,
     LoadForecast,
     PredictedRates,
     RatePeriod,
     SolarForecast,
     SystemFlags,
+    TimeRange,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,6 +110,61 @@ class SolcastConfig:
 
 
 @dataclass(frozen=True)
+class FlagsConfig:
+    """HA entity IDs the WorldGatherer uses for flag detection.
+
+    Defaults match a typical install but every ID is overridable.
+    `None` for an entity skips that flag (it stays at its default).
+    """
+
+    # Octopus IGO smart-dispatch (binary_sensor.octopus_energy_..._intelligent_dispatching)
+    igo_dispatching_entity: str | None = None
+    # Octopus saving sessions (binary_sensor.octopus_energy_octoplus_saving_sessions)
+    saving_session_entity: str | None = None
+    # Inverter sensors used for derived flags
+    grid_voltage_entity: str = "sensor.sa_inverter_1_grid_voltage"
+    inverter_temperature_entity: str = (
+        "sensor.sa_inverter_1_inverter_temperature"
+    )
+    battery_temperature_entity: str = (
+        "sensor.sa_inverter_1_battery_temperature"
+    )
+    # User-set behavioural flag (HEO III's own switch)
+    defer_ev_eligible_entity: str = "switch.heo3_defer_ev_when_export_high"
+
+    # Thresholds for derived alarms
+    inverter_temperature_alarm_c: float = 65.0
+    battery_temperature_min_c: float = 5.0
+    battery_temperature_max_c: float = 50.0
+    eps_grid_voltage_threshold_v: float = 5.0  # below this counts as "0"
+    eps_debounce_s: float = 5.0
+
+
+class _EPSDetector:
+    """Tracks 'grid_voltage at zero for ≥ debounce_s seconds'.
+
+    Stateful — survives across read_flags() calls within the same
+    WorldGatherer instance. Reset whenever grid voltage rises above
+    the threshold.
+    """
+
+    def __init__(self, debounce_s: float = 5.0, threshold_v: float = 5.0) -> None:
+        self._debounce_s = debounce_s
+        self._threshold_v = threshold_v
+        self._first_zero_at: datetime | None = None
+
+    def update(self, grid_voltage_v: float | None, now: datetime) -> bool:
+        if grid_voltage_v is None or grid_voltage_v > self._threshold_v:
+            self._first_zero_at = None
+            return False
+        if self._first_zero_at is None:
+            self._first_zero_at = now
+            return False
+        elapsed = (now - self._first_zero_at).total_seconds()
+        return elapsed >= self._debounce_s
+
+
+@dataclass(frozen=True)
 class LoadModelConfig:
     """HEO-5 load model wiring.
 
@@ -162,6 +220,7 @@ class WorldGatherer:
         solcast_config: SolcastConfig | None = None,
         load_model_config: LoadModelConfig | None = None,
         load_history_reader: LoadHistoryReader | None = None,
+        flags_config: FlagsConfig | None = None,
         local_tz: str = "Europe/London",
         hass=None,  # type: ignore[no-untyped-def]
     ) -> None:
@@ -172,6 +231,11 @@ class WorldGatherer:
         self._solcast = solcast_config or SolcastConfig()
         self._load_model = load_model_config or LoadModelConfig()
         self._load_history = load_history_reader
+        self._flags_cfg = flags_config or FlagsConfig()
+        self._eps_detector = _EPSDetector(
+            debounce_s=self._flags_cfg.eps_debounce_s,
+            threshold_v=self._flags_cfg.eps_grid_voltage_threshold_v,
+        )
         self._local_tz = ZoneInfo(local_tz)
         self._hass = hass
 
@@ -356,8 +420,82 @@ class WorldGatherer:
 
     # ── Flags (P1.6) ──────────────────────────────────────────────
 
-    async def read_flags(self) -> SystemFlags:
-        raise NotImplementedError("P1.6 — World Gatherer flags")
+    async def read_flags(self, *, now: datetime | None = None) -> SystemFlags:
+        """Derive operational booleans + event windows from external state.
+
+        EPS detection requires temporal state (5s of grid_voltage at
+        zero); the WorldGatherer's _EPSDetector tracks this across
+        successive read_flags() calls.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        if self._state_reader is None:
+            return SystemFlags()
+        r = self._state_reader
+        cfg = self._flags_cfg
+
+        # IGO smart-charge dispatch
+        igo_dispatching = None
+        igo_planned: tuple[IGOPlannedDispatch, ...] = ()
+        if cfg.igo_dispatching_entity is not None:
+            igo_dispatching = parse_bool(
+                r.get_state(cfg.igo_dispatching_entity)
+            )
+            attrs = r.get_attributes(cfg.igo_dispatching_entity)
+            igo_planned = _parse_igo_planned(attrs.get("planned_dispatches", []))
+
+        # Octoplus saving sessions
+        saving_active = None
+        saving_window: TimeRange | None = None
+        saving_price: float | None = None
+        if cfg.saving_session_entity is not None:
+            saving_active = parse_bool(r.get_state(cfg.saving_session_entity))
+            attrs = r.get_attributes(cfg.saving_session_entity)
+            saving_window = _parse_saving_window(attrs)
+            sp = attrs.get("octoplus_session_rewards_pence_per_kwh")
+            if sp is None:
+                sp = attrs.get("price")  # fallback if integration variant differs
+            try:
+                saving_price = float(sp) if sp is not None else None
+            except (TypeError, ValueError):
+                saving_price = None
+
+        # EPS via temporal detector
+        grid_voltage = parse_float(r.get_state(cfg.grid_voltage_entity))
+        eps = self._eps_detector.update(grid_voltage, now)
+
+        # Temperature alarms
+        inv_temp = parse_float(r.get_state(cfg.inverter_temperature_entity))
+        bat_temp = parse_float(r.get_state(cfg.battery_temperature_entity))
+        inv_alarm = (
+            None
+            if inv_temp is None
+            else inv_temp >= cfg.inverter_temperature_alarm_c
+        )
+        bat_alarm = (
+            None
+            if bat_temp is None
+            else (
+                bat_temp < cfg.battery_temperature_min_c
+                or bat_temp > cfg.battery_temperature_max_c
+            )
+        )
+
+        defer_ev = parse_bool(r.get_state(cfg.defer_ev_eligible_entity))
+
+        return SystemFlags(
+            igo_dispatching=igo_dispatching,
+            igo_planned=igo_planned,
+            saving_session_active=saving_active,
+            saving_session_window=saving_window,
+            saving_session_price_pence=saving_price,
+            eps_active=eps,
+            grid_connected=not eps,
+            inverter_temperature_alarm=inv_alarm,
+            battery_temperature_alarm=bat_alarm,
+            defer_ev_eligible=defer_ev if defer_ev is not None else False,
+        )
 
     # ── Convenience accessors for IGO config ──────────────────────
 
@@ -400,6 +538,53 @@ def _parse_rates_attr(raw: Any) -> tuple[RatePeriod, ...]:
         out.append(RatePeriod(start=start, end=end, rate_pence=pence))
     out.sort(key=lambda p: p.start)
     return tuple(out)
+
+
+def _parse_igo_planned(raw: Any) -> tuple[IGOPlannedDispatch, ...]:
+    """Parse the `planned_dispatches` attribute on the IGO binary_sensor."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[IGOPlannedDispatch] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        start = _try_parse_iso(entry.get("start"))
+        end = _try_parse_iso(entry.get("end"))
+        if start is None or end is None:
+            continue
+        kwh = entry.get("charge_in_kwh")
+        if kwh is None:
+            kwh = entry.get("charge_kwh")
+        try:
+            kwh_val = float(kwh) if kwh is not None else None
+        except (TypeError, ValueError):
+            kwh_val = None
+        source = entry.get("source")
+        out.append(
+            IGOPlannedDispatch(
+                start=start,
+                end=end,
+                charge_kwh=kwh_val,
+                source=str(source) if source is not None else None,
+            )
+        )
+    return tuple(out)
+
+
+def _parse_saving_window(attrs: dict) -> TimeRange | None:
+    """Octoplus saving session window — try a few attribute name variants."""
+    # The integration exposes the active session in different shapes
+    # depending on version. Try common ones.
+    for start_key, end_key in (
+        ("current_session_start", "current_session_end"),
+        ("octoplus_session_start", "octoplus_session_end"),
+        ("start", "end"),
+    ):
+        s = _try_parse_iso(attrs.get(start_key))
+        e = _try_parse_iso(attrs.get(end_key))
+        if s is not None and e is not None:
+            return TimeRange(start=s, end=e)
+    return None
 
 
 def _try_parse_iso(raw: Any) -> datetime | None:
