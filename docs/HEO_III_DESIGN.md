@@ -74,43 +74,85 @@ Two reasons, both rooted in HEO II's pain:
 ## 3. Architectural shape
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         Operator                             │
-│  (single public class, single point of contact for planner)  │
-│                                                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
-│  │  Inverter   │  │ Peripheral  │  │   World     │          │
-│  │   Adapter   │  │   Adapter   │  │  Gatherer   │          │
-│  │             │  │             │  │             │          │
-│  │ MQTT write  │  │ HA service  │  │ HA entity   │          │
-│  │ MQTT read   │  │ calls       │  │ reads       │          │
-│  │ verify      │  │ HA entity   │  │             │          │
-│  │             │  │ reads       │  │             │          │
-│  └─────────────┘  └─────────────┘  └─────────────┘          │
-│         │                │                │                  │
-│         ▼                ▼                ▼                  │
-│  ┌──────────────────────────────────────────────────┐       │
-│  │              Snapshot (frozen state)              │       │
-│  │  Single immutable struct, what the world IS now   │       │
-│  └──────────────────────────────────────────────────┘       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         Operator                                 │
+│  (single public class, single point of contact for planner)      │
+│                                                                  │
+│  ── State (mechanical I/O) ──                                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │  Inverter   │  │ Peripheral  │  │   World     │              │
+│  │   Adapter   │  │   Adapter   │  │  Gatherer   │              │
+│  │ MQTT W/R    │  │ HA services │  │ HA reads    │              │
+│  │ verify      │  │ + reads     │  │ rates+fcst  │              │
+│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│         │                │                │                      │
+│         ▼                ▼                ▼                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │              Snapshot (frozen state)              │           │
+│  │  what the world IS right now                      │           │
+│  └──────────────────────────────────────────────────┘           │
+│                            │                                     │
+│                            ▼                                     │
+│  ── Derived (pure-function library over Snapshot) ──             │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │   Compute   energy↔SOC↔kWh                        │           │
+│  │             time/rate windows                     │           │
+│  │             forecast aggregation                  │           │
+│  │             counterfactual analysis               │           │
+│  │             physics predictions                   │           │
+│  └──────────────────────────────────────────────────┘           │
+│                            │                                     │
+│                            ▼                                     │
+│  ── Construction (intent → mechanical writes) ──                 │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │   Build     sell_kwh, charge_to, hold_at,         │           │
+│  │             drain_to, defer_ev, eps_lockdown      │           │
+│  │             returns: PlannedAction                │           │
+│  └──────────────────────────────────────────────────┘           │
+│                            │                                     │
+│                            ▼                                     │
+│  ── Execution (PlannedAction → inverter) ──                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │   apply()   diff, write, verify, report          │           │
+│  └──────────────────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
                             ▲
-                            │  (planner consumes Snapshot,
-                            │   produces PlannedAction,
-                            │   passes back to Operator.apply)
+                            │  Planner uses everything above:
+                            │  reads Snapshot, calls Compute for
+                            │  derived facts, decides intent, calls
+                            │  Build to construct PlannedAction,
+                            │  hands it to apply().
 ```
 
-Three internal sub-modules. One outward-facing class. The planner sees
-the `Operator` interface only.
+Four conceptual layers. One outward-facing class. The planner expresses
+intent ("sell 8 kWh in these top slots", "charge to 80% by 05:30");
+the operator handles all the physics, all the topology, all the
+mechanics of getting the inverter to do it. The planner never opens an
+MQTT connection, never computes a discharge throttle, never does an
+SOC-to-kWh conversion.
 
 ### Public API (single source of truth for the planner)
 
 ```python
 class Operator:
+    # ── State ──────────────────────────────────────────
     async def snapshot(self) -> Snapshot:
-        """Gather a complete frozen state: inverter + peripherals +
-        world. Single call returns everything the planner needs."""
+        """Gather complete frozen state: inverter + peripherals +
+        world. Single call returns everything for one planner tick."""
 
+    # ── Derived facts (pure, callable any time) ────────
+    @property
+    def compute(self) -> Compute:
+        """Stateless library of derived calculations over a
+        Snapshot. Pure functions. See §12."""
+
+    # ── Action construction (intent → writes) ──────────
+    @property
+    def build(self) -> ActionBuilder:
+        """High-level action constructors. Inputs are domain-level
+        intent; output is a fully-formed PlannedAction. See §13."""
+
+    # ── Execution ──────────────────────────────────────
     async def apply(self, action: PlannedAction) -> ApplyResult:
         """Mechanically execute a planned action: inverter writes,
         peripheral changes. Verifies and reports per-write outcome."""
@@ -120,7 +162,11 @@ class Operator:
         cancelled."""
 ```
 
-Three methods. Everything else is internal organisation.
+The `compute` and `build` namespaces are pure-function libraries. They
+carry no state of their own — they take `Snapshot` (or relevant pieces
+of it) as input. This means the planner's tests can construct a
+synthetic `Snapshot` and call `compute.*` / `build.*` directly without
+the operator needing to be alive.
 
 ## 4. Inverter Adapter — Writes
 
@@ -379,7 +425,312 @@ Every nested type is a `@dataclass(frozen=True)`. Construction is one
 call; reading is direct attribute access; planners never block on
 operator I/O during a tick.
 
-## 12. PlannedAction — the planner's output
+## 12. Compute — derived calculations (pure-function library)
+
+Stateless library accessed via `operator.compute`. Every function
+takes a `Snapshot` (or the relevant subset) plus parameters; returns
+a value. No I/O, no state, no opinions. The planner uses these to
+reason about facts ("how much is X?") without redoing physics.
+
+Organised into five families.
+
+### 12a. Energy / SOC / kWh conversions
+
+```python
+class Compute:
+    def kwh_for_soc(self, soc_pct: float, snap: Snapshot) -> float:
+        """Convert SOC percentage to absolute kWh given live capacity."""
+
+    def soc_for_kwh(self, kwh: float, snap: Snapshot) -> float:
+        """Inverse: kWh → SOC percentage."""
+
+    def usable_kwh(self, snap: Snapshot) -> float:
+        """Energy available between current SOC and the user's min_soc
+        floor. Above-floor only — never returns negative."""
+
+    def headroom_kwh(self, snap: Snapshot) -> float:
+        """Energy capacity remaining for charging: from current SOC to
+        100% (or `battery_max_soc` if set lower)."""
+
+    def round_trip_efficiency(self) -> float:
+        """Charge × discharge efficiency. ~0.9. Used for
+        break-even-pricing math."""
+```
+
+### 12b. Time / rate windows
+
+```python
+    def next_cheap_window(self, snap: Snapshot, *, after: datetime | None = None) -> RateWindow | None:
+        """Next contiguous block of bottom-quartile import rates after
+        `after` (defaults to now). Returns the window's start, end,
+        and average rate. None if no cheap window in the published
+        rate horizon."""
+
+    def next_peak_window(self, snap: Snapshot, *, after: datetime | None = None) -> RateWindow | None:
+        """Next contiguous block of top-quartile import rates."""
+
+    def time_until(self, target: datetime, snap: Snapshot) -> timedelta:
+        """Convenience: target - snap.captured_at."""
+
+    def top_export_windows(self, snap: Snapshot, *, n: int = 3, until: datetime | None = None) -> list[RateWindow]:
+        """The N highest-rated 30-min export slots that haven't ended,
+        ordered by rate descending. `until` defaults to next cheap
+        window start (don't sell if we're about to refill cheaply)."""
+
+    def cheap_window_duration(self, window: RateWindow) -> timedelta:
+        """Trivial; included for API completeness."""
+```
+
+`RateWindow` is a `dataclass(frozen=True)` with `start`, `end`,
+`rate_pence`, `avg_rate_pence` (latter for multi-slot windows).
+
+### 12c. Forecast aggregation
+
+```python
+    def total_load(self, snap: Snapshot, window: TimeRange) -> float:
+        """Sum forecast load over a time window. Uses the operator's
+        load model (HEO-5 14-day learned). Window may span past +
+        future; past portion uses actuals if available."""
+
+    def total_solar(self, snap: Snapshot, window: TimeRange) -> float:
+        """Sum forecast PV over a window. Uses Solcast P50."""
+
+    def net_load(self, snap: Snapshot, window: TimeRange) -> float:
+        """Load - Solar. Signed: positive = battery+grid must cover,
+        negative = surplus PV available."""
+
+    def cumulative_load_to(self, snap: Snapshot, target: datetime) -> float:
+        """Forecast load between snap.captured_at and target. Pro-rates
+        partial hours."""
+
+    def cumulative_solar_to(self, snap: Snapshot, target: datetime) -> float:
+        """Same shape for solar."""
+
+    def bridge_kwh(self, snap: Snapshot, *, until: datetime | None = None) -> float:
+        """Net energy the battery must supply to bridge from now to
+        `until` (default: next cheap window). Equals
+        cumulative_load_to(until) - cumulative_solar_to(until). Floor
+        at zero. THIS IS THE 2026-05-08 KEY METRIC."""
+
+    def pv_takeover_hour(self, snap: Snapshot) -> int | None:
+        """The first hour tomorrow where forecast solar ≥ forecast
+        load. None if PV never overtakes (deep winter). Used by any
+        cheap-charge sizing logic the planner builds."""
+```
+
+### 12d. Counterfactual analysis (visibility / dashboard)
+
+```python
+    def usage_at_rate_band(
+        self, snap: Snapshot, window: TimeRange,
+    ) -> dict[RateBand, float]:
+        """How much of forecast load falls in each rate band (peak,
+        off-peak, cheap-window). Returns {band: kWh}. Useful for
+        understanding "what would a do-nothing day cost?"."""
+
+    def cost_breakdown(
+        self, snap: Snapshot, window: TimeRange,
+    ) -> dict[str, float]:
+        """Forecast £ split: import_cost_peak, import_cost_off_peak,
+        export_revenue_top, export_revenue_other. Ground-truth-style
+        accounting that the dashboard can render."""
+
+    def import_volume_under_plan(
+        self, plan: PlannedAction, snap: Snapshot,
+    ) -> float:
+        """Counterfactual: if THIS plan ran from now to end of
+        horizon, given current forecasts, how much grid import would
+        the plan need? Lets the planner compare candidate plans
+        without writing them. THIS IS THE OBJECTIVE-FUNCTION
+        BUILDING BLOCK for whatever decision logic the planner
+        eventually uses."""
+
+    def export_revenue_under_plan(
+        self, plan: PlannedAction, snap: Snapshot,
+    ) -> float:
+        """Same for forecast export revenue."""
+```
+
+### 12e. Physics predictions
+
+```python
+    def time_to_charge(
+        self, *, target_soc_pct: float, charge_rate_kw: float,
+        snap: Snapshot,
+    ) -> timedelta:
+        """How long to get from current SOC to target_soc_pct at the
+        given charge rate. Accounts for charge efficiency. Returns
+        timedelta(0) if already at or above target."""
+
+    def time_to_discharge(
+        self, *, target_soc_pct: float, discharge_rate_kw: float,
+        snap: Snapshot,
+    ) -> timedelta:
+        """How long to drain from current SOC to target. Accounts for
+        discharge efficiency."""
+
+    def kwh_deliverable_in(
+        self, *, duration: timedelta, throttle_a: float,
+        snap: Snapshot,
+    ) -> float:
+        """Given a discharge throttle (amps) and a slot duration,
+        how many kWh leave the battery? Uses live battery voltage
+        from snap so we don't drift on voltage assumptions."""
+
+    def discharge_throttle_for(
+        self, *, kwh: float, duration: timedelta, snap: Snapshot,
+    ) -> float:
+        """Inverse: what amp setting delivers exactly `kwh` over
+        `duration`? Clamped to inverter limits. Returns the
+        max_discharge_a value the operator will write. Replaces the
+        ad-hoc `kw_for_slot / battery_voltage * 1000` formula
+        scattered across HEO II's PeakArbitrageRule."""
+
+    def charge_throttle_for(
+        self, *, kwh: float, duration: timedelta, snap: Snapshot,
+    ) -> float:
+        """Same shape for charging. Useful when the planner wants to
+        rate-limit a grid_charge slot."""
+```
+
+### Why pure functions, not methods on a class with state
+
+Every Compute function is callable from a test with a synthetic
+`Snapshot` and produces deterministic output. No "did the operator
+warm up yet?" failure modes. Concurrency is also free — these
+functions are safe to call from anywhere.
+
+## 13. Build — action constructors (intent → PlannedAction)
+
+`operator.build` is a higher-level layer on top of Compute. Each
+constructor takes domain-level intent and returns a fully-formed
+`PlannedAction` ready to hand to `apply()`. The planner expresses
+WHAT it wants; the constructor figures out WHICH inverter writes
+achieve it.
+
+### 13a. Energy actions
+
+```python
+class ActionBuilder:
+    def sell_kwh(
+        self, *, total_kwh: float,
+        across_slots: list[RateWindow],
+        snap: Snapshot,
+    ) -> PlannedAction:
+        """Allocate `total_kwh` across the given slots (typically
+        from compute.top_export_windows). For each slot:
+
+          * If slot covers `now`, set work_mode="Selling first" and
+            max_discharge_a = compute.discharge_throttle_for(
+              kwh=allocation, duration=slot_duration, snap=snap)
+          * Set the inverter slot's capacity_soc to the calculated
+            post-sell SOC (so it stops at the right level).
+
+        For slots in the future (next ticks will pick them up): no
+        immediate inverter write needed; the daily plan / next tick
+        builds on the updated state.
+
+        Returns a PlannedAction that, applied, sells exactly
+        `total_kwh` if conditions hold."""
+
+    def charge_to(
+        self, *, target_soc_pct: float, by: datetime,
+        snap: Snapshot,
+        rate_limit_a: float | None = None,
+    ) -> PlannedAction:
+        """Set the slot covering [now, by) to grid_charge=True,
+        capacity_soc=target_soc_pct. If `by` is during a cheap
+        window, slot timing aligns with the window. Optional rate
+        limit applies via max_charge_a."""
+
+    def hold_at(
+        self, *, soc_pct: float, window: TimeRange,
+        snap: Snapshot,
+    ) -> PlannedAction:
+        """Keep battery at `soc_pct` over `window`: set the slot
+        covering window to capacity_soc=soc_pct, grid_charge=False
+        (so PV charges naturally and house load drains naturally to
+        that level)."""
+
+    def drain_to(
+        self, *, target_soc_pct: float, by: datetime,
+        snap: Snapshot,
+    ) -> PlannedAction:
+        """Set slot covering [now, by) to capacity_soc=target_soc_pct,
+        grid_charge=False. Doesn't change work_mode (drain happens
+        passively under "Zero export to CT" if there's load)."""
+```
+
+### 13b. Mode actions
+
+```python
+    def lockdown_eps(self, snap: Snapshot) -> PlannedAction:
+        """SPEC H3: grid down. All slots cap=0%, gc=False. EV stop.
+        Appliance switches off. Returns the fully-baked plan.
+        Coordinator triggers this on eps_active transition."""
+
+    def baseline_static(self, snap: Snapshot) -> PlannedAction:
+        """The known-good static plan: 80% overnight charge, day
+        hold at 100%, evening drain to 25%, no arbitrage. Used by
+        the cutover script (P1.9) and as the planner's fallback if
+        it can't produce a valid plan."""
+
+    def restore_default(self, snap: Snapshot) -> PlannedAction:
+        """Reset globals to baseline values: work_mode='Zero export
+        to CT', energy_pattern='Load first', max_charge_a=100,
+        max_discharge_a=100. Used when exiting active arbitrage /
+        EV-deferral / saving session windows."""
+```
+
+### 13c. Peripheral actions
+
+```python
+    def defer_ev(self, snap: Snapshot) -> PlannedAction:
+        """SPEC §12: stop the EV. Captures current charge mode for
+        later restore. Returns a PlannedAction with peripheral_action
+        set; no inverter writes."""
+
+    def restore_ev(self, snap: Snapshot) -> PlannedAction:
+        """Restore EV to its captured-pre-deferral charge mode."""
+```
+
+### 13d. Composition
+
+`PlannedAction` instances can be merged (operator-level helper). The
+planner can do:
+
+```python
+plan = builder.merge(
+    builder.sell_kwh(total_kwh=8, across_slots=top_3, snap=snap),
+    builder.charge_to(target_soc_pct=75, by=tomorrow_5_30, snap=snap),
+    builder.hold_at(soc_pct=50, window=evening, snap=snap),
+)
+result = await operator.apply(plan)
+```
+
+`merge` does field-by-field reconciliation:
+* Slot fields: union, last-write-wins on conflicts (with a warning).
+* Globals: same.
+* Peripheral actions: must agree or merge raises.
+
+### Why this layer exists at all (vs planner does it itself)
+
+Three reasons:
+
+1. **The planner doesn't need to know about discharge throttles, slot
+   boundaries, or value vocabularies.** It knows about kWh, SOC %, and
+   timestamps. The translation lives here, where it's tested once.
+2. **It's the right place for "we want the same plan-shape across
+   different planners".** v1 planner, v2 planner with optimiser, the
+   eventual stochastic planner — all produce intent-shaped requests
+   and use the same `Build` layer. The mechanical correctness of the
+   plan is invariant.
+3. **It makes counterfactual analysis cheap.** The planner can call
+   `build.sell_kwh(...)` to get a candidate plan, then
+   `compute.import_volume_under_plan(plan, snap)` to evaluate it,
+   without writing anything. Loops over candidates trivially.
+
+## 14. PlannedAction — the planner's output
 
 Equally typed. Whatever the planner produces, this is the shape:
 
@@ -412,7 +763,7 @@ class PlannedAction:
 `Optional[...]` fields = "don't touch this dimension". The operator
 diffs; absent fields produce no writes.
 
-## 13. ApplyResult — what happened
+## 15. ApplyResult — what happened
 
 ```python
 @dataclass(frozen=True)
@@ -430,7 +781,7 @@ class ApplyResult:
 The planner uses this to detect partial failures and decide whether to
 retry on the next tick or surface to the user.
 
-## 14. Verification + write/read cycle
+## 16. Verification + write/read cycle
 
 For every write the operator publishes, it expects SA to publish a
 response on `set/response_message/state` (per SA's value vocabulary —
@@ -470,7 +821,7 @@ changed). The operator simplifies: one write at a time, await response
 or timeout, retry. The slowdown (a few seconds per global change) is
 acceptable at 15-min cadence; the simplification is large.
 
-## 15. Mechanical safety invariants
+## 17. Mechanical safety invariants
 
 The operator enforces these BEFORE writing. Failures bubble up as
 `PlannedAction` rejections (the planner is told and can replan).
@@ -487,7 +838,7 @@ The operator enforces these BEFORE writing. Failures bubble up as
 * **GC values lowercase.** `"true"` / `"false"`. (HEO-32 incident.)
 * **Current values in [0, 350]** (Sunsynk hardware limit).
 
-## 16. Configuration
+## 18. Configuration
 
 Operator config is one HA `config_entry` plus number/select entities
 the user can tune at runtime.
@@ -508,7 +859,7 @@ the user can tune at runtime.
 * `switch.heo3_pause_on_verification_failure` — pause writes on
   any verification miss until user clears.
 
-## 17. Testing strategy
+## 19. Testing strategy
 
 ### Unit tests (no MQTT, no HA)
 
@@ -539,7 +890,7 @@ Per `feedback_dry_run.md`: dry_run skips MQTT publish and hides writer
 bugs. Tests use **mock transport**, not dry_run. Dry_run is a runtime
 flag for the user, not a testing tool.
 
-## 18. Build phases (operator-only)
+## 20. Build phases (operator-only)
 
 * **P1.0 — Skeleton.** Package layout, `Operator` class with stub
   methods, mock transport, config_flow shell. ~1 day.
@@ -558,22 +909,34 @@ flag for the user, not a testing tool.
   EPS detection. ~1 day.
 * **P1.7 — Snapshot integration.** Compose adapters into one
   `Snapshot`. End-to-end test. ~1 day.
-* **P1.8 — Live SA validation.** Connect to the real SA broker on the
-  prod HA. Mosquitto-probe to verify SA value vocabulary still matches
-  what the operator sends. Confirm verification cycle works
+* **P1.8 — Compute library.** Pure-function family in §12. Each
+  family in own file with focused unit tests against synthetic
+  Snapshots. Energy/SOC/kWh + time/rate + forecast aggregation +
+  counterfactual + physics. ~3 days.
+* **P1.9 — Build (action constructors).** Each constructor in §13
+  with tests asserting the produced PlannedAction matches expected
+  writes for representative inputs. ~2 days.
+* **P1.10 — Live SA validation.** Connect to the real SA broker on
+  the prod HA. Mosquitto-probe to verify SA value vocabulary still
+  matches what the operator sends. Confirm verification cycle works
   end-to-end. ~1 day.
-* **P1.9 — Static baseline plan + cutover.** Apply the static
-  baseline plan to the inverter (a one-shot script), turn off HEO II,
-  let the operator run with no planner attached (it just gathers
-  snapshots and reports them via dashboard). Validates the operator
-  doesn't break the live system. ~1 day.
+* **P1.11 — Static baseline plan + cutover.** Apply the static
+  baseline plan to the inverter (use `build.baseline_static()` +
+  `apply()` from a one-shot script), turn off HEO II, let the
+  operator run with no planner attached (it gathers snapshots,
+  exposes Compute results via dashboard sensors, applies
+  `build.lockdown_eps()` on grid-loss transitions). Validates the
+  operator doesn't break the live system. ~1 day.
 
-**Total: ~10-12 working days, ~2-3 weeks.**
+**Total: ~14-17 working days, ~3-4 weeks.** Compute + Build add ~5
+days vs the previous estimate but absorb the planner's hardest work.
 
-After P1 lands and runs cleanly for a week, planner design (the other
-doc) begins.
+After P1 lands and runs cleanly for a week, planner design begins —
+and starts from a much better place because the operator already
+exposes `compute.bridge_kwh`, `compute.import_volume_under_plan`,
+`build.sell_kwh`, etc. The planner just decides intent.
 
-## 19. Open questions
+## 21. Open questions
 
 * **`zero_export_to_ct` setting** — does SA's MQTT discovery actually
   expose this on Paddy's firmware? Mosquitto-probe required (P1.0 task).
@@ -588,20 +951,24 @@ doc) begins.
   At 15-min cadence, a few seconds is fine. At 1-min cadence (future),
   this matters. Decide once we see real timings.
 
-## 20. Sign-off checklist
+## 22. Sign-off checklist
 
 - [ ] Scope (§2) — every hook the planner could need is enumerated, nothing missing
-- [ ] Architectural shape (§3) — operator + 3 sub-adapters + Snapshot
+- [ ] Architectural shape (§3) — Operator + adapters + Compute + Build + apply
 - [ ] Inverter writes (§4) — every Sunsynk control HEO III might need
 - [ ] Inverter reads (§5) — every sensor HEO III might need
 - [ ] Peripheral controls + reads (§6, §7) — EV, appliances, future hooks
 - [ ] World rates + forecasts + flags (§8, §9, §10) — full external state
-- [ ] Snapshot + PlannedAction shapes (§11, §12) — typed, frozen
-- [ ] Verification + write/read cycle (§14)
-- [ ] Mechanical safety invariants (§15)
-- [ ] Config + tunables (§16)
-- [ ] Testing strategy (§17) — no dry_run for tests
-- [ ] Build phases (§18) — order + estimated effort
-- [ ] Open questions (§19) — anything to resolve before P1.0?
+- [ ] Snapshot shape (§11) — typed, frozen
+- [ ] Compute library (§12) — every derived calculation a planner might need
+- [ ] Build constructors (§13) — every high-level intent → PlannedAction mapping
+- [ ] PlannedAction shape (§14) — typed, frozen
+- [ ] ApplyResult (§15)
+- [ ] Verification + write/read cycle (§16)
+- [ ] Mechanical safety invariants (§17)
+- [ ] Config + tunables (§18)
+- [ ] Testing strategy (§19) — no dry_run for tests
+- [ ] Build phases (§20) — P1.0 through P1.11, estimated 14-17 days
+- [ ] Open questions (§21) — anything to resolve before P1.0?
 
 After sign-off: open tracking issue, P1.0 begins.
