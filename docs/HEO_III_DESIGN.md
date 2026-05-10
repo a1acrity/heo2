@@ -13,8 +13,9 @@
 > planner gets built later, including a planner more sophisticated than
 > the one we end up with v1.
 >
-> Tracking issue: TBD. Owner: Paddy. Targets: `custom_components/heo3/`
-> in this repo, building alongside HEO II until cutover.
+> Tracking issue: [#75](https://github.com/a1acrity/heo2/issues/75).
+> Owner: Paddy. Targets: `custom_components/heo3/` in this repo,
+> building alongside HEO II until cutover.
 
 ## 1. Why a separate operator module exists
 
