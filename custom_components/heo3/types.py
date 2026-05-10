@@ -22,8 +22,38 @@ class InverterState:
 
 
 @dataclass(frozen=True)
+class SlotSettings:
+    """Current values of one timer slot (1..6). Per SPEC §2 / §17:
+    `start_hhmm` is on a 5-min boundary; `grid_charge` is True/False;
+    `capacity_pct` is 0..100.
+    """
+
+    start_hhmm: str
+    grid_charge: bool
+    capacity_pct: int
+
+
+@dataclass(frozen=True)
 class InverterSettings:
-    """Current values of writable inverter settings. Filled in P1.2."""
+    """Current values of writable inverter settings.
+
+    Used as the diff baseline for `InverterAdapter.writes_for()`. A
+    write is only published when the new value differs from the value
+    here (case-insensitive for strings, tolerance 0.5 for floats).
+    """
+
+    work_mode: str
+    energy_pattern: str
+    max_charge_a: float
+    max_discharge_a: float
+    slots: tuple[
+        SlotSettings,
+        SlotSettings,
+        SlotSettings,
+        SlotSettings,
+        SlotSettings,
+        SlotSettings,
+    ]
 
 
 # ── Peripherals ─────────────────────────────────────────────────────

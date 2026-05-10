@@ -31,12 +31,28 @@ from heo3.types import (
     PlannedAction,
     PredictedRates,
     SlotPlan,
+    SlotSettings,
     Snapshot,
     SolarForecast,
     SystemConfig,
     SystemFlags,
     TeslaState,
 )
+
+
+def _baseline_inverter_settings() -> InverterSettings:
+    """Helper: a minimal valid InverterSettings for Snapshot construction."""
+    slots = tuple(
+        SlotSettings(start_hhmm=f"{h:02d}:00", grid_charge=False, capacity_pct=50)
+        for h in (0, 5, 11, 16, 19, 22)
+    )
+    return InverterSettings(
+        work_mode="Zero export to CT",
+        energy_pattern="Load first",
+        max_charge_a=100.0,
+        max_discharge_a=100.0,
+        slots=slots,
+    )
 
 
 class TestPackageImports:
@@ -76,10 +92,17 @@ class TestOperatorWiring:
             await op.snapshot()
 
     @pytest.mark.asyncio
-    async def test_apply_stub_raises(self):
-        op = Operator(transport=MockTransport())
-        with pytest.raises(NotImplementedError, match="P1.1"):
-            await op.apply(PlannedAction())
+    async def test_apply_no_op_returns_empty_result(self):
+        # P1.1: apply() is wired. An empty action with a connected
+        # transport produces an empty (success) ApplyResult.
+        transport = MockTransport()
+        await transport.connect()
+        op = Operator(transport=transport)
+
+        result = await op.apply(PlannedAction())
+        assert result.requested == ()
+        assert result.succeeded == ()
+        assert result.failed == ()
 
 
 class TestTypeSurface:
@@ -109,7 +132,7 @@ class TestTypeSurface:
             captured_at=datetime(2026, 5, 10, 18, 0, tzinfo=timezone.utc),
             local_tz=ZoneInfo("Europe/London"),
             inverter=InverterState(),
-            inverter_settings=InverterSettings(),
+            inverter_settings=_baseline_inverter_settings(),
             ev=EVState(),
             tesla=TeslaState(),
             appliances=ApplianceState(),
@@ -123,13 +146,15 @@ class TestTypeSurface:
         )
         assert snap.config.min_soc == 10
         assert snap.tesla is not None
+        assert snap.inverter_settings.work_mode == "Zero export to CT"
+        assert len(snap.inverter_settings.slots) == 6
 
     def test_snapshot_tesla_is_optional(self):
         snap = Snapshot(
             captured_at=datetime(2026, 5, 10, 18, 0, tzinfo=timezone.utc),
             local_tz=ZoneInfo("Europe/London"),
             inverter=InverterState(),
-            inverter_settings=InverterSettings(),
+            inverter_settings=_baseline_inverter_settings(),
             ev=EVState(),
             tesla=None,
             appliances=ApplianceState(),
