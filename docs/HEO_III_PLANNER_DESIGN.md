@@ -1,6 +1,6 @@
 # HEO III — Planner Module Design
 
-> Status: **draft for review**. This document defines the planner
+> Status: **signed off 2026-05-11**, P2.0 ready to begin. This document defines the planner
 > module. The mechanical operator layer it sits on top of is in
 > `docs/HEO_III_DESIGN.md` (signed off 2026-05-10, in production
 > from 2026-05-11 running `baseline_static`).
@@ -217,7 +217,6 @@ precedence (lower tier wins).
 |---|---|---|
 | **SavingSessionRule** | `flags.saving_session_active` is True | SellIntent over the session window: drain to min_soc + buffer. PREFER strength because the £/kWh signal (~£3) dominates regular peak rates. |
 | **IGODispatchRule** | `flags.igo_dispatching` OR scheduled `igo_planned[]` covers the active slot | ChargeIntent during the dispatch (gc=True, target=80% by dispatch end). PREFER strength. Avoids HEO II's F2 race by checking saving_session BEFORE claiming (no double-write). |
-| **EPSReadyRule** | `solar_today_total < threshold` AND `tomorrow_load_high` | HoldIntent at higher floor (e.g. 30%) overnight. OFFER — adds resilience but doesn't fight other tier-2 rules. |
 | **EVDeferralRule** | `defer_ev_eligible` AND `top_export_window` is now AND `ev_charging` | DeferEVIntent (zappi → Stopped). PREFER. Restore-on-window-end is a separate claim that fires when the export window passes. |
 
 ### Tier 3 — Optimisation (rate-driven)
@@ -229,12 +228,11 @@ precedence (lower tier wins).
 | **SolarSurplusRule** | `solar_power > load_power + headroom` AND `headroom_kwh > 0` | HoldIntent allowing PV to charge battery. OFFER. |
 | **EveningDrainRule** | active slot is in evening window (e.g. 19:00-23:30) | DrainIntent to `target_end_soc` (default 25%) by 23:30. OFFER — defaults beat doing nothing but yield to other rules. |
 
-That's 9 rules. Smaller than HEO II (which had ~13). Differences from HEO II:
+That's 9 rules total: tier-1 (2) + tier-2 (3) + tier-3 (4). Smaller than HEO II (which had ~13). Differences from HEO II:
 
 - **No BaselineRule** — the operator's `build.baseline_static()` is the planner's *fallback when zero rules fire*, not a rule itself.
 - **No SeparatePeakArbitrage / EveningProtect split** — replaced by asymmetry-aware PeakExportArbitrage that ALREADY considers worst-case replacement.
 - **MinSOCFloorRule is its own thing** — was implicit in HEO II; explicit here so it's observable when blocking another rule.
-- **EPSReadyRule is new** — addresses winter-low-PV scenario where overnight floor should be higher. Was in HEO II implicitly via cycle budget.
 
 ## 7. Tunable parameters + bounds
 
@@ -251,7 +249,6 @@ within bounds. Bounds are HARD — the tuner cannot exceed them.
 | PeakExportArbitrageRule | `spread_threshold_pence` | 8.0 | [3.0, 30.0] | actual P&L of past arbitrage decisions |
 | PeakExportArbitrageRule | `worst_case_replacement_quantile` | 0.9 | [0.5, 1.0] | "did we end up paying more than we sold for" rate |
 | EveningDrainRule | `target_end_soc` | 25 | [10, 50] | overnight surplus vs cheap-charge target |
-| EPSReadyRule | `winter_floor_pct` | 30 | [20, 60] | actual EPS events vs forecast | 
 
 Forecast biases (separate from rules — applied at Compute layer):
 - `load_forecast_bias_pct` — added to load forecast. Default 0, bounds [-20, +30]. Tuned from rolling 7-day actual vs forecast.
@@ -475,16 +472,18 @@ pre-planner work in §13 = ~4 weeks elapsed.
 
 ## 16. Sign-off checklist
 
-- [ ] Why-this-doc + scope (§1, §2)
-- [ ] Architectural shape (§3)
-- [ ] Rule shape: Claim + Arbiter contracts (§4, §5)
-- [ ] Starting rule set (§6) — 9 rules, all named, all with one-line description
-- [ ] Tunable parameters + bounds (§7) — every rule documented
-- [ ] Learning loop (§8) — what tunes, how, where audit logs land
-- [ ] Coordinator + scheduling (§9) — cron + event triggers
-- [ ] Observability sensors (§10) — active_rules / last_decision / weekly_digest
-- [ ] PerformanceTracker (§11) — what's stored, for how long
-- [ ] Rule context (§12) — what helpers rules can call
-- [ ] Pre-planner work (§13) — tick infrastructure, latency profiling, read-back
-- [ ] Build phases (§14) — P2.0 through P2.8, ~3 weeks
-- [ ] Open questions (§15) — anything to resolve before P2.0?
+Signed off 2026-05-11.
+
+- [x] Why-this-doc + scope (§1, §2)
+- [x] Architectural shape (§3)
+- [x] Rule shape: Claim + Arbiter contracts (§4, §5)
+- [x] Starting rule set (§6) — 9 rules, all named, all with one-line description
+- [x] Tunable parameters + bounds (§7) — every rule documented
+- [x] Learning loop (§8) — what tunes, how, where audit logs land
+- [x] Coordinator + scheduling (§9) — cron + event triggers
+- [x] Observability sensors (§10) — active_rules / last_decision / weekly_digest
+- [x] PerformanceTracker (§11) — what's stored, for how long
+- [x] Rule context (§12) — what helpers rules can call
+- [x] Pre-planner work (§13) — tick infrastructure, latency profiling, read-back
+- [x] Build phases (§14) — P2.0 through P2.8, ~3 weeks
+- [x] Open questions (§15) — none blocking; will iterate during build
