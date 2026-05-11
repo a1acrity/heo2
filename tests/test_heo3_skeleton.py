@@ -60,8 +60,8 @@ class TestPackageImports:
         assert const.DOMAIN == "heo3"
 
     def test_tick_budget_constants_present(self):
-        assert const.TICK_HARD_BUDGET_S == 60.0
-        assert const.TICK_WARNING_S == 30.0
+        assert const.TICK_HARD_BUDGET_S == 120.0
+        assert const.TICK_WARNING_S == 60.0
 
 
 class TestOperatorWiring:
