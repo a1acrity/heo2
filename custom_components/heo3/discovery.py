@@ -131,22 +131,37 @@ def discover_tesla_vehicle(hass) -> str | None:  # type: ignore[no-untyped-def]
 
 
 def discover_deye_prefix(hass) -> str | None:  # type: ignore[no-untyped-def]
-    """Find the Deye-Sunsynk integration's entity prefix.
+    """Find the Deye-Sunsynk integration's entity prefix for inverter 1.
 
     Returns the leaf prefix (e.g. 'deye_sunsynk_sol_ark_') that all
-    its writable settings share. Used as a more reliable read-back
-    source than SA mirror sensors after HA restarts.
+    of inverter 1's writable settings share. Used as a more reliable
+    read-back source than SA mirror sensors after HA restarts.
+
+    Per SPEC §2 we only ever read/write the primary inverter — skips
+    entries with 'inverter_2' which is the RS485-mirrored secondary
+    (different state, not authoritative).
 
     None if the integration isn't installed.
     """
-    # Anchor on the work_mode select since every inverter exposes it.
+    candidates = []
     for eid in _all_entity_ids(hass):
-        if eid.startswith("select.") and eid.endswith("_work_mode"):
-            leaf = eid[len("select."):-len("work_mode")]
-            # Match deye-style installs only (not e.g. SA-via-MQTT)
-            if "deye" in leaf or "sunsynk" in leaf or "sol_ark" in leaf:
-                return leaf
-    return None
+        if not (eid.startswith("select.") and eid.endswith("_work_mode")):
+            continue
+        leaf = eid[len("select."):-len("work_mode")]
+        if not any(k in leaf for k in ("deye", "sunsynk", "sol_ark")):
+            continue
+        # Skip the mirrored secondary inverter — SPEC §2 says writes
+        # only go to inverter 1, so reads should come from there too.
+        if "inverter_2" in leaf:
+            continue
+        candidates.append(leaf)
+
+    if not candidates:
+        return None
+    # Prefer the SHORTEST prefix — the inverter_1 primary entries
+    # usually have less suffix than e.g. multi-device prefixes.
+    candidates.sort(key=len)
+    return candidates[0]
 
 
 # ── Inverter sensor overrides ─────────────────────────────────────

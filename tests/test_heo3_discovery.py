@@ -158,7 +158,6 @@ class TestDeyePrefix:
         assert discover_deye_prefix(hass) == "deye_sunsynk_sol_ark_"
 
     def test_skips_non_inverter_work_mode(self):
-        # E.g. some HVAC integration with select.thermostat_work_mode
         hass = _hass([
             "select.thermostat_work_mode",
         ])
@@ -167,6 +166,14 @@ class TestDeyePrefix:
     def test_no_match_returns_none(self):
         hass = _hass(["sensor.foo"])
         assert discover_deye_prefix(hass) is None
+
+    def test_prefers_inverter_1_over_inverter_2(self):
+        # SPEC §2: writes only go to inverter 1; reads should too.
+        hass = _hass([
+            "select.deye_sunsynk_sol_ark_x_2_inverter_2_work_mode",  # secondary
+            "select.deye_sunsynk_sol_ark_work_mode",                  # primary
+        ])
+        assert discover_deye_prefix(hass) == "deye_sunsynk_sol_ark_"
 
 
 # ── Inverter sensor overrides ─────────────────────────────────────
