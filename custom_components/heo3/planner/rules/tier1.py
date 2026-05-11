@@ -80,7 +80,20 @@ class MinSOCFloorRule:
         if snap.flags.eps_active:
             return None
 
+        # Only fire when battery is within FLOOR_PROXIMITY_PCT of the
+        # floor — otherwise we'd block tier-3 rules from claiming the
+        # slot. Operator's safety validation enforces hard min_soc.
+        soc = snap.inverter.battery_soc_pct
+        if soc is None:
+            # Without telemetry we don't fire — other rules also won't
+            # have enough to act on; baseline_static fallback covers.
+            return None
+
         floor = snap.config.min_soc
+        FLOOR_PROXIMITY_PCT = 10  # only assert floor when within 10% of it
+        if soc > floor + FLOOR_PROXIMITY_PCT:
+            return None  # comfortably above floor
+
         window = TimeRange(
             start=snap.captured_at,
             end=snap.captured_at + timedelta(hours=1),
@@ -88,7 +101,10 @@ class MinSOCFloorRule:
         return Claim(
             rule_name=self.name,
             intent=HoldIntent(soc_pct=floor, window=window),
-            rationale=f"min_soc floor at {floor}% (fallback)",
+            rationale=(
+                f"battery {soc:.0f}% near min_soc floor {floor}% "
+                f"— asserting floor"
+            ),
             strength=ClaimStrength.OFFER,
             horizon=window,
             expected_pence_impact=0.0,

@@ -73,21 +73,38 @@ class TestEPSLockdownRule:
 
 
 class TestMinSOCFloorRule:
-    def test_fires_when_grid_up(self):
+    def test_fires_when_near_floor(self):
+        # SOC at 15%, floor 15% → within proximity → claim.
         rule = MinSOCFloorRule()
-        snap = make_snapshot(eps_active=False, config=SystemConfig(min_soc=15))
+        snap = make_snapshot(
+            eps_active=False,
+            config=SystemConfig(min_soc=15),
+            soc_pct=15.0,
+        )
         claim = rule.evaluate(snap, _ctx(rule))
         assert claim is not None
-        # OFFER strength so it yields to any rule with a real opinion.
-        # Operator's safety validation enforces the hard floor.
         assert claim.strength == ClaimStrength.OFFER
         assert isinstance(claim.intent, HoldIntent)
         assert claim.intent.soc_pct == 15
 
-    def test_yields_during_eps(self):
-        # EPSLockdownRule overrides; floor rule shouldn't claim.
+    def test_no_fire_when_comfortably_above_floor(self):
+        # SOC 60%, floor 10% — well above proximity (10%) → don't fire.
         rule = MinSOCFloorRule()
-        snap = make_snapshot(eps_active=True)
+        snap = make_snapshot(
+            eps_active=False,
+            config=SystemConfig(min_soc=10),
+            soc_pct=60.0,
+        )
+        assert rule.evaluate(snap, _ctx(rule)) is None
+
+    def test_no_fire_when_soc_unavailable(self):
+        rule = MinSOCFloorRule()
+        snap = make_snapshot(eps_active=False, soc_pct=None)
+        assert rule.evaluate(snap, _ctx(rule)) is None
+
+    def test_yields_during_eps(self):
+        rule = MinSOCFloorRule()
+        snap = make_snapshot(eps_active=True, soc_pct=5.0)
         assert rule.evaluate(snap, _ctx(rule)) is None
 
 
