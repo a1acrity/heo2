@@ -20,8 +20,11 @@ patching needed (was a workaround before discovery.py landed).
 from __future__ import annotations
 
 import logging
+from dataclasses import replace as _dc_replace
 from typing import Any
 
+from .adapters.peripheral import TeslaConfig, ZappiConfig
+from .adapters.world import BDConfig, FlagsConfig
 from .const import DOMAIN
 from .discovery import discover_all
 
@@ -34,10 +37,14 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
     async def snapshot_log(call) -> None:
         op = _get_operator(hass)
         discovered_at_setup = _get_discovered(hass)
-        discovered_now = discover_all(hass)
         if op is None:
             logger.error("heo3.snapshot_log: no HEO III config entry loaded")
             return
+
+        # Re-discover NOW — entity registry may have changed since
+        # async_setup_entry (Teslemetry, SA, etc. often register
+        # late). Update operator's adapters with anything new.
+        discovered_now = _refresh_operator_config(hass, op)
 
         try:
             snap = await op.snapshot()
@@ -101,6 +108,8 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
         if op is None:
             logger.error("heo3.apply_baseline_static: no config entry loaded")
             return
+
+        _refresh_operator_config(hass, op)
 
         try:
             snap = await op.snapshot()
@@ -169,3 +178,61 @@ def _get_discovered(hass) -> dict | None:  # type: ignore[no-untyped-def]
         if isinstance(entry_data, dict) and "discovered" in entry_data:
             return entry_data["discovered"]
     return None
+
+
+def _refresh_operator_config(hass, op) -> dict:  # type: ignore[no-untyped-def]
+    """Re-run discovery and apply any new findings to operator adapters.
+
+    HA integrations register entities lazily — discovery at
+    async_setup_entry often misses Tesla / late-loading SA entities.
+    Re-running on each service call makes the operator self-heal.
+    Also handles the case where the user installs a new integration
+    (e.g. adds zappi) without restarting heo3.
+    """
+    discovered = discover_all(hass)
+
+    # BD meter key
+    if discovered["bd_meter_key"] and op._world._bd is None:
+        op._world._bd = BDConfig.from_meter_key(discovered["bd_meter_key"])
+
+    # IGO + saving session
+    cfg = op._world._flags_cfg
+    needs_update = False
+    if discovered["igo_dispatching_entity"] and cfg.igo_dispatching_entity is None:
+        needs_update = True
+    if discovered["saving_session_entity"] and cfg.saving_session_entity is None:
+        needs_update = True
+    if needs_update:
+        op._world._flags_cfg = _dc_replace(
+            cfg,
+            igo_dispatching_entity=(
+                discovered["igo_dispatching_entity"] or cfg.igo_dispatching_entity
+            ),
+            saving_session_entity=(
+                discovered["saving_session_entity"] or cfg.saving_session_entity
+            ),
+        )
+
+    # Tesla
+    if discovered["tesla_vehicle"] and op._peripheral._tesla is None:
+        op._peripheral._tesla = TeslaConfig.from_vehicle(
+            discovered["tesla_vehicle"]
+        )
+
+    # Zappi (always update — entity prefix doesn't change at runtime
+    # but if the user-set defaults at construction were wrong we want
+    # to overwrite with what we found).
+    zappi_prefix = discovered["zappi_prefix"]
+    if zappi_prefix:
+        op._peripheral._zappi = ZappiConfig(
+            charge_mode=f"select.{zappi_prefix}_charge_mode",
+            charging_state=f"sensor.{zappi_prefix}_status",
+            charge_power=f"sensor.{zappi_prefix}_power_ct_internal_load",
+        )
+
+    # Inverter sensor overrides — merge in any new ones discovered.
+    op._inverter._sensor_overrides.update(
+        discovered["inverter_sensor_overrides"]
+    )
+
+    return discovered
