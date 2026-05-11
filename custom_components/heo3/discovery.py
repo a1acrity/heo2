@@ -149,20 +149,18 @@ _INVERTER_OVERRIDE_CANDIDATES: dict[str, list[str]] = {
 }
 
 
-def _has_real_state(hass, entity_id: str) -> bool:  # type: ignore[no-untyped-def]
-    """True if the entity exists AND has a non-null/non-unavailable state.
+def _entity_registered(hass, entity_id: str) -> bool:  # type: ignore[no-untyped-def]
+    """True if the entity exists in the state machine.
 
-    Just checking registry presence isn't enough — HA can keep stale
-    registry entries for entities that are no longer publishing
-    (e.g. after an integration is reconfigured). We want only entities
-    that are actually live.
+    We use hass.states.get() rather than `eid in async_all()` because
+    .get() correctly returns None for stale registry entries that an
+    earlier integration version registered but no longer publishes
+    (the previous bug). State value can be 'unknown'/'unavailable'
+    here — that's acceptable because integrations like SA take ~10s
+    after HA restart to publish their first telemetry, and we don't
+    want to miss them by checking too early.
     """
-    s = hass.states.get(entity_id)
-    if s is None:
-        return False
-    if s.state in (None, "unknown", "unavailable", ""):
-        return False
-    return True
+    return hass.states.get(entity_id) is not None
 
 
 def discover_inverter_sensor_overrides(
@@ -180,7 +178,7 @@ def discover_inverter_sensor_overrides(
     for leaf, candidates in _INVERTER_OVERRIDE_CANDIDATES.items():
         default = f"sensor.sa_inverter_1_{leaf}"
         for alt in candidates:
-            if _has_real_state(hass, alt):
+            if _entity_registered(hass, alt):
                 if alt != default:
                     out[leaf] = alt
                 break
