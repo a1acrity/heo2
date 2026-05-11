@@ -86,6 +86,8 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
             "min_soc": snap.config.min_soc,
             "discovered_at_setup": discovered_at_setup or {},
             "discovered_now": discovered_now,
+            "operator_inverter_overrides": dict(op._inverter._sensor_overrides),
+            "operator_inverter_battery_soc_entity": op._inverter._entity("battery_soc"),
             "slots_current": [
                 {
                     "n": i + 1,
