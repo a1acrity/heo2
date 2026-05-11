@@ -18,6 +18,7 @@ import logging
 from .const import DEFAULT_MQTT_HOST, DEFAULT_MQTT_PORT, DOMAIN
 from .operator import Operator
 from .service_caller_ha import HAServiceCaller
+from .services import async_register_services
 from .state_reader_ha import HAStateReader
 from .transport_paho import PahoTransport
 
@@ -59,6 +60,8 @@ async def async_setup_entry(hass, entry) -> bool:  # type: ignore[no-untyped-def
         "operator": operator,
         "transport": transport,
     }
+
+    await async_register_services(hass)
 
     logger.info(
         "HEO III setup_entry: operator wired, transport connected to %s:%d",
