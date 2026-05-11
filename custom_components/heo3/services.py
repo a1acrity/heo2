@@ -23,6 +23,7 @@ import logging
 from typing import Any
 
 from .const import DOMAIN
+from .discovery import discover_all
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,8 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
 
     async def snapshot_log(call) -> None:
         op = _get_operator(hass)
-        discovered = _get_discovered(hass)
+        discovered_at_setup = _get_discovered(hass)
+        discovered_now = discover_all(hass)
         if op is None:
             logger.error("heo3.snapshot_log: no HEO III config entry loaded")
             return
@@ -75,7 +77,8 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
                 sum(snap.load_forecast.today_hourly_kwh), 2
             ),
             "min_soc": snap.config.min_soc,
-            "discovered": discovered or {},
+            "discovered_at_setup": discovered_at_setup or {},
+            "discovered_now": discovered_now,
             "slots_current": [
                 {
                     "n": i + 1,
