@@ -88,6 +88,19 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
             "discovered_now": discovered_now,
             "operator_inverter_overrides": dict(op._inverter._sensor_overrides),
             "operator_inverter_battery_soc_entity": op._inverter._entity("battery_soc"),
+            # Per-candidate diagnostic: what hass.states.get returns
+            "diag_battery_soc_default": _entity_debug(
+                hass, "sensor.sa_inverter_1_battery_soc"
+            ),
+            "diag_battery_soc_total": _entity_debug(
+                hass, "sensor.sa_total_battery_state_of_charge"
+            ),
+            "diag_solar_default": _entity_debug(
+                hass, "sensor.sa_inverter_1_solar_power"
+            ),
+            "diag_solar_pv": _entity_debug(
+                hass, "sensor.sa_inverter_1_pv_power"
+            ),
             "slots_current": [
                 {
                     "n": i + 1,
@@ -172,6 +185,14 @@ def _get_operator(hass) -> Any | None:  # type: ignore[no-untyped-def]
         if isinstance(entry_data, dict) and "operator" in entry_data:
             return entry_data["operator"]
     return None
+
+
+def _entity_debug(hass, entity_id: str) -> str:  # type: ignore[no-untyped-def]
+    """For diagnostic dumps — what hass.states.get returns for this entity."""
+    s = hass.states.get(entity_id)
+    if s is None:
+        return "GET_RETURNS_NONE"
+    return f"state={s.state!r} type={type(s.state).__name__}"
 
 
 def _get_discovered(hass) -> dict | None:  # type: ignore[no-untyped-def]
