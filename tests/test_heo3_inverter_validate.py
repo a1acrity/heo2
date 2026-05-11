@@ -84,12 +84,37 @@ class TestSlots:
             eps_active=False,
         )
 
-    def test_wrong_slot_count_rejected(self):
-        with pytest.raises(SafetyError, match="exactly 6"):
+    def test_partial_slot_subset_allowed(self):
+        # Build constructors emit partial subsets (e.g. drain_to
+        # only touches the slot covering [now, by]). Validator
+        # should accept any subset 1-6.
+        validate_action(
+            PlannedAction(
+                slots=(
+                    SlotPlan(slot_n=5, capacity_pct=25),
+                    SlotPlan(slot_n=6, capacity_pct=25),
+                ),
+            ),
+            min_soc=10, eps_active=False,
+        )
+
+    def test_too_many_slots_rejected(self):
+        slots = tuple(
+            SlotPlan(slot_n=i) for i in [1, 2, 3, 4, 5, 6, 1]
+        )
+        with pytest.raises(SafetyError, match="max 6"):
             validate_action(
-                PlannedAction(slots=(SlotPlan(slot_n=1),)),
-                min_soc=10,
-                eps_active=False,
+                PlannedAction(slots=slots), min_soc=10, eps_active=False,
+            )
+
+    def test_duplicate_slot_n_rejected(self):
+        # 6 slots but with a duplicate slot_n
+        slots = tuple(
+            SlotPlan(slot_n=i) for i in [1, 2, 2, 4, 5, 6]
+        )
+        with pytest.raises(SafetyError, match="duplicate"):
+            validate_action(
+                PlannedAction(slots=slots), min_soc=10, eps_active=False,
             )
 
     def test_six_valid_slots_pass(self):

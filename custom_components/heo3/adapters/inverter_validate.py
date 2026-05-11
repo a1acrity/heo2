@@ -84,15 +84,29 @@ def validate_action(
     if not action.slots:
         return
 
-    if len(action.slots) != 6:
+    # Build constructors emit partial slot tuples (just the ones that
+    # change for the current intent). We accept any subset, as long
+    # as each slot_n is in [1,6] and there are no duplicates.
+    if len(action.slots) > 6:
         raise SafetyError(
-            f"slots must be empty or exactly 6, got {len(action.slots)}"
+            f"action.slots has {len(action.slots)} entries, max 6"
+        )
+
+    slot_ns = [s.slot_n for s in action.slots]
+    if len(set(slot_ns)) != len(slot_ns):
+        raise SafetyError(
+            f"duplicate slot_n in action.slots: {slot_ns}"
         )
 
     for slot in action.slots:
         _validate_slot(slot, min_soc=min_soc, eps_active=eps_active)
 
-    _validate_slot_contiguity(action.slots)
+    # Contiguity check only makes sense when we have all 6 slots
+    # (an action specifying complete new slot timings). Partial
+    # actions only modify a subset of fields on existing slots; the
+    # inverter's other slots retain their previous values.
+    if len(action.slots) == 6:
+        _validate_slot_contiguity(action.slots)
 
 
 def _validate_slot(
