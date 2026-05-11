@@ -84,6 +84,7 @@ class InverterAdapter:
         state_reader: StateReader | None = None,
         sensor_prefix: str | None = None,
         sensor_overrides: dict[str, str] | None = None,
+        deye_settings_prefix: str | None = None,
     ) -> None:
         self._transport = transport
         self._inverter_name = inverter_name
@@ -100,6 +101,12 @@ class InverterAdapter:
         # dict maps internal leaf → full entity ID for any leaf whose
         # name doesn't fit the prefix+leaf convention.
         self._sensor_overrides = dict(sensor_overrides or {})
+        # Deye-Sunsynk integration alternate read source (writable HA
+        # entities, more reliable than SA's MQTT-mirror sensors which
+        # can lag stale after HA restarts). When set, read_settings
+        # prefers Deye for slot config + globals. Writes still go via
+        # SA MQTT — Deye is read-only here.
+        self._deye_prefix = deye_settings_prefix
 
         # Single in-flight response Future. One write at a time means
         # the next response on the topic IS for that write — no FIFO
@@ -159,12 +166,14 @@ class InverterAdapter:
     async def read_settings(self) -> InverterSettings:
         """Read back the current value of every writable setting.
 
-        Used as the diff baseline by writes_for() and as the verification
-        target for §16's full OK / SET_BUT_UNVERIFIED states.
+        Prefers Deye-Sunsynk integration entities when configured
+        (proven more reliable than SA's MQTT-mirror sensors after
+        HA restarts). Falls back to SA mirror entities when Deye
+        isn't available.
 
-        Slot reads use the SA discovery names — `time_point_N`,
-        `grid_charge_point_N`, `capacity_point_N` — and floor times to
-        the 5-min boundary (Sunsynk does this on writes; we mirror).
+        Used as the diff baseline by writes_for() and as the
+        verification target for §16's full OK / SET_BUT_UNVERIFIED
+        states.
         """
         if self._state_reader is None:
             raise RuntimeError(
@@ -172,15 +181,66 @@ class InverterAdapter:
             )
         r = self._state_reader
 
+        if self._deye_prefix is not None:
+            settings = self._read_settings_via_deye(r)
+            if settings is not None:
+                return settings
+        return self._read_settings_via_sa(r)
+
+    def _read_settings_via_deye(
+        self, r: StateReader
+    ) -> InverterSettings | None:
+        """Read inverter settings from the Deye-Sunsynk integration.
+
+        Returns None if the Deye work_mode select isn't reporting —
+        treat as "Deye not ready" and let the caller fall back to SA.
+        """
+        prefix = self._deye_prefix
+        wm_state = parse_str(r.get_state(f"select.{prefix}work_mode"))
+        if wm_state is None:
+            return None  # Deye not ready, fall back
+
+        slots: list[SlotSettings] = []
+        for n in range(1, 7):
+            time_str = parse_str(
+                r.get_state(f"select.{prefix}time_point_{n}")
+            )
+            gc = parse_bool(
+                r.get_state(f"switch.{prefix}grid_charge_point_{n}")
+            )
+            cap = parse_int(
+                r.get_state(f"number.{prefix}capacity_point_{n}")
+            )
+            slots.append(
+                SlotSettings(
+                    start_hhmm=time_str if time_str is not None else "00:00",
+                    grid_charge=gc if gc is not None else False,
+                    capacity_pct=cap if cap is not None else 0,
+                )
+            )
+
+        ep = parse_str(r.get_state(f"select.{prefix}energy_pattern"))
+        max_charge = parse_float(
+            r.get_state(f"number.{prefix}max_charge_current")
+        )
+        max_discharge = parse_float(
+            r.get_state(f"number.{prefix}max_discharge_current")
+        )
+        return InverterSettings(
+            work_mode=wm_state,
+            energy_pattern=ep if ep is not None else "",
+            max_charge_a=max_charge if max_charge is not None else 0.0,
+            max_discharge_a=max_discharge if max_discharge is not None else 0.0,
+            slots=tuple(slots),  # type: ignore[arg-type]
+        )
+
+    def _read_settings_via_sa(self, r: StateReader) -> InverterSettings:
+        """Original SA-mirror read path. Used when Deye unavailable."""
         slots: list[SlotSettings] = []
         for n in range(1, 7):
             time_str = parse_str(r.get_state(self._entity(f"time_point_{n}")))
             gc = parse_bool(r.get_state(self._entity(f"grid_charge_point_{n}")))
             cap = parse_int(r.get_state(self._entity(f"capacity_point_{n}")))
-            # If any slot field is missing we still build a SlotSettings;
-            # use placeholder defaults so the dataclass invariants hold.
-            # The diff path will then publish whatever the planner
-            # specifies (no false skip).
             slots.append(
                 SlotSettings(
                     start_hhmm=time_str if time_str is not None else "00:00",

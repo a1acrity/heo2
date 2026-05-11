@@ -127,6 +127,28 @@ def discover_tesla_vehicle(hass) -> str | None:  # type: ignore[no-untyped-def]
     return None
 
 
+# ── Deye-Sunsynk integration prefix ───────────────────────────────
+
+
+def discover_deye_prefix(hass) -> str | None:  # type: ignore[no-untyped-def]
+    """Find the Deye-Sunsynk integration's entity prefix.
+
+    Returns the leaf prefix (e.g. 'deye_sunsynk_sol_ark_') that all
+    its writable settings share. Used as a more reliable read-back
+    source than SA mirror sensors after HA restarts.
+
+    None if the integration isn't installed.
+    """
+    # Anchor on the work_mode select since every inverter exposes it.
+    for eid in _all_entity_ids(hass):
+        if eid.startswith("select.") and eid.endswith("_work_mode"):
+            leaf = eid[len("select."):-len("work_mode")]
+            # Match deye-style installs only (not e.g. SA-via-MQTT)
+            if "deye" in leaf or "sunsynk" in leaf or "sol_ark" in leaf:
+                return leaf
+    return None
+
+
 # ── Inverter sensor overrides ─────────────────────────────────────
 
 # Real SA naming on Paddy's install differs from the leaf names HEO III
@@ -197,4 +219,5 @@ def discover_all(hass) -> dict[str, Any]:  # type: ignore[no-untyped-def]
         "zappi_prefix": discover_zappi_prefix(hass),
         "tesla_vehicle": discover_tesla_vehicle(hass),
         "inverter_sensor_overrides": discover_inverter_sensor_overrides(hass),
+        "deye_prefix": discover_deye_prefix(hass),
     }

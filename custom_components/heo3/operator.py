@@ -91,6 +91,7 @@ class Operator:
         inverter_name: str = DEFAULT_INVERTER_NAME,
         inverter_sensor_prefix: str | None = None,
         inverter_sensor_overrides: dict[str, str] | None = None,
+        deye_settings_prefix: str | None = None,
         zappi_config: ZappiConfig | None = None,
         zappi_charge_mode_entity: str = "select.zappi_charge_mode",
         tesla_config: TeslaConfig | None = None,
@@ -119,6 +120,7 @@ class Operator:
             state_reader=state_reader,
             sensor_prefix=inverter_sensor_prefix,
             sensor_overrides=inverter_sensor_overrides,
+            deye_settings_prefix=deye_settings_prefix,
         )
         self._peripheral = PeripheralAdapter(
             state_reader=state_reader,

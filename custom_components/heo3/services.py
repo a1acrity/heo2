@@ -258,4 +258,8 @@ def _refresh_operator_config(hass, op) -> dict:  # type: ignore[no-untyped-def]
         discovered["inverter_sensor_overrides"]
     )
 
+    # Deye-Sunsynk read-back prefix
+    if discovered["deye_prefix"] and op._inverter._deye_prefix is None:
+        op._inverter._deye_prefix = discovered["deye_prefix"]
+
     return discovered

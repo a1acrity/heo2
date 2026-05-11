@@ -10,6 +10,7 @@ import pytest
 from heo3.discovery import (
     discover_all,
     discover_bd_meter_key,
+    discover_deye_prefix,
     discover_igo_dispatching_entity,
     discover_inverter_sensor_overrides,
     discover_saving_session_entity,
@@ -143,6 +144,29 @@ class TestTesla:
     def test_no_tesla_returns_none(self):
         hass = _hass(["sensor.foo"])
         assert discover_tesla_vehicle(hass) is None
+
+
+# ── Deye prefix ───────────────────────────────────────────────────
+
+
+class TestDeyePrefix:
+    def test_finds_deye_sunsynk_sol_ark(self):
+        hass = _hass([
+            "select.deye_sunsynk_sol_ark_work_mode",
+            "number.deye_sunsynk_sol_ark_capacity_point_1",
+        ])
+        assert discover_deye_prefix(hass) == "deye_sunsynk_sol_ark_"
+
+    def test_skips_non_inverter_work_mode(self):
+        # E.g. some HVAC integration with select.thermostat_work_mode
+        hass = _hass([
+            "select.thermostat_work_mode",
+        ])
+        assert discover_deye_prefix(hass) is None
+
+    def test_no_match_returns_none(self):
+        hass = _hass(["sensor.foo"])
+        assert discover_deye_prefix(hass) is None
 
 
 # ── Inverter sensor overrides ─────────────────────────────────────

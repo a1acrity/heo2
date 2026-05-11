@@ -105,6 +105,7 @@ async def async_setup_entry(hass, entry) -> bool:  # type: ignore[no-untyped-def
         zappi_config=zappi_config,
         appliance_switches=DEFAULT_APPLIANCES,
         inverter_sensor_overrides=discovered["inverter_sensor_overrides"],
+        deye_settings_prefix=discovered["deye_prefix"],
     )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
