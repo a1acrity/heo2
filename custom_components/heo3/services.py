@@ -32,6 +32,7 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
 
     async def snapshot_log(call) -> None:
         op = _get_operator(hass)
+        discovered = _get_discovered(hass)
         if op is None:
             logger.error("heo3.snapshot_log: no HEO III config entry loaded")
             return
@@ -74,6 +75,7 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
                 sum(snap.load_forecast.today_hourly_kwh), 2
             ),
             "min_soc": snap.config.min_soc,
+            "discovered": discovered or {},
             "slots_current": [
                 {
                     "n": i + 1,
@@ -155,4 +157,12 @@ def _get_operator(hass) -> Any | None:  # type: ignore[no-untyped-def]
     for entry_data in bucket.values():
         if isinstance(entry_data, dict) and "operator" in entry_data:
             return entry_data["operator"]
+    return None
+
+
+def _get_discovered(hass) -> dict | None:  # type: ignore[no-untyped-def]
+    bucket = hass.data.get(DOMAIN, {})
+    for entry_data in bucket.values():
+        if isinstance(entry_data, dict) and "discovered" in entry_data:
+            return entry_data["discovered"]
     return None
