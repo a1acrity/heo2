@@ -5,8 +5,9 @@
 > `docs/HEO_III_DESIGN.md` (signed off 2026-05-10, in production
 > from 2026-05-11 running `baseline_static`).
 >
-> Tracking issue: TBD. Owner: Paddy. Targets: `custom_components/heo3/planner/`,
-> sitting alongside the operator's adapters/ + compute.py + build.py.
+> Tracking issue: [#90](https://github.com/a1acrity/heo2/issues/90).
+> Owner: Paddy. Targets: `custom_components/heo3/planner/`, sitting
+> alongside the operator's adapters/ + compute.py + build.py.
 
 ## 1. Why a separate planner doc
 
