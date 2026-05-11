@@ -78,7 +78,9 @@ class TestMinSOCFloorRule:
         snap = make_snapshot(eps_active=False, config=SystemConfig(min_soc=15))
         claim = rule.evaluate(snap, _ctx(rule))
         assert claim is not None
-        assert claim.strength == ClaimStrength.MUST
+        # OFFER strength so it yields to any rule with a real opinion.
+        # Operator's safety validation enforces the hard floor.
+        assert claim.strength == ClaimStrength.OFFER
         assert isinstance(claim.intent, HoldIntent)
         assert claim.intent.soc_pct == 15
 

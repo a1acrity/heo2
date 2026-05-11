@@ -52,23 +52,24 @@ class EPSLockdownRule:
 
 
 class MinSOCFloorRule:
-    """Always-on safety floor.
+    """Observable floor — only fires when no other rule has claimed the slot.
 
-    Holds the active slot's capacity_pct ≥ config.min_soc. Stops
-    other rules from draining below floor.
+    The OPERATOR's safety validation (inverter_validate.SafetyError)
+    already rejects plans with slot capacity_pct < config.min_soc.
+    This rule is the OBSERVABLE counterpart: it claims the floor as
+    OFFER so the user can see "no other rule decided, falling back
+    to min_soc floor". Other rules override.
 
-    This is a tier-1 MUST. Other rules can claim higher SOC; this
-    rule just enforces "not lower than floor". The Arbiter resolves
-    by tier: this MUST always wins on the dimension it covers.
+    Even though it's tier=1 by classification (safety), the strength
+    is OFFER so it yields to any rule with a real opinion. The hard
+    safety enforcement lives at the operator layer where it belongs.
     """
 
     name = "min_soc_floor"
     tier = 1
-    description = "Holds active slot ≥ config.min_soc, regardless of other rules"
+    description = "Observable fallback to config.min_soc (operator enforces hard)"
 
     def __init__(self) -> None:
-        # Max we'll claim is the user-set min_soc itself; nothing to tune
-        # here other than via SystemConfig.min_soc which is user-set.
         self._params: dict[str, Tunable] = {}
 
     @property
@@ -76,14 +77,10 @@ class MinSOCFloorRule:
         return self._params
 
     def evaluate(self, snap: Snapshot, ctx: RuleContext) -> Claim | None:
-        # If EPS is active, EPSLockdownRule overrides anyway.
         if snap.flags.eps_active:
             return None
 
         floor = snap.config.min_soc
-        # Window: from now to end of next slot transition (1h granularity
-        # is fine for a floor — the inverter will respect it indefinitely
-        # if the active slot's capacity_pct is set to >= floor).
         window = TimeRange(
             start=snap.captured_at,
             end=snap.captured_at + timedelta(hours=1),
@@ -91,8 +88,8 @@ class MinSOCFloorRule:
         return Claim(
             rule_name=self.name,
             intent=HoldIntent(soc_pct=floor, window=window),
-            rationale=f"min_soc floor at {floor}%",
-            strength=ClaimStrength.MUST,
+            rationale=f"min_soc floor at {floor}% (fallback)",
+            strength=ClaimStrength.OFFER,
             horizon=window,
             expected_pence_impact=0.0,
         )
