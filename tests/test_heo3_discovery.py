@@ -18,11 +18,31 @@ from heo3.discovery import (
 )
 
 
-def _hass(entity_ids):
-    """Build a fake hass with a given list of entity IDs."""
-    states = [SimpleNamespace(entity_id=eid) for eid in entity_ids]
+def _hass(entity_ids, state_value: str = "ok"):
+    """Build a fake hass with given entity IDs (each with a sentinel state).
+
+    `state_value` is the .state for every entity; pass an
+    iterable to vary, or use _hass_with_states for finer control.
+    """
+    state_objects = {
+        eid: SimpleNamespace(entity_id=eid, state=state_value)
+        for eid in entity_ids
+    }
     hass = MagicMock()
-    hass.states.async_all.return_value = states
+    hass.states.async_all.return_value = list(state_objects.values())
+    hass.states.get.side_effect = lambda eid: state_objects.get(eid)
+    return hass
+
+
+def _hass_with_states(states_dict: dict[str, str]):
+    """Build a fake hass with explicit per-entity state values."""
+    state_objects = {
+        eid: SimpleNamespace(entity_id=eid, state=state)
+        for eid, state in states_dict.items()
+    }
+    hass = MagicMock()
+    hass.states.async_all.return_value = list(state_objects.values())
+    hass.states.get.side_effect = lambda eid: state_objects.get(eid)
     return hass
 
 
@@ -130,22 +150,36 @@ class TestTesla:
 
 class TestInverterOverrides:
     def test_default_battery_soc_present_no_override(self):
-        hass = _hass([
-            "sensor.sa_inverter_1_battery_soc",  # default present
-            "sensor.sa_inverter_1_pv_power",  # solar override needed
-            "sensor.sa_inverter_1_temperature",  # temp override needed
-        ])
+        # If the default entity has a real state, no override needed.
+        hass = _hass_with_states({
+            "sensor.sa_inverter_1_battery_soc": "82",  # default has live state
+            "sensor.sa_inverter_1_pv_power": "1500",  # solar override needed
+            "sensor.sa_inverter_1_temperature": "35",  # temp override needed
+        })
         out = discover_inverter_sensor_overrides(hass)
         assert "battery_soc" not in out
         assert out["solar_power"] == "sensor.sa_inverter_1_pv_power"
         assert out["inverter_temperature"] == "sensor.sa_inverter_1_temperature"
 
+    def test_default_unavailable_treated_as_missing(self):
+        # Default entity exists in registry but state=unavailable —
+        # discovery should treat as missing and try alternatives.
+        hass = _hass_with_states({
+            "sensor.sa_inverter_1_battery_soc": "unavailable",
+            "sensor.sa_total_battery_state_of_charge": "100",
+        })
+        out = discover_inverter_sensor_overrides(hass)
+        assert (
+            out["battery_soc"]
+            == "sensor.sa_total_battery_state_of_charge"
+        )
+
     def test_total_state_of_charge_used_when_no_default(self):
-        hass = _hass([
-            "sensor.sa_total_battery_state_of_charge",
-            "sensor.sa_inverter_1_pv_power",
-            "sensor.sa_inverter_1_temperature",
-        ])
+        hass = _hass_with_states({
+            "sensor.sa_total_battery_state_of_charge": "100",
+            "sensor.sa_inverter_1_pv_power": "1500",
+            "sensor.sa_inverter_1_temperature": "35",
+        })
         out = discover_inverter_sensor_overrides(hass)
         assert (
             out["battery_soc"]
@@ -154,11 +188,11 @@ class TestInverterOverrides:
 
     def test_no_relevant_entities_empty_overrides(self):
         # Default present for everything → no overrides.
-        hass = _hass([
-            "sensor.sa_inverter_1_battery_soc",
-            "sensor.sa_inverter_1_solar_power",
-            "sensor.sa_inverter_1_inverter_temperature",
-        ])
+        hass = _hass_with_states({
+            "sensor.sa_inverter_1_battery_soc": "82",
+            "sensor.sa_inverter_1_solar_power": "1500",
+            "sensor.sa_inverter_1_inverter_temperature": "35",
+        })
         assert discover_inverter_sensor_overrides(hass) == {}
 
 

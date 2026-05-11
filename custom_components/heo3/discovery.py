@@ -149,21 +149,40 @@ _INVERTER_OVERRIDE_CANDIDATES: dict[str, list[str]] = {
 }
 
 
+def _has_real_state(hass, entity_id: str) -> bool:  # type: ignore[no-untyped-def]
+    """True if the entity exists AND has a non-null/non-unavailable state.
+
+    Just checking registry presence isn't enough — HA can keep stale
+    registry entries for entities that are no longer publishing
+    (e.g. after an integration is reconfigured). We want only entities
+    that are actually live.
+    """
+    s = hass.states.get(entity_id)
+    if s is None:
+        return False
+    if s.state in (None, "unknown", "unavailable", ""):
+        return False
+    return True
+
+
 def discover_inverter_sensor_overrides(
     hass,  # type: ignore[no-untyped-def]
 ) -> dict[str, str]:
     """Return {leaf: full_entity_id} for any leaf whose default name
-    doesn't exist on this install but a known alternative does.
+    isn't live on this install but a known alternative is.
+
+    Walks each leaf's candidate list in priority order; returns the
+    first candidate that's actually publishing state. Only adds an
+    override when the chosen candidate differs from the default
+    (`sensor.sa_inverter_1_<leaf>`).
     """
-    states = set(_all_entity_ids(hass))
     out: dict[str, str] = {}
     for leaf, candidates in _INVERTER_OVERRIDE_CANDIDATES.items():
         default = f"sensor.sa_inverter_1_{leaf}"
-        if default in states:
-            continue  # No override needed.
         for alt in candidates:
-            if alt in states:
-                out[leaf] = alt
+            if _has_real_state(hass, alt):
+                if alt != default:
+                    out[leaf] = alt
                 break
     return out
 
