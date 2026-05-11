@@ -12,52 +12,19 @@ Two services exposed via standard HA service-call:
     summary on `sensor.heo3_last_apply`. THIS WRITES TO THE INVERTER.
 
 Both use the operator on hass.data[DOMAIN][<entry_id>]. If multiple
-entries exist (test installs), the first one is used.
-
-State sensors are set via hass.states.async_set rather than registered
-as a real platform — this keeps the diagnostic surface trivial to
-read via REST without adding a sensor.py.
+entries exist (test installs), the first one is used. The operator
+is fully configured at setup via discovery — no service-time
+patching needed (was a workaround before discovery.py landed).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
-from .adapters.peripheral import TeslaConfig
-from .adapters.world import BDConfig, FlagsConfig
 from .const import DOMAIN
 
 logger = logging.getLogger(__name__)
-
-# Paddy's house defaults — patched onto the operator at service time
-# until the config flow learns to ask for them.
-DEFAULT_BD_METER_KEY = "18p5009498_2372761090617"
-DEFAULT_IGO_DISPATCH_ENTITY = (
-    "binary_sensor.octopus_energy_00000000_0009_4000_8020_000000032ba2"
-    "_intelligent_dispatching"
-)
-DEFAULT_SAVING_SESSION_ENTITY = (
-    "binary_sensor.octopus_energy_a_8e04cfcf_octoplus_saving_sessions"
-)
-DEFAULT_TESLA_VEHICLE = "natalia"
-DEFAULT_APPLIANCES = {
-    "washer": "switch.washer",
-    "dryer": "switch.dryer",
-    "dishwasher": "switch.dishwasher",
-}
-
-# Real SA + zappi entity names on Paddy's install (verified via REST scan).
-# These differ from the leaf-name conventions HEO III's adapters use
-# internally — patched in here until the config flow learns to ask.
-DEFAULT_INVERTER_SENSOR_OVERRIDES = {
-    "battery_soc": "sensor.sa_total_battery_state_of_charge",
-    "solar_power": "sensor.sa_inverter_1_pv_power",
-    "inverter_temperature": "sensor.sa_inverter_1_temperature",
-}
-# Zappi entity ID prefix includes the device serial.
-DEFAULT_ZAPPI_PREFIX = "myenergi_zappi_22752031"
 
 
 async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
@@ -69,7 +36,6 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
             logger.error("heo3.snapshot_log: no HEO III config entry loaded")
             return
 
-        _patch_house_config(op)
         try:
             snap = await op.snapshot()
         except Exception as exc:
@@ -131,7 +97,6 @@ async def async_register_services(hass) -> None:  # type: ignore[no-untyped-def]
             logger.error("heo3.apply_baseline_static: no config entry loaded")
             return
 
-        _patch_house_config(op)
         try:
             snap = await op.snapshot()
             plan = op.build.baseline_static(snap)
@@ -191,46 +156,3 @@ def _get_operator(hass) -> Any | None:  # type: ignore[no-untyped-def]
         if isinstance(entry_data, dict) and "operator" in entry_data:
             return entry_data["operator"]
     return None
-
-
-def _patch_house_config(op) -> None:
-    """Monkey-patch BD/Flags/Tesla/appliance config onto the operator
-    until the config flow learns to ask for them.
-
-    Also patches inverter sensor overrides + zappi entity prefix
-    (real SA + zappi naming differs from the internal leaf-name
-    conventions). Idempotent — re-calling is safe.
-    """
-    from dataclasses import replace
-    from .adapters.peripheral import ZappiConfig
-
-    if op._world._bd is None:
-        op._world._bd = BDConfig.from_meter_key(DEFAULT_BD_METER_KEY)
-
-    if op._world._flags_cfg.igo_dispatching_entity is None:
-        op._world._flags_cfg = replace(
-            op._world._flags_cfg,
-            igo_dispatching_entity=DEFAULT_IGO_DISPATCH_ENTITY,
-            saving_session_entity=DEFAULT_SAVING_SESSION_ENTITY,
-        )
-
-    if op._peripheral._tesla is None:
-        op._peripheral._tesla = TeslaConfig.from_vehicle(DEFAULT_TESLA_VEHICLE)
-
-    # Real zappi entity naming includes the serial number.
-    op._peripheral._zappi = ZappiConfig(
-        charge_mode=f"select.{DEFAULT_ZAPPI_PREFIX}_charge_mode",
-        charging_state=f"sensor.{DEFAULT_ZAPPI_PREFIX}_status",
-        charge_power=f"sensor.{DEFAULT_ZAPPI_PREFIX}_power_ct_internal_load",
-    )
-
-    if not op._peripheral._appliance_switches:
-        op._peripheral._appliance_switches = dict(DEFAULT_APPLIANCES)
-        op._peripheral._appliance_running = {
-            name: f"binary_sensor.{name}_running"
-            for name in DEFAULT_APPLIANCES
-        }
-
-    # Patch the inverter sensor overrides for entity names that
-    # don't fit the sa_<inverter>_<leaf> convention.
-    op._inverter._sensor_overrides.update(DEFAULT_INVERTER_SENSOR_OVERRIDES)

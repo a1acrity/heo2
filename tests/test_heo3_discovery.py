@@ -1,0 +1,197 @@
+"""Auto-discovery tests against a fake hass.states surface."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from heo3.discovery import (
+    discover_all,
+    discover_bd_meter_key,
+    discover_igo_dispatching_entity,
+    discover_inverter_sensor_overrides,
+    discover_saving_session_entity,
+    discover_tesla_vehicle,
+    discover_zappi_prefix,
+)
+
+
+def _hass(entity_ids):
+    """Build a fake hass with a given list of entity IDs."""
+    states = [SimpleNamespace(entity_id=eid) for eid in entity_ids]
+    hass = MagicMock()
+    hass.states.async_all.return_value = states
+    return hass
+
+
+# ── BD meter key ───────────────────────────────────────────────────
+
+
+class TestBDMeterKey:
+    def test_finds_import_meter(self):
+        hass = _hass([
+            "event.octopus_energy_electricity_18p5009498_2372761090617_current_day_rates",
+            "event.octopus_energy_electricity_18p5009498_2394300396097_export_current_day_rates",
+            "sensor.unrelated",
+        ])
+        assert (
+            discover_bd_meter_key(hass)
+            == "18p5009498_2372761090617"
+        )
+
+    def test_export_meter_skipped(self):
+        # Only export entity present — no import meter to discover.
+        hass = _hass([
+            "event.octopus_energy_electricity_X_Y_export_current_day_rates",
+        ])
+        assert discover_bd_meter_key(hass) is None
+
+    def test_no_octopus_returns_none(self):
+        hass = _hass(["sensor.foo", "sensor.bar"])
+        assert discover_bd_meter_key(hass) is None
+
+
+# ── IGO ────────────────────────────────────────────────────────────
+
+
+class TestIGODispatching:
+    def test_finds_intelligent_dispatching(self):
+        hass = _hass([
+            "binary_sensor.octopus_energy_00000000_intelligent_dispatching",
+            "sensor.unrelated",
+        ])
+        assert (
+            discover_igo_dispatching_entity(hass)
+            == "binary_sensor.octopus_energy_00000000_intelligent_dispatching"
+        )
+
+    def test_no_match_returns_none(self):
+        hass = _hass(["sensor.foo"])
+        assert discover_igo_dispatching_entity(hass) is None
+
+
+# ── Octoplus saving sessions ──────────────────────────────────────
+
+
+class TestSavingSession:
+    def test_finds_octoplus_saving_sessions(self):
+        hass = _hass([
+            "binary_sensor.octopus_energy_a_8e04cfcf_octoplus_saving_sessions",
+        ])
+        assert (
+            discover_saving_session_entity(hass)
+            == "binary_sensor.octopus_energy_a_8e04cfcf_octoplus_saving_sessions"
+        )
+
+
+# ── Zappi ─────────────────────────────────────────────────────────
+
+
+class TestZappi:
+    def test_finds_charge_mode_select(self):
+        hass = _hass([
+            "select.myenergi_zappi_22752031_charge_mode",
+            "sensor.myenergi_zappi_22752031_status",
+        ])
+        assert discover_zappi_prefix(hass) == "myenergi_zappi_22752031"
+
+    def test_no_zappi_returns_none(self):
+        hass = _hass(["sensor.foo"])
+        assert discover_zappi_prefix(hass) is None
+
+
+# ── Tesla ─────────────────────────────────────────────────────────
+
+
+class TestTesla:
+    def test_finds_natalia_when_paired(self):
+        hass = _hass([
+            "binary_sensor.natalia_located_at_home",
+            "switch.natalia_charge",
+        ])
+        assert discover_tesla_vehicle(hass) == "natalia"
+
+    def test_located_without_charge_switch_skipped(self):
+        # presence-only sensor (e.g. iBeacon) shouldn't match Tesla.
+        hass = _hass([
+            "binary_sensor.iphone_located_at_home",
+        ])
+        assert discover_tesla_vehicle(hass) is None
+
+    def test_no_tesla_returns_none(self):
+        hass = _hass(["sensor.foo"])
+        assert discover_tesla_vehicle(hass) is None
+
+
+# ── Inverter sensor overrides ─────────────────────────────────────
+
+
+class TestInverterOverrides:
+    def test_default_battery_soc_present_no_override(self):
+        hass = _hass([
+            "sensor.sa_inverter_1_battery_soc",  # default present
+            "sensor.sa_inverter_1_pv_power",  # solar override needed
+            "sensor.sa_inverter_1_temperature",  # temp override needed
+        ])
+        out = discover_inverter_sensor_overrides(hass)
+        assert "battery_soc" not in out
+        assert out["solar_power"] == "sensor.sa_inverter_1_pv_power"
+        assert out["inverter_temperature"] == "sensor.sa_inverter_1_temperature"
+
+    def test_total_state_of_charge_used_when_no_default(self):
+        hass = _hass([
+            "sensor.sa_total_battery_state_of_charge",
+            "sensor.sa_inverter_1_pv_power",
+            "sensor.sa_inverter_1_temperature",
+        ])
+        out = discover_inverter_sensor_overrides(hass)
+        assert (
+            out["battery_soc"]
+            == "sensor.sa_total_battery_state_of_charge"
+        )
+
+    def test_no_relevant_entities_empty_overrides(self):
+        # Default present for everything → no overrides.
+        hass = _hass([
+            "sensor.sa_inverter_1_battery_soc",
+            "sensor.sa_inverter_1_solar_power",
+            "sensor.sa_inverter_1_inverter_temperature",
+        ])
+        assert discover_inverter_sensor_overrides(hass) == {}
+
+
+# ── discover_all ──────────────────────────────────────────────────
+
+
+class TestDiscoverAll:
+    def test_paddy_install_shape(self):
+        # Realistic subset of paddy's install
+        hass = _hass([
+            "event.octopus_energy_electricity_18p5009498_2372761090617_current_day_rates",
+            "binary_sensor.octopus_energy_00000000_intelligent_dispatching",
+            "binary_sensor.octopus_energy_a_8e04cfcf_octoplus_saving_sessions",
+            "select.myenergi_zappi_22752031_charge_mode",
+            "binary_sensor.natalia_located_at_home",
+            "switch.natalia_charge",
+            "sensor.sa_total_battery_state_of_charge",
+            "sensor.sa_inverter_1_pv_power",
+            "sensor.sa_inverter_1_temperature",
+        ])
+        out = discover_all(hass)
+        assert out["bd_meter_key"] == "18p5009498_2372761090617"
+        assert out["igo_dispatching_entity"].endswith("_intelligent_dispatching")
+        assert out["saving_session_entity"].endswith("_octoplus_saving_sessions")
+        assert out["zappi_prefix"] == "myenergi_zappi_22752031"
+        assert out["tesla_vehicle"] == "natalia"
+        assert "battery_soc" in out["inverter_sensor_overrides"]
+
+    def test_empty_hass_all_none(self):
+        hass = _hass([])
+        out = discover_all(hass)
+        assert out["bd_meter_key"] is None
+        assert out["igo_dispatching_entity"] is None
+        assert out["zappi_prefix"] is None
+        assert out["tesla_vehicle"] is None
+        assert out["inverter_sensor_overrides"] == {}

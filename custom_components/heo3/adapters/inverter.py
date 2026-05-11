@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as _time
 from dataclasses import replace
 from typing import Iterable
 
@@ -56,7 +57,7 @@ from .inverter_validate import (
 logger = logging.getLogger(__name__)
 
 # Per-attempt response timeout. SA usually responds in 1-3s.
-RESPONSE_TIMEOUT_S = 5.0
+RESPONSE_TIMEOUT_S = 10.0
 
 # SA response payloads (per HEO-32 / reference_sa_mqtt.md).
 RESPONSE_OK = "Saved"
@@ -328,27 +329,33 @@ class InverterAdapter:
         """Publish one write, await SA response with retries.
 
         Retry policy:
-        - Up to WRITE_RETRY_LIMIT (3) attempts on TIMEOUT.
+        - Up to WRITE_RETRY_LIMIT attempts on TIMEOUT.
         - No retry on explicit `Error: ...` responses — those are
           vocabulary mismatches that won't fix on retry (HEO-32 lesson).
-        - WRITE_RETRY_BACKOFF_S (5s) between attempts.
+        - WRITE_RETRY_BACKOFF_S between attempts.
 
         Returns one of: VERIFY_OK_FROM_SA, VERIFY_FAILED, VERIFY_TIMEOUT.
+        Logs per-attempt duration at INFO so we can profile in
+        production where SA's actual response latency lives.
         """
         await self.ensure_subscribed()
 
         last_state = VERIFY_TIMEOUT
+        total_start = _time.monotonic()
         for attempt in range(1, WRITE_RETRY_LIMIT + 1):
             self._response_future = asyncio.get_event_loop().create_future()
+            attempt_start = _time.monotonic()
             try:
                 await self._transport.publish(write.topic, write.payload)
                 payload = await asyncio.wait_for(
                     self._response_future, timeout=RESPONSE_TIMEOUT_S
                 )
             except asyncio.TimeoutError:
+                elapsed_ms = (_time.monotonic() - attempt_start) * 1000.0
                 logger.warning(
-                    "SA response timeout on %s (attempt %d/%d)",
+                    "SA response timeout on %s after %.0fms (attempt %d/%d)",
                     write.topic,
+                    elapsed_ms,
                     attempt,
                     WRITE_RETRY_LIMIT,
                 )
@@ -359,18 +366,25 @@ class InverterAdapter:
             finally:
                 self._response_future = None
 
+            attempt_ms = (_time.monotonic() - attempt_start) * 1000.0
+            total_ms = (_time.monotonic() - total_start) * 1000.0
+
             if payload == RESPONSE_OK:
+                logger.info(
+                    "SA OK on %s in %.0fms (attempt %d, total %.0fms)",
+                    write.topic, attempt_ms, attempt, total_ms,
+                )
                 return VERIFY_OK_FROM_SA
             if payload.startswith(RESPONSE_ERROR_PREFIX):
                 logger.error(
-                    "SA returned %s for %s — not retrying (vocabulary mismatch)",
-                    payload,
-                    write.topic,
+                    "SA returned %s for %s in %.0fms — not retrying "
+                    "(vocabulary mismatch)",
+                    payload, write.topic, attempt_ms,
                 )
                 return VERIFY_FAILED
-            # Unexpected payload — treat as failure, don't retry.
             logger.error(
-                "Unexpected SA response %r for %s", payload, write.topic
+                "Unexpected SA response %r for %s in %.0fms",
+                payload, write.topic, attempt_ms,
             )
             return VERIFY_FAILED
 
