@@ -82,16 +82,23 @@ class InverterAdapter:
         inverter_name: str,
         state_reader: StateReader | None = None,
         sensor_prefix: str | None = None,
+        sensor_overrides: dict[str, str] | None = None,
     ) -> None:
         self._transport = transport
         self._inverter_name = inverter_name
         self._state_reader = state_reader
-        # SA discovery names sensors like sensor.sa_inverter_1_battery_soc.
+        # SA discovery names like sensor.sa_inverter_1_<leaf>.
         self._sensor_prefix = (
             sensor_prefix
             if sensor_prefix is not None
             else f"sensor.sa_{inverter_name}_"
         )
+        # Real SA naming differs from the leaf names we use internally
+        # (e.g. battery_soc lives at sensor.sa_total_battery_state_of_
+        # charge, not sensor.sa_inverter_1_battery_soc). The overrides
+        # dict maps internal leaf → full entity ID for any leaf whose
+        # name doesn't fit the prefix+leaf convention.
+        self._sensor_overrides = dict(sensor_overrides or {})
 
         # Single in-flight response Future. One write at a time means
         # the next response on the topic IS for that write — no FIFO
@@ -108,6 +115,8 @@ class InverterAdapter:
         return "solar_assistant/set/response_message/state"
 
     def _entity(self, leaf: str) -> str:
+        if leaf in self._sensor_overrides:
+            return self._sensor_overrides[leaf]
         return f"{self._sensor_prefix}{leaf}"
 
     # ── Reads (P1.2) ──────────────────────────────────────────────
