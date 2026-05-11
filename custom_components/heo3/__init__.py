@@ -339,6 +339,10 @@ def _publish_decision_sensors(hass, record: TickRecord) -> None:  # type: ignore
     )
 
     # Last decision sensor
+    failed_reasons = (
+        [fw.reason for fw in result.failed]
+        if result is not None else []
+    )
     hass.states.async_set(
         "sensor.heo3_last_decision",
         decision.rationale[:200] if decision.rationale else "no-op",
@@ -355,6 +359,7 @@ def _publish_decision_sensors(hass, record: TickRecord) -> None:  # type: ignore
             "writes_failed": (
                 len(result.failed) if result is not None else 0
             ),
+            "failed_reasons": failed_reasons,
             "duration_ms": (
                 result.duration_ms if result is not None else 0.0
             ),

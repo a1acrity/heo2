@@ -73,7 +73,11 @@ class ConfigEntities:
 
 
 # SPEC H4: rates older than this trigger a write block.
-RATES_FRESHNESS_THRESHOLD = timedelta(minutes=60)
+# Long enough to ride out HA restarts (BD entities' check-in timestamp
+# lags after a reload even though the rate data itself is current).
+# If BD is genuinely broken we'd see ALL day's rates missing, caught
+# elsewhere.
+RATES_FRESHNESS_THRESHOLD = timedelta(hours=6)
 
 logger = logging.getLogger(__name__)
 
